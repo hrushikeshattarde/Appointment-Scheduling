@@ -1,0 +1,107 @@
+"""Application settings.
+
+All secrets and environment-specific values come from environment variables or a local
+``.env`` file. Transport Pro variables reuse the names used by the Transport Pro MCP server
+(``TPRO_BASE_URL``, ``TPRO_USERNAME``, ``TPRO_PASSWORD``, ``TPRO_TIMEOUT_MS``) so one ``.env``
+serves both tools. Application settings use the ``FP_`` prefix.
+"""
+
+from __future__ import annotations
+
+from enum import StrEnum
+from functools import lru_cache
+from typing import Annotated
+
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+
+class RunMode(StrEnum):
+    """Whether the routine may write profiles or only recommend them."""
+
+    RECOMMEND = "recommend"
+    WRITE = "write"
+
+
+class Settings(BaseSettings):
+    """Runtime configuration for the facility-profiles routine."""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        env_prefix="FP_",
+        extra="ignore",
+        case_sensitive=False,
+    )
+
+    # --- Transport Pro -------------------------------------------------------------
+    tpro_base_url: str = Field(
+        validation_alias=AliasChoices("TPRO_BASE_URL"),
+        description="Base URL of the Transport Pro Public API, no trailing slash.",
+    )
+    tpro_username: SecretStr = Field(validation_alias=AliasChoices("TPRO_USERNAME"))
+    tpro_password: SecretStr = Field(validation_alias=AliasChoices("TPRO_PASSWORD"))
+    tpro_timeout_ms: int = Field(30_000, validation_alias=AliasChoices("TPRO_TIMEOUT_MS"), gt=0)
+    tpro_max_requests_per_second: float = Field(
+        5.0, validation_alias=AliasChoices("TPRO_MAX_REQUESTS_PER_SECOND"), gt=0
+    )
+
+    # --- LLM -----------------------------------------------------------------------------
+    llm_model: str = "claude-opus-5"
+    llm_max_tokens: int = Field(16_000, gt=0)
+
+    # --- Storage -----------------------------------------------------------------------
+    database_url: str = "sqlite:///./data/facility_profiles.db"
+    export_dir: str = "./exports"
+
+    # --- Run controls -------------------------------------------------------------------
+    mode: RunMode = RunMode.RECOMMEND
+    pilot_terminal_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
+    facility_cap: int = Field(500, gt=0)
+    lookback_days: int = Field(90, gt=0)
+    max_loads_per_facility: int = Field(100, gt=0)
+    write_threshold: float = Field(0.8, ge=0, le=1)
+    queue_threshold: float = Field(0.5, ge=0, le=1)
+    conflict_support: float = Field(0.3, ge=0, le=1)
+    stale_after_days: int = Field(180, gt=0)
+    geo_match_meters: float = Field(200.0, gt=0)
+    name_match_threshold: int = Field(92, ge=0, le=100)
+
+    # --- Logging -------------------------------------------------------------------------
+    log_level: str = "INFO"
+    log_json: bool = False
+
+    @field_validator("tpro_base_url")
+    @classmethod
+    def _strip_trailing_slash(cls, value: str) -> str:
+        return value.strip().rstrip("/")
+
+    @field_validator("pilot_terminal_ids", mode="before")
+    @classmethod
+    def _split_terminal_ids(cls, value: object) -> list[int]:
+        if value is None or value == "":
+            return []
+        if isinstance(value, str):
+            return [int(part) for part in value.split(",") if part.strip()]
+        if isinstance(value, list | tuple):
+            return [int(part) for part in value]
+        msg = "pilot_terminal_ids must be a comma-separated string or a list of integers"
+        raise TypeError(msg)
+
+    @model_validator(mode="after")
+    def _thresholds_are_ordered(self) -> Settings:
+        if self.queue_threshold > self.write_threshold:
+            msg = "queue_threshold must not exceed write_threshold"
+            raise ValueError(msg)
+        return self
+
+    @property
+    def timeout_seconds(self) -> float:
+        """Per-request Transport Pro timeout in seconds."""
+        return self.tpro_timeout_ms / 1000
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    """Return the process-wide settings, loaded once."""
+    return Settings()
