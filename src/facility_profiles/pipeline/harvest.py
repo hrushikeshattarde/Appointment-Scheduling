@@ -28,7 +28,7 @@ from facility_profiles.tpro.models import Load, Waypoint
 log = get_logger(__name__)
 
 WINDOW_DAYS = 7
-STRUCTURED_FIELDS = {"type", "appointmentTime", "contact", "reference", "locationId"}
+STRUCTURED_FIELDS = {"type", "appointment_time", "contact", "reference", "location_id"}
 
 
 @dataclass

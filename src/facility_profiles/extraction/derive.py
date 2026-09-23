@@ -58,7 +58,7 @@ def mentions_from_stop(
 
     appt = waypoint.appointment_time
     status = (appt.appointment_status or "").strip().lower() if appt else ""
-    if status in STATUS_REQUIRES:
+    if status in STATUS_REQUIRES or ("required" in status and "not required" not in status):
         add("appointment_required", True, SourceType.APPOINTMENT_TIMES, f"status: {status}", 0.6)
     elif status in STATUS_NOT_REQUIRED:
         add("appointment_required", False, SourceType.APPOINTMENT_TIMES, f"status: {status}", 0.4)
