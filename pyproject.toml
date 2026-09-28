@@ -54,7 +54,7 @@ src = ["src", "tests"]
 select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "SIM", "PL", "RUF", "S", "T20", "PT", "RET", "ARG", "ERA", "TID", "D"]
 ignore = [
   "D100", "D104", "D105", "D107", "D203", "D213",
-  "PLR0911", "PLR0913", "PLR2004", "S101", "S311",
+  "PLR0911", "PLR0913", "PLR0915", "PLR2004", "S101", "S311",
   "RUF012", "TID252", "UP046",
 ]
 pydocstyle = { convention = "google" }
