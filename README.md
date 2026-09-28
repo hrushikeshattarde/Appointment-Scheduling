@@ -58,6 +58,8 @@ MCP server, so the existing file can be reused. Never commit `.env`.
 | `facility-profiles lookup 196508` / `lookup "carolina beverage"` | Shows the stored profile, per role, with confidence and state per field. |
 | `facility-profiles review list` / `accept ID --by NAME` / `edit ID --value V --by NAME` / `reject ID --by NAME` | Works the review queue (FR-11). Decisions become human-set values the routine never overwrites. |
 | `facility-profiles export [--out file.csv]` | Trusted values in Transport Pro field names for the vendor bulk import (FR-10). |
+| `facility-profiles export-xlsx [--out file.xlsx]` | Reviewer workbook: a Review Queue sheet with Decision (accept/edit/reject), Corrected value and Reviewer columns, plus Profile Fields, Scheduling Summaries, Facilities, Audit Log and Runs sheets. |
+| `facility-profiles review import file.xlsx [--by NAME] [--dry-run]` | Reads the filled-in Review Queue sheet and applies each decision as a human-set value; rows with a blank Decision are skipped and problems are listed per row. |
 | `facility-profiles digest [--out file.md]` | Markdown digest for the pod lead: what the run did, what needs a decision (FR-13). |
 | `uvicorn facility_profiles.api.app:create_app --factory` | Lookup and review HTTP API (`/facilities/{id}`, `/facilities?name=`, `/review`, `/digest`). Needs the `api` extra. |
 
@@ -91,6 +93,13 @@ One load can reach at most 0.5, two agreeing loads 0.75, three or more 1.0. Then
 | otherwise | queue |
 
 A field not seen in any source for `FP_STALE_AFTER_DAYS` (180) is marked stale and queued.
+
+## Review flow for CSRs
+
+1. `facility-profiles export-xlsx` and send the workbook to the pod.
+2. Reviewers fill in the three yellow columns on the Review Queue sheet: Decision, Corrected value (only for edit) and Reviewer. Blank rows are skipped.
+3. `facility-profiles review import <file> --dry-run` to see what would be applied, then without `--dry-run`.
+4. Decisions become human-set values the routine never overwrites; the audit log records who decided what. `run --replay` then re-scores everything else at no model cost.
 
 ## Data model
 
