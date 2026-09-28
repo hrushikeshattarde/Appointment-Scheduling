@@ -151,11 +151,15 @@ class ProfileWriter:
             unwrap(previous.value) if previous is not None and human_previous else record_value
         )
         existing_is_human = human_previous or record_value is not None
+        record_backed = bool(scored.evidence) and all(
+            e.source_type.value.startswith("facility_") for e in scored.evidence
+        )
         ruling = decide(
             scored,
             existing_value=existing_value,
             existing_is_human=existing_is_human,
             thresholds=self._thresholds,
+            record_backed=record_backed,
         )
         load_ids = [e.load_id for e in scored.evidence if e.load_id is not None]
         before = unwrap(previous.value) if previous is not None else None
@@ -256,7 +260,26 @@ class ProfileWriter:
         before: Any,
         audit: Any,
     ) -> str:
-        if previous is None or previous.state not in LIVE_STATES:
+        """No mentions this run: keep human and verified values, withdraw or age the rest."""
+        if previous is None or previous.origin in HUMAN_ORIGINS:
+            return "skip"
+        key, role = profile.identity.key, profile.role
+        if previous.state in {FieldState.QUEUED.value, FieldState.EXTRACTED.value}:
+            # The value came from sources that no longer support it (for example an internal
+            # contact now filtered out). It was never trusted, so it is withdrawn outright.
+            withdrawn = ProfileField(name=scored.name, value=None, confidence=0.0)
+            self._repo.upsert_field(
+                key,
+                role,
+                withdrawn,
+                state=FieldState.DISCARDED,
+                origin=ValueOrigin.EXTRACTED,
+                run_id=self._run_id,
+            )
+            self._repo.close_review_items(key, role, scored.name, status="withdrawn")
+            audit("withdraw", None, "no source supports the earlier value any more")
+            return "withdraw"
+        if previous.state != FieldState.WRITTEN.value:
             return "skip"
         last_seen = as_utc(previous.last_seen)
         if last_seen is not None and self._now - last_seen > self._stale_after:
@@ -270,8 +293,8 @@ class ProfileWriter:
                 last_seen=last_seen,
             )
             self._repo.upsert_field(
-                profile.identity.key,
-                profile.role,
+                key,
+                role,
                 stale,
                 state=FieldState.STALE,
                 origin=ValueOrigin(previous.origin),
@@ -279,8 +302,8 @@ class ProfileWriter:
                 keep_value=True,
             )
             self._repo.queue(
-                profile.identity.key,
-                profile.role,
+                key,
+                role,
                 stale,
                 existing_value=before,
                 reason=f"no supporting mention for {self._stale_after.days} days",

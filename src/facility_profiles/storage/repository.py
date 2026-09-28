@@ -568,6 +568,21 @@ class Repository:
         item.decided_by = decided_by
         item.decided_at = utcnow()
 
+    def close_review_items(self, key: str, role: Role, field_name: str, *, status: str) -> int:
+        """Close every open review item for a field; returns how many were closed."""
+        items = self.session.scalars(
+            select(ReviewItem).where(
+                ReviewItem.facility_key == key,
+                ReviewItem.role == role.value,
+                ReviewItem.field_name == field_name,
+                ReviewItem.status == "open",
+            )
+        ).all()
+        for item in items:
+            item.status = status
+            item.decided_at = utcnow()
+        return len(items)
+
     # ------------------------------------------------------------------ audit
 
     def audit(

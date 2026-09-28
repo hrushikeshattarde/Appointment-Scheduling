@@ -145,6 +145,9 @@ def run(
         float | None,
         typer.Option(help="Stop extracting once estimated LLM spend reaches this many USD"),
     ] = None,
+    replay: Annotated[
+        bool, typer.Option(help="Reuse the last stored model output instead of calling the model")
+    ] = False,
 ) -> None:
     """Run the pipeline: collect, extract, score and apply every facility."""
     settings = _settings()
@@ -152,12 +155,14 @@ def run(
         settings = settings.model_copy(update={"llm_budget_usd": budget})
     client = None if offline else _client(settings)
     try:
-        pipeline = Pipeline(
-            settings,
-            _sessions(settings),
-            client=client,
-            extractor=_extractor(settings, fake=fake_llm),
-        )
+        sessions = _sessions(settings)
+        if replay:
+            from facility_profiles.extraction.replay import ReplayExtractor
+
+            extractor = ReplayExtractor(sessions)
+        else:
+            extractor = _extractor(settings, fake=fake_llm)
+        pipeline = Pipeline(settings, sessions, client=client, extractor=extractor)
         report = pipeline.run(
             do_harvest=harvest_first and not offline,
             refresh_only=refresh,

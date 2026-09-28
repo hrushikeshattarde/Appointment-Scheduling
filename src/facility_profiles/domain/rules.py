@@ -7,6 +7,7 @@ before any confidence threshold, because confirming an existing value is not a w
 * record value present and equal                        -> verify
 * record value present and different, material support -> queue
 * record value present and different, weak support     -> discard (record kept)
+* no mapped record value but the evidence is the record -> verify
 * conflict                                              -> queue (informational fields: discard)
 * confidence below the queue threshold                  -> discard
 * confidence at or above the write threshold            -> write
@@ -72,6 +73,7 @@ def decide(
     existing_value: Any = None,
     existing_is_human: bool = False,
     thresholds: Thresholds | None = None,
+    record_backed: bool = False,
 ) -> Ruling:
     """Apply the write policy to one scored field."""
     thresholds = thresholds or Thresholds()
@@ -94,7 +96,11 @@ def decide(
     if scored.conflict:
         if informational:
             return Ruling(Decision.DISCARD, "conflicting values on an informational field")
+        if scored.confidence < thresholds.queue and not record_backed:
+            return Ruling(Decision.DISCARD, f"conflicting values, {conf} too weak to review")
         return Ruling(Decision.QUEUE, "conflicting values with material support")
+    if record_backed:
+        return Ruling(Decision.VERIFY, "restates the facility record")
     if scored.confidence < thresholds.queue:
         return Ruling(Decision.DISCARD, f"{conf} below queue threshold")
     if scored.confidence >= thresholds.write:
