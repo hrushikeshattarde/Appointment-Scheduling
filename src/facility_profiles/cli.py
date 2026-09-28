@@ -60,6 +60,16 @@ def _extractor(settings: Settings, *, fake: bool):  # type: ignore[no-untyped-de
         from facility_profiles.extraction.llm import FakeExtractor, empty_result
 
         return FakeExtractor(empty_result())
+    if settings.llm_provider == "openrouter":
+        from facility_profiles.extraction.openrouter import OpenRouterExtractor
+
+        assert settings.openrouter_api_key is not None  # enforced by Settings
+        return OpenRouterExtractor(
+            settings.openrouter_api_key.get_secret_value(),
+            model=settings.llm_model,
+            max_tokens=settings.llm_max_tokens,
+            base_url=settings.openrouter_base_url,
+        )
     from facility_profiles.extraction.llm import AnthropicExtractor
 
     return AnthropicExtractor(settings.llm_model, max_tokens=settings.llm_max_tokens)

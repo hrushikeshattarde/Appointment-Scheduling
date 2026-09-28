@@ -119,9 +119,16 @@ overlapping IDs), `/location/{id}`, `/load/{id}/notes`, `/tracking/note/load/{id
 
 ## LLM
 
-`extraction/llm.py` calls Claude through the Anthropic SDK with structured outputs
-(`messages.parse` + a Pydantic schema), a cached system prompt and `claude-opus-5` by default
-(`FP_LLM_MODEL`). The model returns candidate values with verbatim quotes that reference
+Two providers, selected with `FP_LLM_PROVIDER`:
+
+- `anthropic` (default): `extraction/llm.py` calls Claude through the Anthropic SDK with
+  structured outputs (`messages.parse` + a Pydantic schema) and a cached system prompt.
+- `openrouter`: `extraction/openrouter.py` calls the same model through OpenRouter's
+  OpenAI-compatible endpoint with a strict JSON-schema `response_format`; set
+  `OPENROUTER_API_KEY`. Bare model names such as `claude-opus-5` become
+  `anthropic/claude-opus-5`.
+
+Both use `claude-opus-5` by default (`FP_LLM_MODEL`). The model returns candidate values with verbatim quotes that reference
 numbered sources; `extraction/validate.py` drops any quote not found in its source and any
 phone, email or URL not present verbatim (FR-5, FR-6). `--fake-llm` runs the pipeline without
 model calls.

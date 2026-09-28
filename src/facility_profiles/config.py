@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 from functools import lru_cache
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -47,8 +47,13 @@ class Settings(BaseSettings):
     )
 
     # --- LLM -----------------------------------------------------------------------------
+    llm_provider: Literal["anthropic", "openrouter"] = "anthropic"
     llm_model: str = "claude-opus-5"
     llm_max_tokens: int = Field(16_000, gt=0)
+    openrouter_api_key: SecretStr | None = Field(
+        default=None, validation_alias=AliasChoices("OPENROUTER_API_KEY")
+    )
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
 
     # --- Storage -----------------------------------------------------------------------
     database_url: str = "sqlite:///./data/facility_profiles.db"
@@ -87,6 +92,13 @@ class Settings(BaseSettings):
             return [int(part) for part in value]
         msg = "pilot_terminal_ids must be a comma-separated string or a list of integers"
         raise TypeError(msg)
+
+    @model_validator(mode="after")
+    def _openrouter_needs_key(self) -> Settings:
+        if self.llm_provider == "openrouter" and self.openrouter_api_key is None:
+            msg = "FP_LLM_PROVIDER=openrouter requires OPENROUTER_API_KEY"
+            raise ValueError(msg)
+        return self
 
     @model_validator(mode="after")
     def _thresholds_are_ordered(self) -> Settings:
