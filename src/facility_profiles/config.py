@@ -54,6 +54,9 @@ class Settings(BaseSettings):
         default=None, validation_alias=AliasChoices("OPENROUTER_API_KEY")
     )
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    llm_budget_usd: float | None = Field(default=None, gt=0)
+    llm_price_input_per_million: float | None = Field(default=None, ge=0)
+    llm_price_output_per_million: float | None = Field(default=None, ge=0)
 
     # --- Storage -----------------------------------------------------------------------
     database_url: str = "sqlite:///./data/facility_profiles.db"

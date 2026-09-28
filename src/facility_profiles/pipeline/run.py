@@ -17,6 +17,8 @@ from facility_profiles.domain.rules import Thresholds
 from facility_profiles.domain.schema import Role
 from facility_profiles.domain.scoring import Mention
 from facility_profiles.extraction.llm import ExtractionError, Extractor
+from facility_profiles.extraction.pricing import Budget, price_for
+from facility_profiles.extraction.prompts import render_user_message
 from facility_profiles.extraction.validate import validate_and_convert
 from facility_profiles.logging import get_logger
 from facility_profiles.pipeline.collect import (
@@ -55,6 +57,9 @@ class RunReport:
     llm_input_tokens: int = 0
     llm_output_tokens: int = 0
     llm_cache_read_tokens: int = 0
+    llm_cost_usd: float = 0.0
+    budget_usd: float | None = None
+    budget_stopped: bool = False
     errors: list[str] = field(default_factory=list)
 
     def as_stats(self) -> dict[str, Any]:
@@ -70,6 +75,9 @@ class RunReport:
             "llm_input_tokens": self.llm_input_tokens,
             "llm_output_tokens": self.llm_output_tokens,
             "llm_cache_read_tokens": self.llm_cache_read_tokens,
+            "llm_cost_usd": round(self.llm_cost_usd, 4),
+            "budget_usd": self.budget_usd,
+            "budget_stopped": self.budget_stopped,
             "errors": self.errors[:50],
         }
 
@@ -93,6 +101,15 @@ class Pipeline:
         self._extractor = extractor
         self._adapter = adapter
         self._now = now or datetime.now(tz=UTC)
+        self._budget: Budget | None = None
+        if settings.llm_budget_usd is not None:
+            model_name = str(getattr(extractor, "model", settings.llm_model))
+            prices = price_for(
+                model_name,
+                settings.llm_price_input_per_million,
+                settings.llm_price_output_per_million,
+            )
+            self._budget = Budget(settings.llm_budget_usd, prices)
 
     # ------------------------------------------------------------------ harvest
 
@@ -154,7 +171,7 @@ class Pipeline:
                     terminal_ids or self._settings.pilot_terminal_ids,
                     model_version,
                 )
-            report = RunReport(run_id=run.id)
+            report = RunReport(run_id=run.id, budget_usd=self._settings.llm_budget_usd)
 
         try:
             if do_harvest:
@@ -188,6 +205,9 @@ class Pipeline:
             ]
         log.info("run.targets", count=len(targets), cap=cap)
         for key, role in targets:
+            if report.budget_stopped:
+                log.warning("run.budget_reached", spent_usd=round(report.llm_cost_usd, 4))
+                break
             self._process_one(report, key, role, refresh_only=refresh_only)
 
     def _process_one(self, report: RunReport, key: str, role: Role, *, refresh_only: bool) -> None:
@@ -231,6 +251,11 @@ class Pipeline:
             summary: str | None = None
             model_version: str | None = getattr(self._extractor, "model", None)
             if bundle.sources:
+                if self._budget is not None and self._budget.would_exceed(
+                    render_user_message(bundle)
+                ):
+                    report.budget_stopped = True
+                    return
                 try:
                     output = self._extractor.extract(bundle)
                 except ExtractionError as exc:
@@ -260,6 +285,10 @@ class Pipeline:
                 report.llm_input_tokens += output.usage.input_tokens
                 report.llm_output_tokens += output.usage.output_tokens
                 report.llm_cache_read_tokens += output.usage.cache_read_tokens
+                if self._budget is not None:
+                    report.llm_cost_usd = self._budget.add(output.usage)
+                    if self._budget.exhausted:
+                        report.budget_stopped = True
 
             identity = identity_from_record(record, bundle.identity.aliases)
             profile = assemble_profile(

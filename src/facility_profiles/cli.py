@@ -141,9 +141,15 @@ def run(
         bool, typer.Option(help="No Transport Pro calls; use stored sources only")
     ] = False,
     resume: Annotated[str | None, typer.Option(help="Run ID to resume")] = None,
+    budget: Annotated[
+        float | None,
+        typer.Option(help="Stop extracting once estimated LLM spend reaches this many USD"),
+    ] = None,
 ) -> None:
     """Run the pipeline: collect, extract, score and apply every facility."""
     settings = _settings()
+    if budget is not None:
+        settings = settings.model_copy(update={"llm_budget_usd": budget})
     client = None if offline else _client(settings)
     try:
         pipeline = Pipeline(

@@ -153,16 +153,18 @@ class FakeExtractor:
         result: ExtractionResult | Callable[[SourceBundle], ExtractionResult],
         *,
         model: str = "fake-model",
+        usage: LLMUsage | None = None,
     ) -> None:
         self._result = result
         self.model = model
+        self._usage = usage
         self.calls: list[SourceBundle] = []
 
     def extract(self, bundle: SourceBundle) -> ExtractionOutput:
         """Return the configured result."""
         self.calls.append(bundle)
         result = self._result(bundle) if callable(self._result) else self._result
-        return ExtractionOutput(result=result, model=self.model)
+        return ExtractionOutput(result=result, model=self.model, usage=self._usage or LLMUsage())
 
 
 def empty_result() -> ExtractionResult:
