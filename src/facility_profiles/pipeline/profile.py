@@ -16,9 +16,34 @@ from facility_profiles.domain.schema import (
     Role,
     ValueOrigin,
 )
-from facility_profiles.domain.scoring import Mention, score_field
+from facility_profiles.domain.scoring import Mention, breadth, score_field
 from facility_profiles.storage.models import ProfileFieldRecord, ProfileRecord
 from facility_profiles.storage.repository import as_utc, unwrap
+
+MIXED_CONFIDENCE = 0.8
+_GRANULARITY_VALUES = {"exact", "window"}
+
+
+def resolve_time_granularity(field: ProfileField) -> ProfileField:
+    """A site that gives both exact times and windows is ``mixed``, not a conflict for a person."""
+    if field.name != "time_granularity" or not field.conflict:
+        return field
+    values = {str(c.value) for c in field.candidates}
+    if not values <= _GRANULARITY_VALUES:
+        return field
+    total_loads = sum(c.distinct_loads for c in field.candidates)
+    evidence: list[Evidence] = []
+    for candidate in field.candidates:
+        evidence.extend(candidate.evidence[:3])
+    return field.model_copy(
+        update={
+            "value": "mixed",
+            "conflict": False,
+            "confidence": round(breadth(total_loads) * MIXED_CONFIDENCE, 4),
+            "distinct_loads": total_loads,
+            "evidence": evidence,
+        }
+    )
 
 
 def assemble_profile(
@@ -39,12 +64,14 @@ def assemble_profile(
     for mention in mentions:
         by_field[mention.field_name].append(mention)
     fields = {
-        name: score_field(
-            name,
-            by_field.get(name, []),
-            now=now,
-            half_life_days=half_life_days,
-            conflict_support=conflict_support,
+        name: resolve_time_granularity(
+            score_field(
+                name,
+                by_field.get(name, []),
+                now=now,
+                half_life_days=half_life_days,
+                conflict_support=conflict_support,
+            )
         )
         for name in PROFILE_FIELDS
     }

@@ -358,6 +358,7 @@ class Terminal(TProModel):
     title: str | None = None
     terminal_code: str | None = None
     parent_terminal_id: int | str | None = None
+    phone_numbers: list[dict[str, Any]] = Field(default_factory=list)
 
     @property
     def is_pod(self) -> bool:

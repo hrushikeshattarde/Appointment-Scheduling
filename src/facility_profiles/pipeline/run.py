@@ -13,6 +13,7 @@ from typing import Any
 from sqlalchemy.orm import Session, sessionmaker
 
 from facility_profiles.config import RunMode, Settings
+from facility_profiles.domain.contacts import InternalContacts
 from facility_profiles.domain.rules import Thresholds
 from facility_profiles.domain.schema import Role
 from facility_profiles.domain.scoring import Mention
@@ -60,6 +61,7 @@ class RunReport:
     llm_cost_usd: float = 0.0
     budget_usd: float | None = None
     budget_stopped: bool = False
+    validation_issue_reasons: dict[str, int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
 
     def as_stats(self) -> dict[str, Any]:
@@ -78,6 +80,7 @@ class RunReport:
             "llm_cost_usd": round(self.llm_cost_usd, 4),
             "budget_usd": self.budget_usd,
             "budget_stopped": self.budget_stopped,
+            "validation_issue_reasons": dict(self.validation_issue_reasons),
             "errors": self.errors[:50],
         }
 
@@ -101,6 +104,9 @@ class Pipeline:
         self._extractor = extractor
         self._adapter = adapter
         self._now = now or datetime.now(tz=UTC)
+        self._internal = InternalContacts.build(
+            settings.internal_email_domains, settings.internal_phone_numbers
+        )
         self._budget: Budget | None = None
         if settings.llm_budget_usd is not None:
             model_name = str(getattr(extractor, "model", settings.llm_model))
@@ -174,6 +180,7 @@ class Pipeline:
             report = RunReport(run_id=run.id, budget_usd=self._settings.llm_budget_usd)
 
         try:
+            self._learn_internal_phones()
             if do_harvest:
                 report.harvest = self.harvest(terminal_ids=terminal_ids)
             self._process_facilities(report, refresh_only=refresh_only, facility_cap=facility_cap)
@@ -185,6 +192,23 @@ class Pipeline:
             raise
         self._finish(report)
         return report
+
+    def _learn_internal_phones(self) -> None:
+        """Treat every Circle terminal phone number as internal, when the API is reachable."""
+        if self._client is None:
+            return
+        try:
+            terminals = self._client.list_terminals()
+        except Exception as exc:
+            log.warning("run.terminal_phones_unavailable", error=str(exc))
+            return
+        phones = [
+            str(entry.get("value"))
+            for terminal in terminals
+            for entry in terminal.phone_numbers
+            if isinstance(entry, dict) and entry.get("value")
+        ]
+        self._internal = self._internal.with_phones(phones)
 
     def _finish(self, report: RunReport, error: str | None = None) -> None:
         with session_scope(self._sessions) as session:
@@ -240,7 +264,12 @@ class Pipeline:
                 max_loads=self._settings.max_loads_per_facility,
             )
             derived = structured_mentions(
-                repo, record, role, max_loads=self._settings.max_loads_per_facility
+                repo,
+                record,
+                role,
+                max_loads=self._settings.max_loads_per_facility,
+                internal=self._internal,
+                facility_names=[record.company_name, record.city, *bundle.identity.aliases],
             )
             if not bundle.sources and not derived:
                 repo.checkpoint(report.run_id, key, role, STAGE_NO_SOURCES)
@@ -274,8 +303,28 @@ class Pipeline:
                         "run.extraction_failed", facility=key, role=role.value, error=str(exc)
                     )
                     return
-                llm_mentions, issues = validate_and_convert(output.result, bundle)
+                llm_mentions, issues = validate_and_convert(
+                    output.result, bundle, internal=self._internal
+                )
                 report.validation_issues += len(issues)
+                for issue in issues:
+                    report.validation_issue_reasons[issue.reason] = (
+                        report.validation_issue_reasons.get(issue.reason, 0) + 1
+                    )
+                repo.save_extraction(
+                    run_id=report.run_id,
+                    key=key,
+                    role=role,
+                    model=output.model,
+                    prompt_version=output.prompt_version,
+                    request_id=output.request_id,
+                    input_tokens=output.usage.input_tokens,
+                    output_tokens=output.usage.output_tokens,
+                    cache_read_tokens=output.usage.cache_read_tokens,
+                    source_count=len(bundle.sources),
+                    raw=output.result.model_dump(mode="json"),
+                    issues=[issue.__dict__ for issue in issues],
+                )
                 for issue in issues:
                     log.debug("run.validation_issue", facility=key, **issue.__dict__)
                 for field_mentions in llm_mentions.values():

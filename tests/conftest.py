@@ -12,7 +12,14 @@ from sqlalchemy.orm import Session, sessionmaker
 from facility_profiles.config import RunMode, Settings
 from facility_profiles.storage.db import init_db, make_engine, session_factory
 from facility_profiles.storage.repository import Repository
-from facility_profiles.tpro.models import Dispatch, Facility, Load, LoadNote, TrackingNote
+from facility_profiles.tpro.models import (
+    Dispatch,
+    Facility,
+    Load,
+    LoadNote,
+    Terminal,
+    TrackingNote,
+)
 
 NOW = datetime(2026, 9, 22, 12, 0, tzinfo=UTC)
 
@@ -303,6 +310,18 @@ class FakeTPro:
     def get_dispatch_notes(self, dispatch_id: int) -> list[TrackingNote]:
         self.calls.append(f"get_dispatch_notes {dispatch_id}")
         return []
+
+    def list_terminals(self) -> list[Terminal]:
+        self.calls.append("list_terminals")
+        return [
+            Terminal.model_validate(
+                {
+                    "id": 1160,
+                    "title": "POD (X)",
+                    "phoneNumbers": [{"type": "MAIN", "value": "555-010-0100"}],
+                }
+            )
+        ]
 
     def close(self) -> None:
         return None

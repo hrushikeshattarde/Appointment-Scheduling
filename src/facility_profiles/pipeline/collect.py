@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from facility_profiles.domain.contacts import InternalContacts
 from facility_profiles.domain.normalize import html_to_text
 from facility_profiles.domain.schema import FacilityIdentity, Role, SourceType
 from facility_profiles.domain.scoring import Mention
@@ -29,6 +30,7 @@ log = get_logger(__name__)
 
 EXTRACTION_SOURCE_TYPES = {
     SourceType.STOP_NOTE,
+    SourceType.FACILITY_APPOINTMENTS,
     SourceType.FACILITY_DISPATCH_NOTES,
     SourceType.FACILITY_INTERNAL_COMMENTS,
     SourceType.FACILITY_BUSINESS_HOURS,
@@ -46,6 +48,28 @@ class CollectStats:
     new_sources: int = 0
     api_errors: int = 0
     errors: list[str] = field(default_factory=list)
+
+
+_APPOINTMENT_LABELS = {
+    "method": "method",
+    "contact": "contact",
+    "email": "email",
+    "phone": "phone",
+    "portalURL": "portal URL",
+    "notes": "notes",
+}
+
+
+def render_appointments(raw: str) -> str:
+    """Render the stored appointments JSON as quotable ``label: value`` lines."""
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return raw
+    if not isinstance(data, dict):
+        return raw
+    lines = [f"{label}: {data[key]}" for key, label in _APPOINTMENT_LABELS.items() if data.get(key)]
+    return "\n".join(lines) or raw
 
 
 def existing_values_from_facility(facility: Facility) -> ExistingValues:
@@ -244,7 +268,9 @@ def build_bundle(
         gate = source_type in {SourceType.LOAD_NOTE, SourceType.TRACKING_NOTE}
         builder.add(
             source_type,
-            doc.text,
+            render_appointments(doc.text)
+            if source_type is SourceType.FACILITY_APPOINTMENTS
+            else doc.text,
             load_id=doc.load_id,
             observed_at=as_utc(doc.observed_at),
             gate=gate,
@@ -253,7 +279,13 @@ def build_bundle(
 
 
 def structured_mentions(
-    repo: Repository, record: FacilityRecord, role: Role, *, max_loads: int
+    repo: Repository,
+    record: FacilityRecord,
+    role: Role,
+    *,
+    max_loads: int,
+    internal: InternalContacts | None = None,
+    facility_names: list[str | None] | None = None,
 ) -> list[Mention]:
     """Rule-based mentions from stored stop snapshots and the facility appointment block."""
     mentions: list[Mention] = []
@@ -267,7 +299,15 @@ def structured_mentions(
                 waypoint = Waypoint.model_validate(json.loads(doc.text))
             except (ValueError, TypeError):
                 continue
-            mentions.extend(mentions_from_stop(doc.load_id or 0, as_utc(doc.observed_at), waypoint))
+            mentions.extend(
+                mentions_from_stop(
+                    doc.load_id or 0,
+                    as_utc(doc.observed_at),
+                    waypoint,
+                    internal=internal,
+                    facility_names=facility_names or [record.company_name, record.city],
+                )
+            )
         elif source_type is SourceType.FACILITY_APPOINTMENTS and record.facility_id is not None:
             try:
                 facility = Facility.model_validate(
@@ -275,5 +315,7 @@ def structured_mentions(
                 )
             except (ValueError, TypeError):
                 continue
-            mentions.extend(mentions_from_facility(facility, as_utc(doc.observed_at)))
+            mentions.extend(
+                mentions_from_facility(facility, as_utc(doc.observed_at), internal=internal)
+            )
     return mentions

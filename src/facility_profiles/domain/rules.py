@@ -1,13 +1,18 @@
 """Write policy (FR-9) and the mapping from profile fields to Transport Pro facility fields.
 
-The rules never overwrite a value a person entered:
+The rules never overwrite a value a person entered, and agreement with the record is checked
+before any confidence threshold, because confirming an existing value is not a write:
 
-* conflict                                -> queue
-* confidence below the queue threshold    -> discard
-* human value present and equal           -> verify
-* human value present and different       -> queue
-* field empty and confidence >= write     -> write
-* otherwise                               -> queue
+* no mentions                                           -> skip
+* record value present and equal                        -> verify
+* record value present and different, material support -> queue
+* record value present and different, weak support     -> discard (record kept)
+* conflict                                              -> queue (informational fields: discard)
+* confidence below the queue threshold                  -> discard
+* confidence at or above the write threshold            -> write
+* otherwise                                             -> queue (informational fields: write)
+
+Informational fields carry no risk if wrong and are never put in front of a reviewer.
 """
 
 from __future__ import annotations
@@ -18,6 +23,8 @@ from typing import Any
 
 from facility_profiles.domain.normalize import normalize_email, normalize_phone, normalize_url
 from facility_profiles.domain.schema import BookingMethod, FacilityProfile, ProfileField
+
+INFORMATIONAL_FIELDS: frozenset[str] = frozenset({"time_granularity"})
 
 
 class Decision(StrEnum):
@@ -70,21 +77,31 @@ def decide(
     thresholds = thresholds or Thresholds()
     if scored.value is None or scored.mention_count == 0:
         return Ruling(Decision.SKIP, "no mentions")
+
+    informational = scored.name in INFORMATIONAL_FIELDS
+    source = (
+        "the value a person entered" if existing_is_human else "the value already on the record"
+    )
+    conf = f"confidence {scored.confidence:.2f}"
+
+    if existing_value is not None:
+        if values_equal(scored.name, scored.value, existing_value):
+            return Ruling(Decision.VERIFY, f"matches {source}")
+        if scored.conflict or scored.confidence >= thresholds.queue:
+            return Ruling(Decision.QUEUE, f"differs from {source}")
+        return Ruling(Decision.DISCARD, f"{conf} below queue threshold; {source} kept")
+
     if scored.conflict:
+        if informational:
+            return Ruling(Decision.DISCARD, "conflicting values on an informational field")
         return Ruling(Decision.QUEUE, "conflicting values with material support")
     if scored.confidence < thresholds.queue:
-        return Ruling(Decision.DISCARD, f"confidence {scored.confidence:.2f} below queue threshold")
-    if existing_is_human and existing_value is not None:
-        if values_equal(scored.name, scored.value, existing_value):
-            return Ruling(Decision.VERIFY, "matches the value a person entered")
-        return Ruling(Decision.QUEUE, "differs from the value a person entered")
-    if existing_value is not None and not values_equal(scored.name, scored.value, existing_value):
-        return Ruling(Decision.QUEUE, "differs from the value already on the record")
+        return Ruling(Decision.DISCARD, f"{conf} below queue threshold")
     if scored.confidence >= thresholds.write:
-        return Ruling(
-            Decision.WRITE, f"confidence {scored.confidence:.2f} at or above write threshold"
-        )
-    return Ruling(Decision.QUEUE, f"confidence {scored.confidence:.2f} between thresholds")
+        return Ruling(Decision.WRITE, f"{conf} at or above write threshold")
+    if informational:
+        return Ruling(Decision.WRITE, f"{conf}; informational field, no review needed")
+    return Ruling(Decision.QUEUE, f"{conf} between thresholds")
 
 
 # Transport Pro appointment methods seen on live records. Other enum members have no confirmed

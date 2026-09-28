@@ -1,8 +1,9 @@
 """Evidence validation and typed conversion of the model's output (FR-5, FR-6).
 
 Every quote must be found in the source it references; every phone, email and URL value must
-appear verbatim in the quoted source. Candidates that fail lose their quotes (or are dropped)
-and each failure is recorded as a :class:`ValidationIssue` for the run report.
+appear verbatim in the quoted source; Circle's own contact details and non-person contact names
+are rejected. Candidates that fail lose their quotes (or are dropped) and each failure is
+recorded as a :class:`ValidationIssue` for the run report.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from facility_profiles.domain.contacts import InternalContacts, looks_like_person_name
 from facility_profiles.domain.normalize import (
     extract_emails,
     extract_phones,
@@ -96,6 +98,22 @@ def _verbatim_present(field_name: str, value: Any, source_text: str) -> bool:
     return True
 
 
+def _contact_rejection(
+    field_name: str, value: Any, bundle: SourceBundle, internal: InternalContacts
+) -> str | None:
+    """Reason to drop a contact candidate outright, or None when it may stand."""
+    if field_name == "contact_email" and internal.is_internal_email(str(value)):
+        return "internal Circle contact"
+    if field_name == "contact_phone" and internal.is_internal_phone(str(value)):
+        return "internal Circle contact"
+    if field_name == "contact_name":
+        identity = bundle.identity
+        names = [identity.company_name, identity.city, *identity.aliases]
+        if not looks_like_person_name(str(value), names):
+            return "not a person name"
+    return None
+
+
 def _valid_quotes(
     field_name: str, value: Any, candidate_value: str, quotes: list[Quote], bundle: SourceBundle
 ) -> tuple[list[tuple[Quote, SourceDoc]], list[ValidationIssue]]:
@@ -154,7 +172,10 @@ def _mentions_for(
 
 
 def _convert_field(
-    field_name: str, block: FieldCandidates, bundle: SourceBundle
+    field_name: str,
+    block: FieldCandidates,
+    bundle: SourceBundle,
+    internal: InternalContacts,
 ) -> tuple[list[Mention], list[ValidationIssue]]:
     mentions: list[Mention] = []
     issues: list[ValidationIssue] = []
@@ -163,6 +184,10 @@ def _convert_field(
         value = coerce(field_name, candidate.value)
         if value is None:
             issues.append(ValidationIssue(field_name, candidate.value, "value not valid for field"))
+            continue
+        rejection = _contact_rejection(field_name, value, bundle, internal)
+        if rejection:
+            issues.append(ValidationIssue(field_name, candidate.value, rejection))
             continue
         kept, quote_issues = _valid_quotes(
             field_name, value, candidate.value, candidate.quotes, bundle
@@ -207,9 +232,13 @@ def _valid_hhmm(value: str) -> bool:
 
 
 def validate_and_convert(
-    result: ExtractionResult, bundle: SourceBundle
+    result: ExtractionResult,
+    bundle: SourceBundle,
+    *,
+    internal: InternalContacts | None = None,
 ) -> tuple[dict[str, list[Mention]], list[ValidationIssue]]:
     """Turn a model result into per-field mentions, dropping anything the sources do not back."""
+    internal = internal or InternalContacts()
     mentions: dict[str, list[Mention]] = {}
     issues: list[ValidationIssue] = []
 
@@ -225,7 +254,7 @@ def validate_and_convert(
         "time_granularity": result.time_granularity,
     }
     for name, block in simple_fields.items():
-        field_mentions, field_issues = _convert_field(name, block, bundle)
+        field_mentions, field_issues = _convert_field(name, block, bundle, internal)
         if field_mentions:
             mentions[name] = field_mentions
         issues.extend(field_issues)

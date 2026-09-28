@@ -1,14 +1,17 @@
 """Rule-based mentions from structured Transport Pro fields.
 
 These need no model call: stop appointment status, service level, confirmed windows, stop
-contacts and the facility record's own appointment fields. Their confidences are deliberately
-modest because the September 2026 sample showed these flags contradicting each other.
+contacts and the facility record's own appointment fields. Status and service-level confidences
+are modest because the September 2026 sample showed those flags contradicting each other;
+confirmed windows are trusted more because they are what actually happened.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import datetime
 
+from facility_profiles.domain.contacts import InternalContacts, looks_like_person_name
 from facility_profiles.domain.normalize import normalize_email, normalize_phone, normalize_url
 from facility_profiles.domain.schema import BookingMethod, SourceType
 from facility_profiles.domain.scoring import FACILITY_SOURCE_LOAD_ID, Mention
@@ -16,6 +19,7 @@ from facility_profiles.tpro.models import Facility, Waypoint
 
 STATUS_REQUIRES = {"confirmed", "requested", "appointment required"}
 STATUS_NOT_REQUIRED = {"not required"}
+CONFIRMED_WINDOW_CONFIDENCE = 0.8
 
 
 def booking_method_from_tpro(method: str | None) -> BookingMethod | None:
@@ -37,10 +41,17 @@ def booking_method_from_tpro(method: str | None) -> BookingMethod | None:
 
 
 def mentions_from_stop(
-    load_id: int, observed_at: datetime | None, waypoint: Waypoint
+    load_id: int,
+    observed_at: datetime | None,
+    waypoint: Waypoint,
+    *,
+    internal: InternalContacts | None = None,
+    facility_names: Iterable[str | None] = (),
 ) -> list[Mention]:
     """Structured signals from one stop on one load."""
     out: list[Mention] = []
+    internal = internal or InternalContacts()
+    names = list(facility_names)
 
     def add(field: str, value: object, source: SourceType, quote: str, conf: float) -> None:
         out.append(
@@ -70,7 +81,7 @@ def mentions_from_stop(
             granularity,
             SourceType.APPOINTMENT_TIMES,
             f"confirmed {appt.open} to {appt.close}",
-            0.5,
+            CONFIRMED_WINDOW_CONFIDENCE,
         )
 
     level = (waypoint.service_level or "").strip()
@@ -86,23 +97,29 @@ def mentions_from_stop(
         for raw in (contact.phone, contact.email):
             phone = normalize_phone(raw)
             email = normalize_email(raw)
-            if phone:
+            if phone and not internal.is_internal_phone(phone):
                 add("contact_phone", phone, SourceType.STOP_CONTACT, raw or "", 0.6)
-            elif email:
+            elif email and not internal.is_internal_email(email):
                 add("contact_email", email, SourceType.STOP_CONTACT, raw or "", 0.6)
-        if contact.name:
-            add("contact_name", contact.name.strip(), SourceType.STOP_CONTACT, contact.name, 0.5)
+        name = (contact.name or "").strip()
+        if name and looks_like_person_name(name, names):
+            conf = 0.5 if len(name.split()) > 1 else 0.3
+            add("contact_name", name, SourceType.STOP_CONTACT, contact.name or name, conf)
     return out
 
 
 def mentions_from_facility(
-    facility: Facility, observed_at: datetime | None = None
+    facility: Facility,
+    observed_at: datetime | None = None,
+    *,
+    internal: InternalContacts | None = None,
 ) -> list[Mention]:
     """Existing appointment fields on the facility record, as modest-confidence mentions."""
     out: list[Mention] = []
     appt = facility.appointments
     if appt is None:
         return out
+    internal = internal or InternalContacts()
 
     def add(field: str, value: object, quote: str, conf: float = 0.7) -> None:
         out.append(
@@ -125,13 +142,13 @@ def mentions_from_facility(
             add("appointment_required", False, f"method: {appt.method}", 0.6)
         elif method is not BookingMethod.PRESET_BY_CUSTOMER:
             add("appointment_required", True, f"method: {appt.method}", 0.5)
-    if appt.contact:
+    if appt.contact and looks_like_person_name(appt.contact, [facility.company_name]):
         add("contact_name", appt.contact.strip(), f"contact: {appt.contact}")
     phone = normalize_phone(appt.phone)
-    if phone:
+    if phone and not internal.is_internal_phone(phone):
         add("contact_phone", phone, f"phone: {appt.phone}")
     email = normalize_email(appt.email)
-    if email:
+    if email and not internal.is_internal_email(email):
         add("contact_email", email, f"email: {appt.email}")
     # Some records store an email address in the portal URL field; route it to the right field.
     if appt.portal_url:
@@ -139,6 +156,6 @@ def mentions_from_facility(
         misplaced_email = normalize_email(appt.portal_url)
         if url:
             add("portal_url", url, f"portalURL: {appt.portal_url}")
-        elif misplaced_email:
+        elif misplaced_email and not internal.is_internal_email(misplaced_email):
             add("contact_email", misplaced_email, f"portalURL: {appt.portal_url}", 0.5)
     return out

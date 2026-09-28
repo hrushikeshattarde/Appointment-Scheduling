@@ -216,6 +216,15 @@ def lookup(
                     )
 
 
+@app.command("repair-links")
+def repair_links() -> None:
+    """Merge duplicate stop links left by re-resolution and recount stops per facility."""
+    settings = _settings()
+    with session_scope(_sessions(settings)) as session:
+        removed, recounted = Repository(session).repair_links()
+    typer.echo(f"removed {removed} duplicate links; recounted {recounted} facilities")
+
+
 @review_app.command("list")
 def review_list(limit: int = 50) -> None:
     """List open review items."""

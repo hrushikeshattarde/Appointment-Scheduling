@@ -74,6 +74,12 @@ class Settings(BaseSettings):
     stale_after_days: int = Field(180, gt=0)
     geo_match_meters: float = Field(200.0, gt=0)
     name_match_threshold: int = Field(92, ge=0, le=100)
+    internal_email_domains: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["circledelivers.com"]
+    )
+    internal_phone_numbers: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["260-208-4500"]
+    )
 
     # --- Logging -------------------------------------------------------------------------
     log_level: str = "INFO"
@@ -94,6 +100,18 @@ class Settings(BaseSettings):
         if isinstance(value, list | tuple):
             return [int(part) for part in value]
         msg = "pilot_terminal_ids must be a comma-separated string or a list of integers"
+        raise TypeError(msg)
+
+    @field_validator("internal_email_domains", "internal_phone_numbers", mode="before")
+    @classmethod
+    def _split_csv(cls, value: object) -> list[str]:
+        if value is None or value == "":
+            return []
+        if isinstance(value, str):
+            return [part.strip() for part in value.split(",") if part.strip()]
+        if isinstance(value, list | tuple):
+            return [str(part).strip() for part in value if str(part).strip()]
+        msg = "expected a comma-separated string or a list"
         raise TypeError(msg)
 
     @model_validator(mode="after")

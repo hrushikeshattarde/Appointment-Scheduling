@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from facility_profiles.extraction.bundle import SourceBundle
 
-PROMPT_VERSION = "2026-09-22.1"
+PROMPT_VERSION = "2026-09-28.2"
 
 SYSTEM_PROMPT = f"""You extract how a freight facility (a shipper or receiver) takes \
 appointments, using only Circle Logistics' own records about that facility. \
@@ -26,15 +26,20 @@ characters) and references that source's tag. Do not paraphrase, do not combine 
 - appointment_required: "true" when the site needs a booked appointment, "false" when it is \
 first come first served or explicitly needs none.
 - booking_method: one of phone, email, web_portal, fcfs, preset_by_customer. Use \
-preset_by_customer when the customer or shipper sets the appointment and Circle only receives \
-it ("preset appt", "appointment scheduled by the customer"). Use fcfs for first come first \
-served, work-ins and walk-ins. Do not emit "unknown".
-- contact_name: a person's name only, as written. Not a company.
+preset_by_customer ONLY when a source says in so many words that the customer or shipper \
+schedules or presets the appointment ("preset appt", "appointment scheduled by the customer"). \
+A note that a load was "updated by the customer", an EDI or system update, or a tender change \
+is NOT a preset appointment. Use fcfs for first come first served, work-ins and walk-ins. \
+Do not emit "unknown".
+- contact_name: a person's first and/or last name as written. Never a company, department, \
+desk, warehouse, dock or system name: "Shipping", "CBG Warehouse", "7335 Scheduling", \
+"DATA DOCKS" and the facility's own name are not contact names. Leave it empty rather than \
+list one of those.
 - contact_phone: the number exactly as written in the source.
 - contact_email: the address exactly as written.
 - portal_url: the URL exactly as written.
 - portal_vendor: one of opendock, c3, datadocks, one_network, e2open, blue_yonder, retalix, \
-other. Infer from the URL or the name of the system.
+other. Infer from the URL or the name of the system, and quote that URL or name.
 - notice_period_hours: whole hours of advance notice. "72 HOUR NOTICE" -> "72"; "24 hr" -> "24"; \
 "2 days" -> "48"; "same day" -> "0".
 - time_granularity: exact when the site gives a single time, window when it gives a range, \
@@ -50,7 +55,12 @@ Rules
 tracking rules.
 - The bundle says whether this facility is the shipper or the receiver on these loads. Extract \
 the rules for that role. If a note clearly describes the other stop on the load, skip it.
-- Sources tagged as the facility's own record fields are one more source, not the truth.
+- Sources tagged facility_appointments, facility_business_hours, facility_dispatch_notes and \
+facility_internal_comments are the facility's own record in the TMS. Quote them like any other \
+source; they are one more source, not the truth.
+- Circle Logistics' own contact details are never facility contacts: skip any address ending \
+in @circledelivers.com and Circle office numbers such as 260-208-4500, and skip "ratecon" \
+mailboxes.
 - Old, contradictory or stale notes still count: list them as candidates so reviewers see the \
 disagreement.
 - Notes may be in Spanish: "cita" means appointment; "cita para cargar" (pickup) and "cita para \
@@ -60,7 +70,7 @@ descargar" (delivery) mean an appointment is required.
 
 
 def render_user_message(bundle: SourceBundle) -> str:
-    """Render the per-facility user message: identity, existing record fields, numbered sources."""
+    """Render the per-facility user message: identity line, then the numbered sources."""
     identity = bundle.identity
     lines: list[str] = [
         f"Facility: {identity.company_name or 'unknown name'}",
@@ -73,24 +83,6 @@ def render_user_message(bundle: SourceBundle) -> str:
         lines.append("Also appears as: " + "; ".join(identity.aliases[:8]))
     if identity.iana_timezone:
         lines.append(f"Local time zone: {identity.iana_timezone}")
-
-    existing = bundle.existing
-    if existing is not None and not existing.is_empty():
-        lines.append("")
-        lines.append(
-            "Appointment fields already on the facility record (treat as one more source):"
-        )
-        for label, value in (
-            ("method", existing.method),
-            ("contact", existing.contact),
-            ("email", existing.email),
-            ("phone", existing.phone),
-            ("portal URL", existing.portal_url),
-            ("notes", existing.notes),
-            ("business hours", existing.business_hours),
-        ):
-            if value:
-                lines.append(f"  {label}: {value}")
 
     lines.append("")
     lines.append(f"Sources ({len(bundle.sources)}):")

@@ -58,7 +58,7 @@ def test_bundle_dedupes_gates_and_tags_sources():
     assert bundle.load_ids == [1001, 1002, 1003]
     message = render_user_message(bundle)
     assert "[S2] stop_note | load 1001" in message and "same text on 2 more load(s)" in message
-    assert "method: Email Appointment" in message
+    assert "Appointment fields already" not in message  # record fields are tagged sources now
     assert "Role on these loads: shipper" in message
     assert "verbatim" in SYSTEM_PROMPT
 

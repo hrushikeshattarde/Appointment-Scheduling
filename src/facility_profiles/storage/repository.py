@@ -26,6 +26,7 @@ from facility_profiles.domain.schema import (
 from facility_profiles.storage.models import (
     AuditEntry,
     Checkpoint,
+    ExtractionRecord,
     FacilityAlias,
     FacilityLoadLink,
     FacilityRecord,
@@ -221,35 +222,121 @@ class Repository:
         score: int,
         observed_at: datetime | None,
     ) -> bool:
-        """Record that a load's stop resolved to this facility; returns True when new."""
+        """Record that a load's stop resolved to this facility; returns True when new or moved.
+
+        A stop is identified by (load, role, stop type). If it was previously linked to another
+        facility (for example a candidate key before the resolver learned the real facility), the
+        link and the stop's source documents move to the new facility instead of duplicating.
+        """
         stmt = select(FacilityLoadLink).where(
-            FacilityLoadLink.facility_key == key,
             FacilityLoadLink.load_id == load_id,
             FacilityLoadLink.role == role.value,
             FacilityLoadLink.stop_type == stop_type,
         )
-        if self.session.scalars(stmt).first() is not None:
+        existing = self.session.scalars(stmt).first()
+        if existing is not None and existing.facility_key == key:
             return False
-        self.session.add(
-            FacilityLoadLink(
-                facility_key=key,
-                load_id=load_id,
-                role=role.value,
-                stop_type=stop_type,
-                terminal_id=terminal_id,
-                resolution_method=method,
-                resolution_score=score,
-                observed_at=observed_at,
+        if existing is not None:
+            self._move_link(existing, key, method=method, score=score)
+        else:
+            self.session.add(
+                FacilityLoadLink(
+                    facility_key=key,
+                    load_id=load_id,
+                    role=role.value,
+                    stop_type=stop_type,
+                    terminal_id=terminal_id,
+                    resolution_method=method,
+                    resolution_score=score,
+                    observed_at=observed_at,
+                )
             )
-        )
         record = self.session.get(FacilityRecord, key)
         if record is not None:
             record.stop_count += 1
-            if observed_at and (
-                record.last_seen_load_at is None or observed_at > as_utc(record.last_seen_load_at)  # type: ignore[operator]
-            ):
+            last_seen = as_utc(record.last_seen_load_at)
+            if observed_at and (last_seen is None or observed_at > last_seen):
                 record.last_seen_load_at = observed_at
         return True
+
+    def _move_link(self, link: FacilityLoadLink, key: str, *, method: str, score: int) -> None:
+        old_key = link.facility_key
+        old_record = self.session.get(FacilityRecord, old_key)
+        if old_record is not None and old_record.stop_count > 0:
+            old_record.stop_count -= 1
+        link.facility_key = key
+        link.resolution_method = method
+        link.resolution_score = score
+        docs = self.session.scalars(
+            select(SourceDocument).where(
+                SourceDocument.facility_key == old_key,
+                SourceDocument.load_id == link.load_id,
+                SourceDocument.role == link.role,
+            )
+        ).all()
+        for doc in docs:
+            duplicate = self.session.scalars(
+                select(SourceDocument).where(
+                    SourceDocument.facility_key == key,
+                    SourceDocument.role == doc.role,
+                    SourceDocument.source_type == doc.source_type,
+                    SourceDocument.load_id == doc.load_id,
+                    SourceDocument.text_hash == doc.text_hash,
+                )
+            ).first()
+            if duplicate is None:
+                doc.facility_key = key
+            else:
+                self.session.delete(doc)
+        self.session.flush()
+
+    def repair_links(self) -> tuple[int, int]:
+        """Remove duplicate stop links left by earlier re-resolution and recount stops.
+
+        Returns (duplicate links removed, facilities recounted).
+        """
+        rows = self.session.execute(
+            select(FacilityLoadLink.load_id, FacilityLoadLink.role, FacilityLoadLink.stop_type)
+            .group_by(FacilityLoadLink.load_id, FacilityLoadLink.role, FacilityLoadLink.stop_type)
+            .having(func.count(FacilityLoadLink.id) > 1)
+        ).all()
+        removed = 0
+        for load_id, role, stop_type in rows:
+            links = self.session.scalars(
+                select(FacilityLoadLink)
+                .where(
+                    FacilityLoadLink.load_id == load_id,
+                    FacilityLoadLink.role == role,
+                    FacilityLoadLink.stop_type == stop_type,
+                )
+                .order_by(FacilityLoadLink.id.desc())
+            ).all()
+            linked = [
+                link
+                for link in links
+                if (rec := self.session.get(FacilityRecord, link.facility_key))
+                and rec.facility_id is not None
+            ]
+            keep = (linked or links)[0]
+            for extra in links:
+                if extra.id != keep.id:
+                    self.session.delete(extra)
+                    removed += 1
+        self.session.flush()
+        counts: dict[str, int] = {
+            str(fkey): int(n)
+            for fkey, n in self.session.execute(
+                select(FacilityLoadLink.facility_key, func.count(FacilityLoadLink.id)).group_by(
+                    FacilityLoadLink.facility_key
+                )
+            ).all()
+        }
+        recounted = 0
+        for record in self.session.scalars(select(FacilityRecord)):
+            record.stop_count = int(counts.get(record.key, 0))
+            recounted += 1
+        self.session.flush()
+        return removed, recounted
 
     def load_links(
         self, key: str, *, role: Role | None = None, limit: int | None = None
@@ -551,6 +638,53 @@ class Repository:
         """True when the facility already reached ``stage`` in this run."""
         row = self.session.get(Checkpoint, (run_id, key, role.value))
         return row is not None and row.stage == stage
+
+    # ------------------------------------------------------------------ extractions
+
+    def save_extraction(
+        self,
+        *,
+        run_id: str,
+        key: str,
+        role: Role,
+        model: str | None,
+        prompt_version: str | None,
+        request_id: str | None,
+        input_tokens: int,
+        output_tokens: int,
+        cache_read_tokens: int,
+        source_count: int,
+        raw: dict[str, Any],
+        issues: list[dict[str, Any]],
+    ) -> ExtractionRecord:
+        """Persist a raw model result and its validation issues for later inspection."""
+        row = ExtractionRecord(
+            run_id=run_id,
+            facility_key=key,
+            role=role.value,
+            model=model,
+            prompt_version=prompt_version,
+            request_id=request_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_tokens=cache_read_tokens,
+            source_count=source_count,
+            raw=raw,
+            issues=issues,
+        )
+        self.session.add(row)
+        return row
+
+    def extractions_for(self, key: str, *, limit: int = 10) -> list[ExtractionRecord]:
+        """Stored extractions for a facility, newest first."""
+        return list(
+            self.session.scalars(
+                select(ExtractionRecord)
+                .where(ExtractionRecord.facility_key == key)
+                .order_by(ExtractionRecord.created_at.desc())
+                .limit(limit)
+            )
+        )
 
     # ------------------------------------------------------------------ digest queries
 
