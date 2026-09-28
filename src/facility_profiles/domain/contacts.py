@@ -179,6 +179,11 @@ def looks_like_person_name(value: str | None, facility_names: Iterable[str | Non
         return False
     for name in facility_names:
         other = normalize_company_name(name)
-        if other and (norm == other or re.search(rf"\b{re.escape(norm)}\b", other)):
+        if not other:
+            continue
+        if norm == other or re.search(rf"\b{re.escape(norm)}\b", other):
+            return False
+        long_words = {w for w in norm.split() if len(w) >= 4}
+        if long_words & {w for w in other.split() if len(w) >= 4}:
             return False
     return True
