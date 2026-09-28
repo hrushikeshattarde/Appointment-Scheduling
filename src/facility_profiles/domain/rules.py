@@ -149,7 +149,9 @@ def _value(profile: FacilityProfile, name: str) -> Any:
 
 
 def format_hours(spans: Any) -> str | None:
-    """Render receiving-hours spans as ``0700-1430 MON-FRI`` style text."""
+    """Render receiving-hours spans as ``0700-1430 MON-FRI`` style text (text passes through)."""
+    if isinstance(spans, str):
+        return spans.strip() or None
     if not spans or not isinstance(spans, list):
         return None
     parts: list[str] = []

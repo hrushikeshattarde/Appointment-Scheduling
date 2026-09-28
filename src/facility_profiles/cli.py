@@ -25,6 +25,7 @@ from facility_profiles.config import Settings, get_settings
 from facility_profiles.logging import configure_logging, get_logger
 from facility_profiles.pipeline.digest import render_digest
 from facility_profiles.pipeline.export import export_profiles_csv
+from facility_profiles.pipeline.export_xlsx import export_workbook
 from facility_profiles.pipeline.run import Pipeline
 from facility_profiles.storage.db import init_db, make_engine, session_factory, session_scope
 from facility_profiles.storage.repository import Repository, unwrap
@@ -299,6 +300,50 @@ def export(out: Annotated[Path | None, typer.Option(help="CSV path")] = None) ->
     with session_scope(_sessions(settings)) as session:
         rows = export_profiles_csv(Repository(session), path)
     typer.echo(f"wrote {rows} rows to {path}")
+
+
+@app.command("export-xlsx")
+def export_xlsx(
+    out: Annotated[Path | None, typer.Option(help="Workbook path")] = None,
+) -> None:
+    """Export the store to Excel, with a Review Queue sheet reviewers can fill in."""
+    settings = _settings()
+    path = (
+        out
+        or Path(settings.export_dir) / f"facility-profiles-review-{date.today().isoformat()}.xlsx"
+    )
+    with session_scope(_sessions(settings)) as session:
+        stats = export_workbook(session, path)
+    typer.echo(
+        f"wrote {path}: {stats.queue} queue items, {stats.fields} fields, "
+        f"{stats.facilities} facilities, {stats.audit} audit rows"
+    )
+
+
+@review_app.command("import")
+def review_import(
+    file: Annotated[Path, typer.Argument(help="Filled-in workbook from export-xlsx")],
+    by: Annotated[str | None, typer.Option(help="Reviewer name for rows without one")] = None,
+    dry_run: Annotated[bool, typer.Option(help="Show what would be applied")] = False,
+) -> None:
+    """Apply the decisions typed into the Review Queue sheet."""
+    from facility_profiles.review.xlsx_import import apply_decisions, read_decisions
+
+    settings = _settings()
+    decisions, errors = read_decisions(file)
+    for err in errors:
+        typer.echo(f"skipped: {err}")
+    if not decisions:
+        typer.echo("no decisions found in the sheet")
+        raise typer.Exit(code=1 if errors else 0)
+    with session_scope(_sessions(settings)) as session:
+        result = apply_decisions(
+            Repository(session), decisions, default_reviewer=by, dry_run=dry_run
+        )
+    for err in result.errors:
+        typer.echo(f"skipped: {err}")
+    label = "would apply" if dry_run else "applied"
+    typer.echo(f"{label} {result.total_applied} decision(s): {result.applied}")
 
 
 @app.command()

@@ -10,6 +10,7 @@ classifiers = ["Private :: Do Not Upload"]
 dependencies = [
   "anthropic>=1.7,<2",
   "httpx>=0.28,<1",
+  "openpyxl>=3.1,<4",
   "pydantic>=2.11,<3",
   "pydantic-settings>=2.6,<3",
   "rapidfuzz>=3.10,<4",
@@ -76,7 +77,7 @@ mypy_path = "src"
 packages = ["facility_profiles"]
 
 [[tool.mypy.overrides]]
-module = ["rapidfuzz.*", "respx.*"]
+module = ["rapidfuzz.*", "respx.*", "openpyxl.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
