@@ -23,6 +23,7 @@ dependencies = [
 [project.optional-dependencies]
 api = ["fastapi>=0.115,<1", "uvicorn[standard]>=0.32,<1"]
 postgres = ["psycopg[binary]>=3.2,<4"]
+gmail = ["google-auth>=2.30,<3", "requests>=2.32,<3"]
 
 [project.scripts]
 facility-profiles = "facility_profiles.cli:app"
@@ -64,6 +65,7 @@ pydocstyle = { convention = "google" }
 "tests/**" = ["D", "S", "PLR", "ARG", "T20", "E501", "PT017", "PT018", "PLC0415", "SIM105", "C408"]
 "src/facility_profiles/cli.py" = ["T20", "PLC0415", "PLR0917"]
 "src/facility_profiles/api/app.py" = ["B008"]
+"src/facility_profiles/booking/mail.py" = ["PLC0415", "E501"]  # optional Google imports
 "scripts/**" = ["T20", "D103", "S603", "PLW1510", "E501", "PLR0912", "C901", "PLR0915", "PLC0415", "B034"]
 
 [tool.ruff.format]
@@ -78,7 +80,7 @@ mypy_path = "src"
 packages = ["facility_profiles"]
 
 [[tool.mypy.overrides]]
-module = ["rapidfuzz.*", "respx.*", "openpyxl.*"]
+module = ["rapidfuzz.*", "respx.*", "openpyxl.*", "google.*", "requests.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

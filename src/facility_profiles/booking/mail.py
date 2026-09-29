@@ -166,15 +166,20 @@ class RecordingMailer:
 
 def _gmail_session(key_path: Path, subject: str, scope: str) -> Any:
     try:
-        from google.auth.transport.requests import AuthorizedSession  # noqa: PLC0415
-        from google.oauth2 import service_account  # noqa: PLC0415
+        # Optional dependency (the `gmail` extra); typed either way for mypy.
+        from google.auth.transport import (
+            requests as gar,  # type: ignore[import-not-found,unused-ignore]  # fmt: skip
+        )
+        from google.oauth2 import (
+            service_account,  # type: ignore[import-not-found,unused-ignore]  # fmt: skip
+        )
     except ImportError as exc:  # pragma: no cover - environment guard
         msg = "install google-auth and requests to use Gmail"
         raise RuntimeError(msg) from exc
-    creds = service_account.Credentials.from_service_account_file(  # type: ignore[no-untyped-call]
+    creds = service_account.Credentials.from_service_account_file(  # type: ignore[no-untyped-call,unused-ignore]
         str(key_path), scopes=[scope]
     ).with_subject(subject)
-    return AuthorizedSession(creds)  # type: ignore[no-untyped-call]
+    return gar.AuthorizedSession(creds)  # type: ignore[no-untyped-call,unused-ignore]
 
 
 @dataclass
