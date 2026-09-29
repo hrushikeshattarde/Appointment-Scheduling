@@ -495,7 +495,7 @@ def apply_reply(
     return case.status
 
 
-def ingest(
+def ingest(  # noqa: PLR0912 - one branch per reply outcome
     session: Session,
     messages: list[InboundMessage],
     classifier: ReplyClassifier,
