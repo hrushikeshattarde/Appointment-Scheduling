@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import date
 
 import pytest
@@ -108,6 +109,10 @@ def test_cli_accepts_customer_option(tmp_path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("TPRO_PASSWORD", "p")
     monkeypatch.setenv("FP_DATABASE_URL", f"sqlite:///{(tmp_path / 'fp.db').as_posix()}")
     monkeypatch.setenv("FP_PILOT_CUSTOMER_IDS", "6680,7211")
+    # CI runners report a colour-capable terminal; keep the help text plain and wide.
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setenv("TERM", "dumb")
+    monkeypatch.setenv("COLUMNS", "200")
     monkeypatch.chdir(tmp_path)
     get_settings.cache_clear()
     try:
@@ -115,6 +120,7 @@ def test_cli_accepts_customer_option(tmp_path, monkeypatch: pytest.MonkeyPatch):
         for command in ("harvest", "run"):
             result = runner.invoke(app, [command, "--help"])
             assert result.exit_code == 0, result.output
-            assert "--customer" in result.output
+            plain = re.sub(r"\[[0-9;]*m", "", result.output)
+            assert "--customer" in plain, plain
     finally:
         get_settings.cache_clear()
