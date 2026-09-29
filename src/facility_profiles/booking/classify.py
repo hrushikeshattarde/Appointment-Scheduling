@@ -31,6 +31,8 @@ Rules:
 - status: "confirmed" when the vendor books the pickup: the requested slot ("SET!", "confirmed", \
 a pickup number alone), a restated slot, or a time only (then the date is the requested date); \
 "deferred" when they ask you to check back later because the order is not released or ready yet \
+(a reply like "these are good for the adjusted time below" with edited times in the quoted \
+text is a counter_offer at those edited times); \
 (put the day to check back in pickup_date); \
 "counter_offer" when they offer a different date or time instead; "question" when they need \
 something before booking (order number, PO, carrier name, driver info); "rejected" when they \
@@ -54,6 +56,7 @@ class ReplyContext:
     reply_sent_at: datetime
     subject: str
     body: str
+    quoted: str = ""
 
 
 @dataclass(frozen=True)
@@ -92,6 +95,12 @@ def render_user_message(context: ReplyContext) -> str:
         f"Reply date: {context.reply_sent_at:%Y-%m-%d %A %H:%M}\n"
         f"Subject: {context.subject}\n\n"
         f'Reply text:\n"""\n{context.body.strip()}\n"""'
+        + (
+            "\n\nQuoted text under the reply (the vendor may have edited dates or times in it):"
+            f'\n"""\n{context.quoted.strip()[:1500]}\n"""'
+            if context.quoted.strip()
+            else ""
+        )
     )
 
 

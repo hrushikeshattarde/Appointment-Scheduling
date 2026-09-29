@@ -41,6 +41,18 @@ log = get_logger(__name__)
 
 DELIVERY_REF_RE = re.compile(r"\b[A-Z]{3}_\d{6,}\b")
 PO_RE = re.compile(r"\b\d{9,15}\b")
+# Lidl's inbound desk writes a delivery slot as "8/20 7AM - GRM_200826926"; the pod writes its
+# own DCT bookings as "FRG_200526615 05/20 @ 1100". Both forms are read.
+DELIVERY_SLOT_RE = re.compile(
+    r"(?P<m>\d{1,2})/(?P<d>\d{1,2})(?:/(?P<y>\d{2,4}))?\s*(?:@|at)?\s*(?P<h>\d{1,2})(?::?(?P<min>\d{2}))?"
+    r"\s*(?P<ampm>AM|PM)?\s*-\s*(?P<ref>[A-Z]{3}_\d{6,})",
+    re.I,
+)
+DELIVERY_SLOT_REF_FIRST_RE = re.compile(
+    r"(?P<ref>[A-Z]{3}_\d{6,})\s+(?P<m>\d{1,2})/(?P<d>\d{1,2})(?:/(?P<y>\d{2,4}))?\s*(?:@|at)?\s*"
+    r"(?P<h>\d{1,2})(?::?(?P<min>\d{2}))?\s*(?P<ampm>AM|PM)?",
+    re.I,
+)
 TRUSTED_STATES = frozenset({"human_set", "verified", "written"})
 OPEN_STATUSES = (
     CaseStatus.NEW.value,
@@ -102,6 +114,7 @@ class IngestStats:
     unrelated: int = 0
     responded: int = 0
     deferred: int = 0
+    delivery_updates: int = 0
 
 
 # ------------------------------------------------------------------ profile and load helpers
@@ -175,6 +188,40 @@ def requested_local(
     while day.weekday() >= 5:  # vendors ship Monday to Friday
         day -= timedelta(days=1)
     return f"{day:%Y-%m-%d} {settings.booking_default_pickup_time}"
+
+
+def parse_delivery_slot(
+    text: str, *, year: int, timezone: str | None
+) -> tuple[datetime, str] | None:
+    """Read a Lidl delivery slot and DCT reference out of a message; returns (UTC start, ref)."""
+    match = DELIVERY_SLOT_RE.search(text) or DELIVERY_SLOT_REF_FIRST_RE.search(text)
+    if match is None:
+        return None
+    hour = int(match.group("h"))
+    minute = int(match.group("min") or 0)
+    ampm = (match.group("ampm") or "").upper()
+    if ampm == "PM" and hour < 12:
+        hour += 12
+    if ampm == "AM" and hour == 12:
+        hour = 0
+    if not ampm and match.group("min") is None and hour > 24:
+        return None
+    if not ampm and match.group("min") is None and len(match.group("h")) == 4:
+        hour, minute = int(match.group("h")[:2]), int(match.group("h")[2:])
+    raw_year = match.group("y")
+    yr = year if not raw_year else (int(raw_year) + 2000 if len(raw_year) == 2 else int(raw_year))
+    try:
+        local = datetime(
+            yr,
+            int(match.group("m")),
+            int(match.group("d")),
+            hour,
+            minute,
+            tzinfo=ZoneInfo(timezone or "America/New_York"),
+        )
+    except ValueError:
+        return None
+    return local.astimezone(UTC), match.group("ref").upper()
 
 
 def _event(
@@ -604,8 +651,13 @@ def ingest(  # noqa: PLR0912 - one branch per reply outcome
     *,
     internal_domains: list[str],
     responder: Responder | None = None,
+    customer_desk: str | None = None,
 ) -> IngestStats:
-    """Match inbound mail to cases, classify the replies, move the cases, draft answers."""
+    """Match inbound mail to cases, classify the replies, move the cases, draft answers.
+
+    Mail from the customer's inbound desk is not a vendor reply: it is read only for a new
+    delivery slot (date, time and DCT reference), which moves the pickup request.
+    """
     stats = IngestStats()
     internal = {d.lower() for d in internal_domains}
     for message in messages:
@@ -622,6 +674,10 @@ def ingest(  # noqa: PLR0912 - one branch per reply outcome
         if case is None:
             stats.unmatched += 1
             continue
+        if customer_desk and message.from_email == customer_desk.lower():
+            if _apply_customer_desk_message(session, case, message, responder):
+                stats.delivery_updates += 1
+            continue
         context = ReplyContext(
             vendor_name=case.vendor_name or "",
             po_numbers=[str(p) for p in case.po_numbers],
@@ -629,9 +685,10 @@ def ingest(  # noqa: PLR0912 - one branch per reply outcome
             reply_sent_at=message.sent_at,
             subject=message.subject,
             body=message.body,
+            quoted=message.quoted,
         )
         output = classifier.classify(context)
-        result, issues = validate_classification(output.result, message.body)
+        result, issues = validate_classification(output.result, message.full_text)
         stats.classified += 1
         inbound = BookingMessage(
             case_id=case.id,
@@ -688,6 +745,140 @@ def ingest(  # noqa: PLR0912 - one branch per reply outcome
                 stats.responded += 1
         session.flush()
     return stats
+
+
+def _apply_customer_desk_message(
+    session: Session, case: BookingCase, message: InboundMessage, responder: Responder | None
+) -> bool:
+    """Record a customer-desk message; on a new delivery slot, move the pickup request."""
+    slot = parse_delivery_slot(
+        message.full_text, year=message.sent_at.year, timezone=case.vendor_timezone
+    )
+    inbound = BookingMessage(
+        case_id=case.id,
+        direction="in",
+        kind="customer_desk",
+        from_addr=message.from_addr,
+        to_addr=message.to_addr,
+        cc_addr=message.cc_addr,
+        subject=message.subject,
+        body=message.body,
+        message_id=message.message_id,
+        thread_id=message.thread_id,
+        sent_at=message.sent_at,
+        classification=(
+            {"delivery_ref": slot[1], "delivery_at_utc": slot[0].isoformat()} if slot else {}
+        ),
+    )
+    case.messages.append(inbound)
+    session.flush()
+    if slot is None:
+        _event(session, case, "customer_desk_message", subject=message.subject)
+        return False
+    start, ref = slot
+    previous_ref, previous_at = case.delivery_ref, as_utc(case.delivery_at_utc)
+    case.delivery_ref = ref
+    case.delivery_at_utc = start
+    _event(
+        session,
+        case,
+        "delivery_updated",
+        previous_ref=previous_ref,
+        previous_at=previous_at.isoformat() if previous_at else None,
+        delivery_ref=ref,
+        delivery_at=start.isoformat(),
+    )
+    if case.status in (CaseStatus.APPROVED.value, CaseStatus.CLOSED.value):
+        return True
+    settings = responder.settings if responder is not None else None
+    if settings is None:
+        case.status = CaseStatus.NEEDS_HUMAN.value
+        case.reason = f"delivery moved to {ref}; re-request the pickup"[:255]
+        return True
+    new_request = requested_local(
+        tendered_pickup_utc=None,
+        delivery_at_utc=start,
+        timezone=case.vendor_timezone,
+        miles=case.miles,
+        settings=settings,
+    )
+    if new_request is None:
+        return True
+    if any(m.direction == "out" for m in case.messages) and responder is not None:
+        reschedule_case(
+            session,
+            case,
+            responder.mailer,
+            settings,
+            requested_local=new_request,
+            by="agent",
+            note="Due to the receiver's availability, we will need to move this pickup.",
+        )
+    else:
+        case.requested_local = new_request
+        case.status = CaseStatus.NEW.value
+        case.reason = None
+    return True
+
+
+def draft_batch(
+    session: Session, cases: list[BookingCase], mailer: Mailer, settings: Settings
+) -> list[BookingMessage]:
+    """Draft new cases, one email per vendor desk, the way the pod batches its requests."""
+    groups: dict[str, list[BookingCase]] = {}
+    for case in cases:
+        groups.setdefault((case.contact_email or "").lower(), []).append(case)
+    messages: list[BookingMessage] = []
+    repo = Repository(session)
+    for desk, group in groups.items():
+        if len(group) == 1 or not desk:
+            for case in group:
+                messages.append(draft_case(session, case, mailer, settings))
+            continue
+        group.sort(key=lambda c: c.requested_local or "")
+        profile = vendor_profile(repo, group[0].facility_key) if group[0].facility_key else None
+        date_only = bool(profile and profile.date_only)
+        first = compose_request(group[0], settings, profile)
+        ask = first.body.split("\n")[2]
+        lines = ["Hello,", "", ask, ""]
+        for case in group:
+            lines.extend(request_lines(case, date_only=date_only))
+        lines.extend(["", "Thank you!", "", settings.booking_signature])
+        pos = [str(p) for c in group for p in c.po_numbers]
+        subject = f"Pick Up Appointments: {' & '.join(pos)}" if pos else "Pick Up Appointments"
+        draft = OutboundDraft(
+            to_addr=desk,
+            cc_addr=", ".join(settings.booking_cc),
+            subject=subject,
+            body="\n".join(lines),
+        )
+        ref = mailer.create_draft(draft)
+        for case in group:
+            message = BookingMessage(
+                case_id=case.id,
+                direction="out",
+                kind="request",
+                to_addr=draft.to_addr,
+                cc_addr=draft.cc_addr,
+                subject=subject,
+                body=draft.body,
+                draft_ref=ref,
+            )
+            case.messages.append(message)
+            case.status = CaseStatus.DRAFTED.value
+            case.reason = None
+            session.flush()
+            _event(
+                session,
+                case,
+                "drafted",
+                draft_ref=ref,
+                to=desk,
+                subject=subject,
+                batched_with=[c.id for c in group if c.id != case.id],
+            )
+            messages.append(message)
+    return messages
 
 
 # ------------------------------------------------------------------ decisions

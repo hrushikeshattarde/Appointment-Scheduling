@@ -35,11 +35,21 @@ class InboundMessage:
     subject: str
     body: str
     in_reply_to: str | None = None
+    quoted: str = ""  # the quoted history under the reply (vendors edit times in it)
+
+    @property
+    def full_text(self) -> str:
+        """Own words plus the quoted part, for quote validation."""
+        return f"{self.body}\n{self.quoted}".strip()
 
     @property
     def from_email(self) -> str:
-        """Bare lower-cased sender address."""
-        return parseaddr(self.from_addr)[1].lower()
+        """Bare lower-cased sender address (display names may themselves contain an @)."""
+        angle = re.search(r"<([^>]+)>", self.from_addr)
+        if angle:
+            return angle.group(1).strip().lower()
+        found = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", self.from_addr)
+        return (found.group(0) if found else parseaddr(self.from_addr)[1]).lower()
 
     @property
     def from_domain(self) -> str:
@@ -47,14 +57,23 @@ class InboundMessage:
         return self.from_email.split("@")[-1]
 
 
+_QUOTE_SPLIT = re.compile(
+    r"\n(?:On .{0,160}wrote:|From: .{0,200}\n(?:Sent|Date): |-----Original Message-----|>|"
+    r"---- on .{0,120} wrote ----)"
+)
+
+
+def split_quoted(text: str) -> tuple[str, str]:
+    """Split a reply into its own words and the quoted history under them."""
+    match = _QUOTE_SPLIT.search(text)
+    if match is None:
+        return text.strip(), ""
+    return text[: match.start()].strip(), text[match.start() :].strip()
+
+
 def strip_quoted(text: str) -> str:
     """Keep only the reply's own words (drop quoted history and signatures' history)."""
-    cut = re.split(
-        r"\n(?:On .{0,160}wrote:|From: .{0,200}\n(?:Sent|Date): |-----Original Message-----|>)",
-        text,
-        maxsplit=1,
-    )
-    return cut[0].strip()
+    return split_quoted(text)[0]
 
 
 def load_messages_jsonl(path: Path) -> list[InboundMessage]:
@@ -65,6 +84,7 @@ def load_messages_jsonl(path: Path) -> list[InboundMessage]:
             if not line.strip():
                 continue
             m = json.loads(line)
+            own, quoted = split_quoted(m.get("body", ""))
             out.append(
                 InboundMessage(
                     message_id=str(m["id"]),
@@ -74,8 +94,9 @@ def load_messages_jsonl(path: Path) -> list[InboundMessage]:
                     to_addr=m.get("to", ""),
                     cc_addr=m.get("cc", ""),
                     subject=m.get("subject", ""),
-                    body=m.get("own_text") or strip_quoted(m.get("body", "")),
+                    body=m.get("own_text") or own,
                     in_reply_to=m.get("in_reply_to") or None,
+                    quoted=quoted,
                 )
             )
     return sorted(out, key=lambda x: x.sent_at)
@@ -262,6 +283,7 @@ def _from_gmail(msg: dict[str, Any]) -> InboundMessage:
         to_addr=headers.get("to", ""),
         cc_addr=headers.get("cc", ""),
         subject=headers.get("subject", ""),
-        body=strip_quoted(body),
+        body=split_quoted(body)[0],
         in_reply_to=headers.get("in-reply-to"),
+        quoted=split_quoted(body)[1],
     )

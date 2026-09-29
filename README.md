@@ -167,6 +167,15 @@ vendor's "check back on Monday" is honoured, with the nudge sent that day as "Ch
 this!"; and `booking reschedule ID --date --time --by [--note]` drafts the in-thread request
 for a new slot after a Circle-side miss, the most common event in the archive.
 
+Third pass through the archive added: the quoted history under a reply is shown to the classifier
+and counts for quote checks (vendors edit times inside it); `booking draft` batches new cases into
+one email per desk with one line per PO, like the pod; mail from the customer's inbound desk is
+never treated as a vendor reply but is read for a new delivery slot ("8/20 7AM - GRM_200826926"
+or "FRG_200526615 05/20 @ 1100"), which moves the pickup request in the vendor thread; and
+`booking delivery-updated` records a DCT rebooking a person made and drafts the pod's note to the
+desk. Lidl delivery slots themselves live in Lidl's DCT dock portal (AMB, CHL and FRZ tabs), which
+Circle books directly; the desk only helps when no slot is free.
+
 Tables: `booking_cases`, `booking_messages`, `booking_events` (created by `init-db`).
 Code: `booking/service.py` (cases), `booking/classify.py` (reply reading and validation),
 `booking/mail.py` (JSONL or Gmail in, `.eml` or Gmail drafts out).

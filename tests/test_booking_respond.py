@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from facility_profiles.booking.classify import FakeReplyClassifier, ReplyContext
-from facility_profiles.booking.mail import RecordingMailer
+from facility_profiles.booking.mail import InboundMessage, RecordingMailer
 from facility_profiles.booking.models import BookingCase, CaseStatus
 from facility_profiles.booking.respond import (
     AnswerDraft,
@@ -224,7 +224,7 @@ def test_rejection_drafts_a_note_to_the_customer_desk_and_money_talk_is_handed_o
         assert case.status == CaseStatus.NEEDS_HUMAN.value
         note = mailer.drafts[-1]
         assert note.to_addr == "inbound@lidl.us" and note.thread_id is None
-        assert note.subject == "226321092660 - pickup pushed by Koch Foods, Inc."
+        assert note.subject == "RESCHEDULE 226321092660"
         assert (
             "PO will not be ready until 10/07" in note.body
             and "new delivery appointment" in note.body
@@ -444,3 +444,62 @@ def test_follow_up_waits_for_the_vendor_check_back_day(settings, sessions):
         assert message is not None and message.kind == "follow_up"
         assert mailer.drafts[-1].body.startswith("Good Morning,\n\nChecking in on this!")
         assert "check back on 10/05" in case.events[-1].detail["reason"]
+
+
+def test_edited_times_in_the_quoted_text_count_as_a_counter_offer(settings, sessions):
+    from facility_profiles.booking.classify import validate_classification
+    from facility_profiles.booking.mail import split_quoted
+
+    settings = settings.model_copy(update={"pilot_terminal_ids": [1089]})
+    mailer = RecordingMailer()
+    case_id = _prepared_case(settings, sessions, mailer)
+    raw = (
+        "These are good for the adjusted time below..\n\nThank you\n\n"
+        "From: Megan Goodwin\nSent: Wednesday, August 12, 2026 3:36 PM\n"
+        "Subject: Lidl Pick Up Appointments\n\nPO# 226321092660 on 10/01 @ 1430\n"
+    )
+    own, quoted = split_quoted(raw)
+    assert own.startswith("These are good") and "on 10/01 @ 1430" in quoted
+
+    def script(ctx: ReplyContext) -> ReplyClassification:
+        assert "@ 1430" in ctx.quoted  # the classifier is shown the quoted part
+        return ReplyClassification(
+            status=ReplyStatus.COUNTER_OFFER,
+            pickup_date="2026-10-01",
+            pickup_time="14:30",
+            quotes=["PO# 226321092660 on 10/01 @ 1430"],
+        )
+
+    kept, issues = validate_classification(
+        script(ReplyContext("", [], None, NOW, "", own, quoted)), f"{own}\n{quoted}"
+    )
+    assert kept.status == ReplyStatus.COUNTER_OFFER and not issues
+
+    classifier = FakeReplyClassifier(script)
+    responder = Responder(settings, mailer, now=NOW)
+    with session_scope(sessions) as session:
+        case = session.get(BookingCase, case_id)
+        assert case is not None
+        message = InboundMessage(
+            message_id="q9",
+            thread_id="t1",
+            sent_at=datetime(2026, 9, 30, 15, 0, tzinfo=UTC),
+            from_addr="gweaver@delgrossos.com",
+            to_addr="",
+            cc_addr="",
+            subject="Re: Pick Up Appointment: 226321092660",
+            body=own,
+            quoted=quoted,
+        )
+        ingest(
+            session,
+            [message],
+            classifier,
+            internal_domains=["circledelivers.com"],
+            responder=responder,
+        )
+        # 14:30 on 10/01 still makes the delivery, so the agent accepts it.
+        assert (
+            case.status == CaseStatus.PROPOSED.value and case.confirmed_local == "2026-10-01 14:30"
+        )
+        assert mailer.drafts[-1].body.startswith("Yes, 10/01 @ 1430 works.")

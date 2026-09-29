@@ -437,11 +437,17 @@ class Responder:
             return ResponsePlan(ResponseIntent.HANDOFF, "vendor cannot ship; no customer desk set")
         pos = " & ".join(str(p) for p in case.po_numbers) or f"load {case.load_id}"
         quote = (result.question or text).strip().replace("\n", " ")[:300]
+        ready = (
+            f" Shipper needs to ship this out on {_fmt(result.pickup_date, None)}."
+            if result.pickup_date
+            else ""
+        )
         body = (
             "Hello,\n\n"
-            f"Please see the note below from {case.vendor_name or 'the shipper'} on PO# {pos}:\n\n"
+            f"Please see the below from {case.vendor_name or 'the shipper'} on PO# {pos}:\n\n"
             f'"{quote}"\n\n'
-            "Can you please assist with a new delivery appointment? Thank you!\n\n"
+            f"{ready.strip()} Can you please assist with a new delivery appointment?\n\n"
+            "Thank you!\n\n"
             f"{self.settings.booking_signature}"
         )
         return ResponsePlan(
@@ -595,7 +601,7 @@ class Responder:
     def _subject(self, case: BookingCase, reply: BookingMessage | None, plan: ResponsePlan) -> str:
         if plan.intent == ResponseIntent.ESCALATE_TO_CUSTOMER:
             pos = " & ".join(str(p) for p in case.po_numbers) or f"load {case.load_id}"
-            return f"{pos} - pickup pushed by {case.vendor_name or 'shipper'}"
+            return f"RESCHEDULE {pos}"
         base = (reply.subject if reply and reply.subject else None) or next(
             (m.subject for m in case.messages if m.direction == "out" and m.subject), ""
         )

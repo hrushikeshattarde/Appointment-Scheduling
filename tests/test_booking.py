@@ -509,3 +509,117 @@ def test_reschedule_drafts_in_thread_and_resets_the_slot(settings, sessions):
             case.events[-1].action == "reschedule"
             and case.events[-1].detail["previous"] == "2026-10-01 09:00"
         )
+
+
+def test_parse_delivery_slot_reads_both_forms_lidl_uses():
+    from facility_profiles.booking.service import parse_delivery_slot
+
+    got = parse_delivery_slot(
+        "Here is an updated appointment! 8/20 7AM - GRM_200826926.",
+        year=2026,
+        timezone="America/New_York",
+    )
+    assert got == (datetime(2026, 8, 20, 11, 0, tzinfo=UTC), "GRM_200826926")
+    got = parse_delivery_slot(
+        "New Appointment: FRG_200526615 05/20 @ 1100", year=2026, timezone="America/New_York"
+    )
+    assert got == (datetime(2026, 5, 20, 15, 0, tzinfo=UTC), "FRG_200526615")
+    got = parse_delivery_slot(
+        "your new appointment on 8/20 at 8AM - FRG_200826660",
+        year=2026,
+        timezone="America/New_York",
+    )
+    assert got is not None and got[1] == "FRG_200826660" and got[0].hour == 12
+    got = parse_delivery_slot("9/30 at 1100 PYE_300926723", year=2026, timezone="America/New_York")
+    assert got is None  # no dash and reference after a bare 24h time: not one of the two forms
+    assert parse_delivery_slot("Thanks for the update!", year=2026, timezone=None) is None
+
+
+def test_customer_desk_slot_moves_the_pickup_and_redrafts_in_thread(settings, sessions):
+    from facility_profiles.booking.respond import Responder
+
+    settings = settings.model_copy(update={"pilot_terminal_ids": [1089]})
+    seed_vendor(sessions)
+    client = FakeTPro([lidl_load(9101, po="104419082630")], {})
+    scan(client, sessions, settings, days_ahead=7, now=NOW)  # type: ignore[arg-type]
+    mailer = RecordingMailer()
+    classifier = FakeReplyClassifier(lambda _c: ReplyClassification(status=ReplyStatus.UNRELATED))
+    with session_scope(sessions) as session:
+        case = list_cases(session)[0]
+        draft_case(session, case, mailer, settings)
+        mark_sent(session, case, by="megan", thread_id="tv")
+        case.status = CaseStatus.NEEDS_HUMAN.value
+        lidl = InboundMessage(
+            message_id="z1",
+            thread_id="tz",
+            sent_at=datetime(2026, 9, 30, 19, 5, tzinfo=UTC),
+            from_addr="inbound @lidl.us <inbound@lidl.us>",
+            to_addr="megan.goodwin@circledelivers.com",
+            cc_addr="lidl@circledelivers.com",
+            subject="104419082630 NO COVERAGE",
+            body="Here is an updated appointment! 10/6 7AM - GRM_061026926.\n\nLet me know if you need anything else.",
+        )
+        stats = ingest(
+            session,
+            [lidl],
+            classifier,
+            internal_domains=["circledelivers.com"],
+            responder=Responder(settings, mailer, now=NOW),
+            customer_desk="inbound@lidl.us",
+        )
+        assert stats.delivery_updates == 1 and stats.classified == 0
+        assert case.delivery_ref == "GRM_061026926"
+        assert as_utc(case.delivery_at_utc) == datetime(2026, 10, 6, 11, 0, tzinfo=UTC)
+        # The pickup was re-requested in the vendor thread, backed off the new delivery.
+        assert case.status == CaseStatus.SENT.value
+        assert case.requested_local == "2026-10-02 09:00"
+        assert mailer.drafts[-1].to_addr == "cci@udfinc.com" and mailer.drafts[-1].thread_id == "tv"
+        assert (
+            "Can we please reschedule PO# 104419082630 on 10/02 @ 0900?" in mailer.drafts[-1].body
+        )
+        assert [m.kind for m in case.messages] == ["request", "customer_desk", "reschedule"]
+        assert any(e.action == "delivery_updated" for e in case.events)
+
+        # A customer-desk message without a slot is recorded and leaves the case alone.
+        stats = ingest(
+            session,
+            [
+                InboundMessage(
+                    message_id="z2",
+                    thread_id="tz",
+                    sent_at=datetime(2026, 9, 30, 19, 30, tzinfo=UTC),
+                    from_addr="inbound@lidl.us",
+                    to_addr="",
+                    cc_addr="",
+                    subject="Re: 104419082630 NO COVERAGE",
+                    body="Thanks for the update!",
+                )
+            ],
+            classifier,
+            internal_domains=["circledelivers.com"],
+            customer_desk="inbound@lidl.us",
+        )
+        assert stats.delivery_updates == 0 and case.status == CaseStatus.SENT.value
+
+
+def test_draft_batch_writes_one_email_per_desk(settings, sessions):
+    from facility_profiles.booking.service import draft_batch
+
+    settings = settings.model_copy(update={"pilot_terminal_ids": [1089]})
+    seed_vendor(sessions)
+    loads = [lidl_load(9201, po="104419082630"), lidl_load(9202, po="104421082660")]
+    loads[1]["waypoints"][0]["appointmentTime"]["open"] = "2026-10-03T15:00:00Z"
+    client = FakeTPro(loads, {})
+    scan(client, sessions, settings, days_ahead=7, now=NOW)  # type: ignore[arg-type]
+    mailer = RecordingMailer()
+    with session_scope(sessions) as session:
+        cases = list_cases(session, CaseStatus.NEW.value)
+        messages = draft_batch(session, cases, mailer, settings)
+        assert len(messages) == 2 and len(mailer.drafts) == 1
+        draft = mailer.drafts[0]
+        assert draft.subject == "Pick Up Appointments: 104419082630 & 104421082660"
+        assert "PO# 104419082630 on 10/01 @ 0900\nPO# 104421082660 on 10/03 @ 1100" in draft.body
+        assert "ALL IN ONE TRUCK" not in draft.body
+        assert all(c.status == CaseStatus.DRAFTED.value for c in cases)
+        assert messages[0].draft_ref == messages[1].draft_ref
+        assert cases[0].events[-1].detail["batched_with"] == [cases[1].id]

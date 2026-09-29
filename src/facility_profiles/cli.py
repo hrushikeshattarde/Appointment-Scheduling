@@ -445,28 +445,109 @@ def booking_draft(
         int | None, typer.Argument(help="Case to draft; omit for all new cases")
     ] = None,
 ) -> None:
-    """Compose the request email and save it as a draft (.eml in the drafts folder)."""
+    """Compose the request emails as drafts, one per vendor desk (.eml in the drafts folder)."""
     from facility_profiles.booking.mail import LocalDraftMailer
     from facility_profiles.booking.models import CaseStatus
-    from facility_profiles.booking.service import draft_case, list_cases
+    from facility_profiles.booking.service import draft_batch, draft_case, list_cases
 
     settings = _settings()
     mailer = LocalDraftMailer(Path(settings.booking_drafts_dir), sender=settings.booking_sender)
     with session_scope(_sessions(settings)) as session:
-        cases = (
-            [_booking_case(session, case_id)]
-            if case_id is not None
-            else list_cases(session, CaseStatus.NEW.value)
-        )
-        for case in cases:
+        if case_id is not None:
             try:
-                message = draft_case(session, case, mailer, settings)
+                messages = [draft_case(session, _booking_case(session, case_id), mailer, settings)]
             except ValueError as exc:
-                typer.echo(f"#{case.id}: {exc}")
-                continue
+                typer.echo(f"#{case_id}: {exc}")
+                raise typer.Exit(code=1) from exc
+        else:
+            cases = [c for c in list_cases(session, CaseStatus.NEW.value) if c.contact_email]
+            messages = draft_batch(session, cases, mailer, settings)
+        for message in messages:
             typer.echo(
-                f"#{case.id} drafted -> {message.to_addr}: {message.subject}  [{message.draft_ref}]"
+                f"#{message.case_id} drafted -> {message.to_addr}: {message.subject}  "
+                f"[{message.draft_ref}]"
             )
+
+
+@booking_app.command("delivery-updated")
+def booking_delivery_updated(
+    case_id: int,
+    ref: Annotated[str, typer.Option(help="New DCT reference, e.g. FRG_200526615")],
+    date: Annotated[str, typer.Option(help="New delivery date, YYYY-MM-DD")],
+    time: Annotated[str, typer.Option(help="New delivery time, HH:MM local")],
+    by: Annotated[str, typer.Option(help="Who rebooked it in DCT")],
+    note: Annotated[str | None, typer.Option(help="Why, e.g. We missed the pickup today")] = None,
+    tag: Annotated[str, typer.Option(help="Subject tag")] = "MISSED PICK UP",
+) -> None:
+    """A person rebooked the Lidl delivery in DCT: record it and draft the note to Lidl's desk."""
+    from zoneinfo import ZoneInfo
+
+    from facility_profiles.booking.mail import LocalDraftMailer, OutboundDraft
+    from facility_profiles.booking.models import BookingEvent, BookingMessage
+
+    settings = _settings()
+    if not settings.booking_customer_desk:
+        typer.echo("FP_BOOKING_CUSTOMER_DESK is not set")
+        raise typer.Exit(code=2)
+    mailer = LocalDraftMailer(Path(settings.booking_drafts_dir), sender=settings.booking_sender)
+    with session_scope(_sessions(settings)) as session:
+        case = _booking_case(session, case_id)
+        local = datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M").replace(
+            tzinfo=ZoneInfo(case.vendor_timezone or "America/New_York")
+        )
+        previous = case.delivery_ref
+        case.delivery_ref = ref.upper()
+        case.delivery_at_utc = local.astimezone(UTC)
+        pos = " & ".join(str(p) for p in case.po_numbers) or f"load {case.load_id}"
+        body = "\n".join(
+            [
+                "Hello,",
+                "",
+                f"{(note or 'We missed the pickup for this today.').strip()} "
+                f"I rescheduled the load in DCT for delivery on {local:%m/%d}. "
+                "Can you please delete my original appointment?",
+                "",
+                f"New Appointment: {ref.upper()} {local:%m/%d} @ {local:%H%M}",
+                "",
+                "Thank you!",
+                "",
+                settings.booking_signature,
+            ]
+        )
+        draft = OutboundDraft(
+            to_addr=settings.booking_customer_desk,
+            cc_addr=", ".join(settings.booking_cc),
+            subject=f"{pos} {tag}",
+            body=body,
+        )
+        draft_ref = mailer.create_draft(draft)
+        case.messages.append(
+            BookingMessage(
+                case_id=case.id,
+                direction="out",
+                kind="notify_customer_desk",
+                to_addr=draft.to_addr,
+                cc_addr=draft.cc_addr,
+                subject=draft.subject,
+                body=draft.body,
+                draft_ref=draft_ref,
+            )
+        )
+        session.add(
+            BookingEvent(
+                case_id=case.id,
+                action="delivery_updated",
+                actor=by,
+                detail={
+                    "previous_ref": previous,
+                    "delivery_ref": ref.upper(),
+                    "draft_ref": draft_ref,
+                },
+            )
+        )
+    typer.echo(
+        f"#{case_id} delivery now {ref.upper()} {date} {time}; note to Lidl drafted [{draft_ref}]"
+    )
 
 
 @booking_app.command("reschedule")
@@ -594,6 +675,7 @@ def booking_inbox(
             classifier,
             internal_domains=settings.internal_email_domains,
             responder=responder,
+            customer_desk=settings.booking_customer_desk,
         )
     typer.echo(json.dumps(stats.__dict__, indent=2))
 
