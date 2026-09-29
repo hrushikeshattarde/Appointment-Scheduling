@@ -123,16 +123,24 @@ class Pipeline:
         self,
         *,
         terminal_ids: list[int] | None = None,
+        customer_ids: list[int] | None = None,
         start: date | None = None,
         end: date | None = None,
     ) -> dict[str, Any]:
-        """Pull loads for the terminals and date range and store facilities, links and notes."""
+        """Pull loads for the terminals, customers and date range; store facilities and notes.
+
+        ``customer_ids`` (default ``FP_PILOT_CUSTOMER_IDS``) restricts the harvest to loads billed
+        to those Transport Pro customers; empty means every customer on the terminal.
+        """
         if self._client is None:
             msg = "harvest needs a Transport Pro client"
             raise RuntimeError(msg)
         end = end or self._now.date()
         start = start or end - timedelta(days=self._settings.lookback_days)
         terminals: list[int | None] = list(terminal_ids or self._settings.pilot_terminal_ids) or [
+            None
+        ]
+        customers: list[int | None] = list(customer_ids or self._settings.pilot_customer_ids) or [
             None
         ]
         with session_scope(self._sessions) as session:
@@ -143,13 +151,23 @@ class Pipeline:
                 name_threshold=self._settings.name_match_threshold,
             )
             harvester = Harvester(repo, resolver)
-            loads = iter_terminal_loads(self._client, terminal_ids=terminals, start=start, end=end)
+            loads = iter_terminal_loads(
+                self._client,
+                terminal_ids=terminals,
+                customer_ids=customers,
+                start=start,
+                end=end,
+            )
             for index, load in enumerate(loads, start=1):
                 harvester.ingest_load(load)
                 if index % 200 == 0:
                     session.commit()
                     log.info("harvest.progress", loads=index, stops=harvester.stats.stops)
             stats = harvester.stats.as_dict()
+            stats["terminal_ids"] = [t for t in terminals if t is not None]
+            stats["customer_ids"] = [c for c in customers if c is not None]
+            stats["start"] = start.isoformat()
+            stats["end"] = end.isoformat()
         log.info("harvest.done", **stats)
         return stats
 
@@ -162,6 +180,7 @@ class Pipeline:
         refresh_only: bool = False,
         facility_cap: int | None = None,
         terminal_ids: list[int] | None = None,
+        customer_ids: list[int] | None = None,
         run_id: str | None = None,
     ) -> RunReport:
         """Execute a full run; returns the report also stored on the run row."""
@@ -182,7 +201,7 @@ class Pipeline:
         try:
             self._learn_internal_phones()
             if do_harvest:
-                report.harvest = self.harvest(terminal_ids=terminal_ids)
+                report.harvest = self.harvest(terminal_ids=terminal_ids, customer_ids=customer_ids)
             self._process_facilities(report, refresh_only=refresh_only, facility_cap=facility_cap)
             report.status = "completed"
         except Exception as exc:

@@ -504,6 +504,7 @@ class Repository:
         existing.state = state.value
         existing.origin = ValueOrigin.HUMAN.value
         existing.confidence = 1.0
+        existing.conflict = False  # a person settled it
         existing.updated_at = utcnow()
         self.session.flush()
         return existing
@@ -541,6 +542,29 @@ class Repository:
         item.candidates = [c.model_dump(mode="json") for c in scored.candidates]
         item.reason = reason[:255]
         item.run_id = run_id
+        self.session.flush()
+        return item
+
+    def ask_review(
+        self,
+        key: str,
+        role: Role,
+        field_name: str,
+        *,
+        reason: str,
+        proposed: Any = None,
+    ) -> ReviewItem:
+        """Open (or refresh) a question for a person about a field, outside a run."""
+        current = self.fields(key, role).get(field_name)
+        item = self.open_review_item(key, role, field_name)
+        if item is None:
+            item = ReviewItem(facility_key=key, role=role.value, field_name=field_name)
+            self.session.add(item)
+        item.proposed = wrap(proposed)
+        item.existing = wrap(unwrap(current.value) if current else None)
+        item.candidates = []
+        item.reason = reason[:255]
+        item.run_id = None
         self.session.flush()
         return item
 

@@ -54,11 +54,15 @@ MCP server, so the existing file can be reused. Never commit `.env`.
 | --- | --- |
 | `facility-profiles check-tpro` | Authenticates and reads one terminal list and one load page. Read-only smoke test. |
 | `facility-profiles harvest --terminal 1160 --days 90` | Pulls loads by pickup-date windows, resolves stops to facilities, stores links and stop notes (FR-1, FR-2). |
+| `facility-profiles harvest --terminal 1089 --customer 6680 --customer 7211` | Same, restricted to loads billed to the given Transport Pro customer IDs (`customerId` on `/load/search`). Use it for a pod that serves many shippers, such as the Lidl inbound and outbound customers on the Megan Goodwin pod. `run` takes the same `--customer` option; `FP_PILOT_CUSTOMER_IDS` sets the default. |
 | `facility-profiles run [--no-harvest] [--refresh] [--cap N] [--terminal ID] [--fake-llm] [--offline] [--resume RUN_ID]` | Full run: collect, extract, score and apply every facility. `--refresh` only re-processes facilities with new sources. `--resume` continues a failed run. |
 | `facility-profiles lookup 196508` / `lookup "carolina beverage"` | Shows the stored profile, per role, with confidence and state per field. |
 | `facility-profiles review list` / `accept ID --by NAME` / `edit ID --value V --by NAME` / `reject ID --by NAME` | Works the review queue (FR-11). Decisions become human-set values the routine never overwrites. |
+| `facility-profiles profile set FACILITY ROLE FIELD --value V --by NAME [--reason TEXT]` | Files a human-set value by hand (a store key, Transport Pro location ID or unique name), closes any open queue item for that field and audits the reason. The routine never overwrites it. |
+| `facility-profiles profile summary FACILITY ROLE --text TEXT --by NAME` | Replaces the scheduling summary with a human-written one. |
+| `facility-profiles profile ask FACILITY ROLE FIELD --reason TEXT [--proposed V]` | Puts a question on the review queue outside a run, for example the booking address of a vendor. |
 | `facility-profiles export [--out file.csv]` | Trusted values in Transport Pro field names for the vendor bulk import (FR-10). |
-| `facility-profiles export-xlsx [--out file.xlsx]` | Reviewer workbook: a Review Queue sheet with Decision (accept/edit/reject), Corrected value and Reviewer columns, plus Profile Fields, Scheduling Summaries, Facilities, Audit Log and Runs sheets. |
+| `facility-profiles export-xlsx [--out file.xlsx] [--facility F ...]` | Reviewer workbook: a Review Queue sheet with Decision (accept/edit/reject), Corrected value and Reviewer columns, plus Profile Fields, Scheduling Summaries, Facilities, Audit Log and Runs sheets. `--facility` (repeatable) restricts every sheet to those facilities, for a focused hand-off. |
 | `facility-profiles review import file.xlsx [--by NAME] [--dry-run]` | Reads the filled-in Review Queue sheet and applies each decision as a human-set value; rows with a blank Decision are skipped and problems are listed per row. |
 | `facility-profiles digest [--out file.md]` | Markdown digest for the pod lead: what the run did, what needs a decision (FR-13). |
 | `uvicorn facility_profiles.api.app:create_app --factory` | Lookup and review HTTP API (`/facilities/{id}`, `/facilities?name=`, `/review`, `/digest`). Needs the `api` extra. |
@@ -93,6 +97,26 @@ One load can reach at most 0.5, two agreeing loads 0.75, three or more 1.0. Then
 | otherwise | queue |
 
 A field not seen in any source for `FP_STALE_AFTER_DAYS` (180) is marked stale and queued.
+
+## One store per pod
+
+`run` profiles every facility in the store and `export-xlsx` exports the whole store, so each
+pilot pod gets its own SQLite file. Point `FP_DATABASE_URL` at it for every command of that pod:
+
+```powershell
+$env:FP_DATABASE_URL = 'sqlite:///./data/facility_profiles_pod-1089-lidl.db'
+facility-profiles harvest --terminal 1089 --customer 6680 --customer 7211 --days 90
+facility-profiles run --no-harvest --terminal 1089 --customer 6680 --customer 7211 --budget 8
+facility-profiles export-xlsx --out exports/facility-profiles-review-pod-1089-lidl-2026-09-29.xlsx
+```
+
+Stores so far: `data/facility_profiles.db` (terminal 1160, POD Frankie Saiz, all customers) and
+`data/facility_profiles_pod-1089-lidl.db` (terminal 1089, POD Megan Goodwin, Lidl inbound 7211
+and Lidl outbound 6680 only).
+
+### Lidl vendor profiles (POD Megan Goodwin)
+
+Lidl store deliveries are tours planned by Lidl (nothing to book), so the bookable facilities on that pod are the twelve vendor pickup sites on Lidl - Inbound loads. `scripts/seed_lidl_vendor_profiles.py` files what the Transport Pro notes and the lidl@ group mail established for them (firm appointments, exact times, driver rules, and for Morgan Foods the email booking desk) as human-set values with their evidence, and queues the two questions Megan has to answer per vendor: booking channel and appointment-desk address. Hand-off workbook: `export-xlsx --facility <vendor> ...`; her answers come back through `review import`. `scripts/seed_lidl_vendor_mail_findings.py` then files the booking channels confirmed in the lidl@ Google Groups archive (Opendock for Polar Fitzgerald, email desks for the rest, inbound@lidl.us for the RDC delivery slots), each with the thread it rests on.
 
 ## Review flow for CSRs
 

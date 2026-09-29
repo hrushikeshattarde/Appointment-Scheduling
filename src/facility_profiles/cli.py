@@ -3,6 +3,7 @@
 facility-profiles init-db
 facility-profiles check-tpro
 facility-profiles harvest --terminal 1160 --days 90
+facility-profiles harvest --terminal 1089 --customer 6680 --customer 7211 --days 90
 facility-profiles run --no-harvest --cap 50
 facility-profiles lookup 196508
 facility-profiles review list | accept 12 --by name | edit 12 --value ... | reject 12
@@ -22,17 +23,24 @@ import typer
 
 from facility_profiles import __version__
 from facility_profiles.config import Settings, get_settings
+from facility_profiles.domain.schema import PROFILE_FIELDS, FieldState, Role
 from facility_profiles.logging import configure_logging, get_logger
 from facility_profiles.pipeline.digest import render_digest
 from facility_profiles.pipeline.export import export_profiles_csv
 from facility_profiles.pipeline.export_xlsx import export_workbook
 from facility_profiles.pipeline.run import Pipeline
 from facility_profiles.storage.db import init_db, make_engine, session_factory, session_scope
+from facility_profiles.storage.models import FacilityRecord
 from facility_profiles.storage.repository import Repository, unwrap
 
 app = typer.Typer(help="Facility scheduling profiles (Idea 1).", no_args_is_help=True)
 review_app = typer.Typer(help="Work the review queue.", no_args_is_help=True)
 app.add_typer(review_app, name="review")
+profile_app = typer.Typer(
+    help="Set profile values by hand, with a reason, or ask a person for one.",
+    no_args_is_help=True,
+)
+app.add_typer(profile_app, name="profile")
 
 log = get_logger(__name__)
 
@@ -113,6 +121,10 @@ def harvest(
     terminal: Annotated[
         list[int] | None, typer.Option(help="Terminal ID(s); default from settings")
     ] = None,
+    customer: Annotated[
+        list[int] | None,
+        typer.Option(help="Customer ID(s) to restrict the loads to; default from settings"),
+    ] = None,
     days: Annotated[int | None, typer.Option(help="Look-back window in days")] = None,
 ) -> None:
     """Pull loads and store facilities, links and stop notes (FR-1, FR-2)."""
@@ -123,7 +135,7 @@ def harvest(
         pipeline = Pipeline(
             settings, _sessions(settings), client=client, extractor=_extractor(settings, fake=True)
         )
-        stats = pipeline.harvest(terminal_ids=terminal, start=start, end=end)
+        stats = pipeline.harvest(terminal_ids=terminal, customer_ids=customer, start=start, end=end)
     typer.echo(json.dumps(stats, indent=2))
 
 
@@ -137,6 +149,9 @@ def run(
     ] = False,
     cap: Annotated[int | None, typer.Option(help="Max facilities this run")] = None,
     terminal: Annotated[list[int] | None, typer.Option(help="Terminal ID(s)")] = None,
+    customer: Annotated[
+        list[int] | None, typer.Option(help="Customer ID(s) to restrict the harvest to")
+    ] = None,
     fake_llm: Annotated[bool, typer.Option(help="Use the fake extractor (no model calls)")] = False,
     offline: Annotated[
         bool, typer.Option(help="No Transport Pro calls; use stored sources only")
@@ -169,6 +184,7 @@ def run(
             refresh_only=refresh,
             facility_cap=cap,
             terminal_ids=terminal,
+            customer_ids=customer,
             run_id=resume,
         )
     finally:
@@ -220,6 +236,132 @@ def lookup(
                         f"conf={fld.confidence:.2f} state={fld.state} "
                         f"loads={fld.distinct_loads}{' CONFLICT' if fld.conflict else ''}"
                     )
+
+
+def resolve_facility(repo: Repository, query: str) -> FacilityRecord:
+    """One facility from a store key, a Transport Pro location ID or a unique name."""
+    if query.startswith(("tpro:", "candidate:")):
+        record = repo.get_facility(query)
+        if record is None:
+            raise typer.BadParameter(f"no facility with key {query}")
+        return record
+    records = (
+        repo.find_facility(facility_id=int(query))
+        if query.isdigit()
+        else repo.find_facility(name=query)
+    )
+    exact = [r for r in records if (r.company_name or "").lower() == query.lower()]
+    if len(records) > 1 and len(exact) == 1:
+        records = exact
+    if len(records) != 1:
+        found = "; ".join(f"{r.company_name} ({r.city}) [{r.key}]" for r in records[:8])
+        raise typer.BadParameter(
+            f"'{query}' matches {len(records)} facilities" + (f": {found}" if found else "")
+        )
+    return records[0]
+
+
+@profile_app.command("set")
+def profile_set(
+    facility: Annotated[str, typer.Argument(help="Store key, location ID or unique name")],
+    role: Annotated[Role, typer.Argument(help="shipper or receiver")],
+    field: Annotated[str, typer.Argument(help="Profile field name")],
+    value: Annotated[str, typer.Option(help="Value to file")],
+    by: Annotated[str, typer.Option(help="Who decided")],
+    reason: Annotated[str | None, typer.Option(help="Evidence or source")] = None,
+) -> None:
+    """File a human-set value (never overwritten by the routine) with its evidence."""
+    from facility_profiles.extraction.validate import coerce
+
+    if field not in PROFILE_FIELDS:
+        raise typer.BadParameter(f"field must be one of {', '.join(PROFILE_FIELDS)}")
+    typed = value if field == "receiving_hours" else coerce(field, value)
+    if typed is None:
+        raise typer.BadParameter(f"'{value}' is not a valid value for {field}")
+    settings = _settings()
+    with session_scope(_sessions(settings)) as session:
+        repo = Repository(session)
+        record = resolve_facility(repo, facility)
+        previous = repo.fields(record.key, role).get(field)
+        before = unwrap(previous.value) if previous else None
+        closed = repo.close_review_items(record.key, role, field, status="superseded")
+        repo.set_field_human(record.key, role, field, typed, state=FieldState.HUMAN_SET)
+        repo.audit(
+            run_id=None,
+            key=record.key,
+            role=role,
+            field_name=field,
+            action="human_set",
+            before=before,
+            after=typed,
+            confidence=1.0,
+            reason=f"set by {by}" + (f": {reason}" if reason else ""),
+            actor=by,
+        )
+        name = record.company_name
+    typer.echo(
+        f"{name} [{role.value}] {field} = {json.dumps(typed)} (was {json.dumps(before)})"
+        + (f"; closed {closed} open review item(s)" if closed else "")
+    )
+
+
+@profile_app.command("summary")
+def profile_summary(
+    facility: Annotated[str, typer.Argument(help="Store key, location ID or unique name")],
+    role: Annotated[Role, typer.Argument(help="shipper or receiver")],
+    text: Annotated[str, typer.Option(help="One-paragraph scheduling summary")],
+    by: Annotated[str, typer.Option(help="Who wrote it")],
+) -> None:
+    """Replace the scheduling summary with a human-written one."""
+    settings = _settings()
+    with session_scope(_sessions(settings)) as session:
+        repo = Repository(session)
+        record = resolve_facility(repo, facility)
+        current = repo.profile(record.key, role)
+        before = current.scheduling_summary if current else None
+        repo.upsert_profile(
+            record.key,
+            role,
+            summary=text,
+            run_id="manual",
+            model_version=f"human:{by}",
+            source_load_ids=list(current.source_load_ids) if current else [],
+            source_count=current.source_count if current else 0,
+        )
+        repo.audit(
+            run_id=None,
+            key=record.key,
+            role=role,
+            field_name="scheduling_summary",
+            action="human_set",
+            before=before,
+            after=text,
+            confidence=1.0,
+            reason=f"summary written by {by}",
+            actor=by,
+        )
+        name = record.company_name
+    typer.echo(f"{name} [{role.value}] summary updated")
+
+
+@profile_app.command("ask")
+def profile_ask(
+    facility: Annotated[str, typer.Argument(help="Store key, location ID or unique name")],
+    role: Annotated[Role, typer.Argument(help="shipper or receiver")],
+    field: Annotated[str, typer.Argument(help="Profile field name")],
+    reason: Annotated[str, typer.Option(help="What the reviewer should answer")],
+    proposed: Annotated[str | None, typer.Option(help="Suggested value, if any")] = None,
+) -> None:
+    """Put a question about a field on the review queue without a run."""
+    if field not in PROFILE_FIELDS:
+        raise typer.BadParameter(f"field must be one of {', '.join(PROFILE_FIELDS)}")
+    settings = _settings()
+    with session_scope(_sessions(settings)) as session:
+        repo = Repository(session)
+        record = resolve_facility(repo, facility)
+        item = repo.ask_review(record.key, role, field, reason=reason, proposed=proposed)
+        item_id, name = item.id, record.company_name
+    typer.echo(f"#{item_id} {name} [{role.value}] {field}: {reason}")
 
 
 @app.command("repair-links")
@@ -305,6 +447,10 @@ def export(out: Annotated[Path | None, typer.Option(help="CSV path")] = None) ->
 @app.command("export-xlsx")
 def export_xlsx(
     out: Annotated[Path | None, typer.Option(help="Workbook path")] = None,
+    facility: Annotated[
+        list[str] | None,
+        typer.Option(help="Only these facilities (key, location ID or unique name); repeatable"),
+    ] = None,
 ) -> None:
     """Export the store to Excel, with a Review Queue sheet reviewers can fill in."""
     settings = _settings()
@@ -313,7 +459,9 @@ def export_xlsx(
         or Path(settings.export_dir) / f"facility-profiles-review-{date.today().isoformat()}.xlsx"
     )
     with session_scope(_sessions(settings)) as session:
-        stats = export_workbook(session, path)
+        repo = Repository(session)
+        only = {resolve_facility(repo, q).key for q in facility} if facility else None
+        stats = export_workbook(session, path, only=only)
     typer.echo(
         f"wrote {path}: {stats.queue} queue items, {stats.fields} fields, "
         f"{stats.facilities} facilities, {stats.audit} audit rows"

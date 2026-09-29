@@ -28,3 +28,7 @@ downloads/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Google service-account keys (never commit)
+gsheets-python-*.json
+*-service-account*.json

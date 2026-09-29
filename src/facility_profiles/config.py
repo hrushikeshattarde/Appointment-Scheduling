@@ -65,6 +65,7 @@ class Settings(BaseSettings):
     # --- Run controls -------------------------------------------------------------------
     mode: RunMode = RunMode.RECOMMEND
     pilot_terminal_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
+    pilot_customer_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
     facility_cap: int = Field(500, gt=0)
     lookback_days: int = Field(90, gt=0)
     max_loads_per_facility: int = Field(100, gt=0)
@@ -90,16 +91,16 @@ class Settings(BaseSettings):
     def _strip_trailing_slash(cls, value: str) -> str:
         return value.strip().rstrip("/")
 
-    @field_validator("pilot_terminal_ids", mode="before")
+    @field_validator("pilot_terminal_ids", "pilot_customer_ids", mode="before")
     @classmethod
-    def _split_terminal_ids(cls, value: object) -> list[int]:
+    def _split_int_ids(cls, value: object) -> list[int]:
         if value is None or value == "":
             return []
         if isinstance(value, str):
             return [int(part) for part in value.split(",") if part.strip()]
         if isinstance(value, list | tuple):
             return [int(part) for part in value]
-        msg = "pilot_terminal_ids must be a comma-separated string or a list of integers"
+        msg = "expected a comma-separated string or a list of integers"
         raise TypeError(msg)
 
     @field_validator("internal_email_domains", "internal_phone_numbers", mode="before")

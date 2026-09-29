@@ -173,7 +173,11 @@ def _add_table(
 
 
 def _review_rows(repo: Repository, facilities: Facilities) -> list[list[Any]]:
-    items = repo.list_review_items(status="open", limit=10_000)
+    items = [
+        item
+        for item in repo.list_review_items(status="open", limit=10_000)
+        if item.facility_key in facilities
+    ]
 
     def sort_key(item: ReviewItem) -> tuple[int, int, str]:
         fac = facilities.get(item.facility_key)
@@ -269,8 +273,10 @@ def _fields_sheet(
         ProfileFieldRecord.facility_key, ProfileFieldRecord.role, ProfileFieldRecord.field_name
     )
     for fld in session.scalars(stmt):
+        if fld.facility_key not in facilities:
+            continue
         value = unwrap(fld.value)
-        if value is None and fld.mention_count == 0:
+        if value is None and fld.mention_count == 0 and fld.origin != "human":
             continue
         fac = facilities.get(fld.facility_key)
         action, reason = reasons.get((fld.facility_key, fld.role, fld.field_name), ("", ""))
@@ -346,6 +352,8 @@ def _summaries_sheet(ws: Worksheet, session: Session, facilities: Facilities) ->
     for prof in session.scalars(
         select(ProfileRecord).order_by(ProfileRecord.facility_key, ProfileRecord.role)
     ):
+        if prof.facility_key not in facilities:
+            continue
         fac = facilities.get(prof.facility_key)
         existing = fac.existing if fac else {}
         rows.append(
@@ -461,6 +469,8 @@ def _audit_sheet(ws: Worksheet, session: Session, facilities: Facilities, run: R
         for entry in session.scalars(
             select(AuditEntry).where(AuditEntry.run_id == run.id).order_by(AuditEntry.id)
         ):
+            if entry.facility_key not in facilities:
+                continue
             fac = facilities.get(entry.facility_key)
             rows.append(
                 [
@@ -624,11 +634,15 @@ def _summary_sheet(
         ws.cell(row=i, column=1, value=line).font = Font(name=FONT, bold=(i == len(metrics) + 7))
 
 
-def build_workbook(session: Session) -> tuple[Workbook, ExportStats]:
-    """Build the workbook from the store."""
+def build_workbook(
+    session: Session, *, only: set[str] | None = None
+) -> tuple[Workbook, ExportStats]:
+    """Build the workbook from the store; ``only`` restricts it to those facility keys."""
     repo = Repository(session)
     run = repo.latest_run()
-    facilities: Facilities = {f.key: f for f in session.scalars(select(FacilityRecord))}
+    facilities: Facilities = {
+        f.key: f for f in session.scalars(select(FacilityRecord)) if only is None or f.key in only
+    }
     wb = Workbook()
 
     review_ws = wb.active
@@ -659,9 +673,9 @@ def build_workbook(session: Session) -> tuple[Workbook, ExportStats]:
     )
 
 
-def export_workbook(session: Session, path: Path) -> ExportStats:
-    """Build and save the workbook."""
-    wb, stats = build_workbook(session)
+def export_workbook(session: Session, path: Path, *, only: set[str] | None = None) -> ExportStats:
+    """Build and save the workbook, optionally for a subset of facilities."""
+    wb, stats = build_workbook(session, only=only)
     path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(path)
     return stats

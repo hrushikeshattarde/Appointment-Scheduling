@@ -230,19 +230,33 @@ def iter_terminal_loads(
     terminal_ids: Iterable[int | None],
     start: date,
     end: date,
+    customer_ids: Iterable[int | None] = (None,),
     extra_filters: dict[str, object] | None = None,
 ) -> Iterator[Load]:
-    """Yield loads for each terminal and date window; ``None`` in ``terminal_ids`` means all."""
+    """Yield loads for each terminal, customer and date window.
+
+    ``None`` in ``terminal_ids`` means every terminal; ``None`` in ``customer_ids`` means every
+    customer. A pod that serves many customers can be scoped to one shipper this way (for
+    example the Lidl inbound and outbound customer records on the Megan Goodwin pod).
+    """
+    customers = list(customer_ids) or [None]
     for terminal_id in terminal_ids:
-        for window_start, window_end in date_windows(start, end):
-            filters: dict[str, object] = {
-                "pickup_date_start": window_start.isoformat(),
-                "pickup_date_end": window_end.isoformat(),
-                **(extra_filters or {}),
-            }
-            if terminal_id is not None:
-                filters["terminal_id"] = terminal_id
-            log.info(
-                "harvest.window", terminal=terminal_id, start=str(window_start), end=str(window_end)
-            )
-            yield from client.iter_loads(**filters)
+        for customer_id in customers:
+            for window_start, window_end in date_windows(start, end):
+                filters: dict[str, object] = {
+                    "pickup_date_start": window_start.isoformat(),
+                    "pickup_date_end": window_end.isoformat(),
+                    **(extra_filters or {}),
+                }
+                if terminal_id is not None:
+                    filters["terminal_id"] = terminal_id
+                if customer_id is not None:
+                    filters["customer_id"] = customer_id
+                log.info(
+                    "harvest.window",
+                    terminal=terminal_id,
+                    customer=customer_id,
+                    start=str(window_start),
+                    end=str(window_end),
+                )
+                yield from client.iter_loads(**filters)
