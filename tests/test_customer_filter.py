@@ -120,7 +120,7 @@ def test_cli_accepts_customer_option(tmp_path, monkeypatch: pytest.MonkeyPatch):
         for command in ("harvest", "run"):
             result = runner.invoke(app, [command, "--help"])
             assert result.exit_code == 0, result.output
-            plain = re.sub(r"\[[0-9;]*m", "", result.output)
+            plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
             assert "--customer" in plain, plain
     finally:
         get_settings.cache_clear()
