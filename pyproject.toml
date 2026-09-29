@@ -65,7 +65,6 @@ pydocstyle = { convention = "google" }
 "tests/**" = ["D", "S", "PLR", "ARG", "T20", "E501", "PT017", "PT018", "PLC0415", "SIM105", "C408"]
 "src/facility_profiles/cli.py" = ["T20", "PLC0415", "PLR0917"]
 "src/facility_profiles/api/app.py" = ["B008"]
-"src/facility_profiles/booking/mail.py" = ["PLC0415", "E501"]  # optional Google imports
 "scripts/**" = ["T20", "D103", "S603", "PLW1510", "E501", "PLR0912", "C901", "PLR0915", "PLC0415", "B034"]
 
 [tool.ruff.format]
