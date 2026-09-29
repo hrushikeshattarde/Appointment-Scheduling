@@ -118,6 +118,39 @@ and Lidl outbound 6680 only).
 
 Lidl store deliveries are tours planned by Lidl (nothing to book), so the bookable facilities on that pod are the twelve vendor pickup sites on Lidl - Inbound loads. `scripts/seed_lidl_vendor_profiles.py` files what the Transport Pro notes and the lidl@ group mail established for them (firm appointments, exact times, driver rules, and for Morgan Foods the email booking desk) as human-set values with their evidence, and queues the two questions Megan has to answer per vendor: booking channel and appointment-desk address. Hand-off workbook: `export-xlsx --facility <vendor> ...`; her answers come back through `review import`. `scripts/seed_lidl_vendor_mail_findings.py` then files the booking channels confirmed in the lidl@ Google Groups archive (Opendock for Polar Fitzgerald, email desks for the rest, inbound@lidl.us for the RDC delivery slots), each with the thread it rests on.
 
+## Booking agent prototype (draft mode)
+
+`facility-profiles booking ...` books vendor pickup appointments by email for customer-tendered
+inbound loads (built for the Lidl inbound pod). It never sends mail and never writes to
+Transport Pro: a person sends each draft and approves each slot.
+
+```powershell
+$env:FP_DATABASE_URL = 'sqlite:///./data/facility_profiles_pod-1089-lidl.db'
+facility-profiles booking scan --terminal 1089 --customer 7211 --days-ahead 7
+facility-profiles booking list
+facility-profiles booking draft            # one .eml per new case in exports/drafts
+facility-profiles booking sent 12 --by megan --thread <gmail thread id>
+facility-profiles booking inbox --file data/lidl-mail/messages.jsonl   # or --key/--subject
+facility-profiles booking show 12
+facility-profiles booking approve 12 --by megan
+```
+
+How a case moves: `scan` opens a case for every pickup stop whose appointment is not
+confirmed, keyed to the vendor profile (`needs_profile` when the profile has no verified
+email desk, `already_booked` when the load already carries a vendor pickup number). `draft` composes the request in the pod's own wording (PO numbers, requested
+date and time from the tender or backed off the Lidl delivery slot, delivery site and
+delivery number) and saves it as a draft. `sent` records that a person sent it. `inbox`
+matches replies to cases by thread, PO number or sender, classifies each reply with a
+strict-schema model call (confirmed, counter-offer, question, rejected, unrelated), drops any
+date, time or pickup number the reply text does not contain verbatim, and moves the case:
+confirmed becomes `proposed` with the slot in UTC, everything else becomes `needs_human` with
+the reason. `approve` records the decision and prints the exact Transport Pro
+`set_appointment` payload; the write itself stays behind the client's write flag.
+
+Tables: `booking_cases`, `booking_messages`, `booking_events` (created by `init-db`).
+Code: `booking/service.py` (cases), `booking/classify.py` (reply reading and validation),
+`booking/mail.py` (JSONL or Gmail in, `.eml` or Gmail drafts out).
+
 ## Review flow for CSRs
 
 1. `facility-profiles export-xlsx` and send the workbook to the pod.

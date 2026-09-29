@@ -82,6 +82,20 @@ class Settings(BaseSettings):
         default_factory=lambda: ["260-208-4500"]
     )
 
+    # --- Booking agent (prototype, draft mode) --------------------------------------------
+    booking_mode: Literal["draft"] = "draft"
+    booking_days_ahead: int = Field(7, gt=0)
+    booking_default_pickup_time: str = "09:00"
+    booking_transit_miles_per_day: int = Field(550, gt=0)
+    booking_sender: str = "lidl@circledelivers.com"
+    booking_cc: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["lidl@circledelivers.com"]
+    )
+    booking_signature: str = (
+        "Circle Logistics, Inc. | Fort Wayne | 260-208-4500 | lidl@circledelivers.com"
+    )
+    booking_drafts_dir: str = "./exports/drafts"
+
     # --- Logging -------------------------------------------------------------------------
     log_level: str = "INFO"
     log_json: bool = False
@@ -103,7 +117,9 @@ class Settings(BaseSettings):
         msg = "expected a comma-separated string or a list of integers"
         raise TypeError(msg)
 
-    @field_validator("internal_email_domains", "internal_phone_numbers", mode="before")
+    @field_validator(
+        "internal_email_domains", "internal_phone_numbers", "booking_cc", mode="before"
+    )
     @classmethod
     def _split_csv(cls, value: object) -> list[str]:
         if value is None or value == "":

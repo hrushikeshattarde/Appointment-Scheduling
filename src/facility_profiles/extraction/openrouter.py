@@ -13,7 +13,7 @@ import json
 from typing import Any
 
 import httpx
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from tenacity import (
     RetryCallState,
     Retrying,
@@ -56,7 +56,7 @@ _UNSUPPORTED_KEYWORDS = (
 )
 
 
-def strict_json_schema(model: type[ExtractionResult]) -> dict[str, Any]:
+def strict_json_schema(model: type[BaseModel]) -> dict[str, Any]:
     """Pydantic schema tightened for strict mode: every object closed, every property required."""
     schema = copy.deepcopy(model.model_json_schema())
 

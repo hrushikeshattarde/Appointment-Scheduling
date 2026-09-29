@@ -46,7 +46,9 @@ def make_engine(database_url: str, *, echo: bool = False) -> Engine:
 
 
 def init_db(engine: Engine) -> None:
-    """Create all tables that do not exist yet."""
+    """Create all tables that do not exist yet (including the booking agent's)."""
+    from facility_profiles.booking import models as _booking_models  # noqa: F401, PLC0415
+
     Base.metadata.create_all(engine)
 
 

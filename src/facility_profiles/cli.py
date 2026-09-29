@@ -41,6 +41,11 @@ profile_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(profile_app, name="profile")
+booking_app = typer.Typer(
+    help="Booking agent prototype (draft mode): scan, draft, inbox, approve.",
+    no_args_is_help=True,
+)
+app.add_typer(booking_app, name="booking")
 
 log = get_logger(__name__)
 
@@ -362,6 +367,216 @@ def profile_ask(
         item = repo.ask_review(record.key, role, field, reason=reason, proposed=proposed)
         item_id, name = item.id, record.company_name
     typer.echo(f"#{item_id} {name} [{role.value}] {field}: {reason}")
+
+
+def _booking_case(session, case_id: int):  # type: ignore[no-untyped-def]
+    from facility_profiles.booking.models import BookingCase
+
+    case = session.get(BookingCase, case_id)
+    if case is None:
+        typer.echo(f"case {case_id} not found")
+        raise typer.Exit(code=1)
+    return case
+
+
+@booking_app.command("scan")
+def booking_scan(
+    terminal: Annotated[list[int] | None, typer.Option(help="Terminal ID(s)")] = None,
+    customer: Annotated[list[int] | None, typer.Option(help="Customer ID(s)")] = None,
+    days_ahead: Annotated[int | None, typer.Option(help="Pickup window in days")] = None,
+) -> None:
+    """Open a booking case for every pickup stop that still needs an appointment."""
+    from facility_profiles.booking.service import scan
+
+    settings = _settings()
+    with _client(settings) as client:
+        stats = scan(
+            client,
+            _sessions(settings),
+            settings,
+            terminal_ids=terminal,
+            customer_ids=customer,
+            days_ahead=days_ahead,
+        )
+    typer.echo(json.dumps(stats.__dict__, indent=2))
+
+
+@booking_app.command("list")
+def booking_list(
+    status: Annotated[str | None, typer.Option(help="Only this status")] = None,
+) -> None:
+    """List booking cases."""
+    from facility_profiles.booking.service import list_cases
+
+    settings = _settings()
+    with session_scope(_sessions(settings)) as session:
+        cases = list_cases(session, status)
+        if not cases:
+            typer.echo("no cases")
+            return
+        for c in cases:
+            typer.echo(
+                f"#{c.id:<4} load {c.load_id:<9} {c.status:<13} "
+                f"{(c.vendor_name or '?')[:32]:<32} "
+                f"PO {', '.join(str(p) for p in c.po_numbers) or '-'} "
+                f"req {c.requested_local or '?'}" + (f"  ({c.reason})" if c.reason else "")
+            )
+
+
+@booking_app.command("show")
+def booking_show(case_id: int) -> None:
+    """Show one case with its messages and events."""
+    from facility_profiles.booking.service import describe
+
+    settings = _settings()
+    with session_scope(_sessions(settings)) as session:
+        case = _booking_case(session, case_id)
+        typer.echo(describe(case))
+        for e in case.events:
+            typer.echo(
+                f"  {e.created_at:%Y-%m-%d %H:%M} {e.action} by {e.actor} "
+                f"{json.dumps(e.detail)[:160]}"
+            )
+
+
+@booking_app.command("draft")
+def booking_draft(
+    case_id: Annotated[
+        int | None, typer.Argument(help="Case to draft; omit for all new cases")
+    ] = None,
+) -> None:
+    """Compose the request email and save it as a draft (.eml in the drafts folder)."""
+    from facility_profiles.booking.mail import LocalDraftMailer
+    from facility_profiles.booking.models import CaseStatus
+    from facility_profiles.booking.service import draft_case, list_cases
+
+    settings = _settings()
+    mailer = LocalDraftMailer(Path(settings.booking_drafts_dir), sender=settings.booking_sender)
+    with session_scope(_sessions(settings)) as session:
+        cases = (
+            [_booking_case(session, case_id)]
+            if case_id is not None
+            else list_cases(session, CaseStatus.NEW.value)
+        )
+        for case in cases:
+            try:
+                message = draft_case(session, case, mailer, settings)
+            except ValueError as exc:
+                typer.echo(f"#{case.id}: {exc}")
+                continue
+            typer.echo(
+                f"#{case.id} drafted -> {message.to_addr}: {message.subject}  [{message.draft_ref}]"
+            )
+
+
+@booking_app.command("sent")
+def booking_sent(
+    case_id: int,
+    by: Annotated[str, typer.Option(help="Who sent it")],
+    thread: Annotated[str | None, typer.Option(help="Gmail thread ID, if known")] = None,
+) -> None:
+    """Record that a person sent the draft, so the reply can be matched."""
+    from facility_profiles.booking.service import mark_sent
+
+    settings = _settings()
+    with session_scope(_sessions(settings)) as session:
+        case = _booking_case(session, case_id)
+        try:
+            mark_sent(session, case, by=by, thread_id=thread)
+        except ValueError as exc:
+            typer.echo(str(exc))
+            raise typer.Exit(code=1) from exc
+    typer.echo(f"#{case_id} marked sent")
+
+
+@booking_app.command("inbox")
+def booking_inbox(
+    file: Annotated[Path | None, typer.Option(help="messages.jsonl from the mail pull")] = None,
+    key: Annotated[
+        Path | None, typer.Option(help="Service-account key for a live Gmail read")
+    ] = None,
+    subject: Annotated[str | None, typer.Option(help="Mailbox to read as (Gmail)")] = None,
+    days: Annotated[int, typer.Option(help="How far back to read (Gmail)")] = 7,
+    fake: Annotated[
+        bool, typer.Option(help="Classify every reply as unrelated (no model)")
+    ] = False,
+) -> None:
+    """Read replies, match them to cases, classify them and move the cases."""
+    from facility_profiles.booking.classify import (
+        FakeReplyClassifier,
+        OpenRouterReplyClassifier,
+        ReplyClassifier,
+    )
+    from facility_profiles.booking.mail import GmailReader, load_messages_jsonl
+    from facility_profiles.booking.schema import ReplyClassification, ReplyStatus
+    from facility_profiles.booking.service import ingest
+
+    settings = _settings()
+    if file is not None:
+        messages = load_messages_jsonl(file)
+    elif key is not None and subject:
+        group = settings.booking_sender
+        messages = GmailReader(key, subject).fetch(
+            f"(to:{group} OR cc:{group} OR deliveredto:{group}) newer_than:{days}d"
+        )
+    else:
+        typer.echo("give --file messages.jsonl, or --key and --subject for Gmail")
+        raise typer.Exit(code=2)
+    if fake:
+        classifier: ReplyClassifier = FakeReplyClassifier(
+            lambda _ctx: ReplyClassification(status=ReplyStatus.UNRELATED)
+        )
+    elif settings.llm_provider == "openrouter" and settings.openrouter_api_key is not None:
+        classifier = OpenRouterReplyClassifier(
+            settings.openrouter_api_key.get_secret_value(),
+            model=settings.llm_model,
+            base_url=settings.openrouter_base_url,
+        )
+    else:
+        typer.echo("reply classification needs FP_LLM_PROVIDER=openrouter (or --fake)")
+        raise typer.Exit(code=2)
+    with session_scope(_sessions(settings)) as session:
+        stats = ingest(
+            session, messages, classifier, internal_domains=settings.internal_email_domains
+        )
+    typer.echo(json.dumps(stats.__dict__, indent=2))
+
+
+@booking_app.command("approve")
+def booking_approve(
+    case_id: int,
+    by: Annotated[str, typer.Option(help="Who approved")],
+) -> None:
+    """Approve the vendor-confirmed slot. Written to Transport Pro only when writes are enabled."""
+    from facility_profiles.booking.service import approve
+
+    settings = _settings()
+    with session_scope(_sessions(settings)) as session:
+        case = _booking_case(session, case_id)
+        try:
+            payload, written = approve(session, case, by=by, client=None)
+        except ValueError as exc:
+            typer.echo(str(exc))
+            raise typer.Exit(code=1) from exc
+    typer.echo(
+        f"#{case_id} approved; Transport Pro appointment payload: {json.dumps(payload)} "
+        + ("(written)" if written else "(not written: draft mode)")
+    )
+
+
+@booking_app.command("close")
+def booking_close(
+    case_id: int,
+    by: Annotated[str, typer.Option(help="Who closed it")],
+    reason: Annotated[str, typer.Option(help="Why")],
+) -> None:
+    """Close a case without booking."""
+    from facility_profiles.booking.service import close_case
+
+    settings = _settings()
+    with session_scope(_sessions(settings)) as session:
+        close_case(session, _booking_case(session, case_id), by=by, reason=reason)
+    typer.echo(f"#{case_id} closed")
 
 
 @app.command("repair-links")
