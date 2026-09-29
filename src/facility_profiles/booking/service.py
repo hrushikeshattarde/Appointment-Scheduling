@@ -428,7 +428,7 @@ def _local_to_utc(day: str, clock: str | None, timezone: str | None) -> datetime
     return parsed.replace(tzinfo=tz).astimezone(UTC)
 
 
-def apply_reply(  # noqa: PLR0912 - one branch per reply status
+def apply_reply(
     session: Session,
     case: BookingCase,
     result: ReplyClassification,
