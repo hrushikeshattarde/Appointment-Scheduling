@@ -14,6 +14,7 @@ class ReplyStatus(StrEnum):
     COUNTER_OFFER = "counter_offer"  # a different date or time is offered
     QUESTION = "question"  # the vendor needs something before booking
     REJECTED = "rejected"  # cannot book: order not ready, not in system, closed
+    DEFERRED = "deferred"  # check back later (pickup_date holds the day to check back)
     UNRELATED = "unrelated"  # not about this pickup appointment
 
 

@@ -66,6 +66,7 @@ class ResponseIntent(StrEnum):
     ASK_ALTERNATIVE = "ask_alternative"
     ANSWER_QUESTION = "answer_question"
     FOLLOW_UP = "follow_up"
+    ACKNOWLEDGE = "acknowledge"
     ESCALATE_TO_CUSTOMER = "escalate_to_customer"
     HANDOFF = "handoff"
 
@@ -337,7 +338,7 @@ class FakeAnswerComposer:
 
 def _fmt(day: str, clock: str | None) -> str:
     parsed = datetime.strptime(day, "%Y-%m-%d")
-    return f"{parsed:%m/%d}" + (f" @ {clock}" if clock else "")
+    return f"{parsed:%m/%d}" + (f" @ {clock.replace(':', '')}" if clock else "")
 
 
 @dataclass
@@ -384,7 +385,7 @@ class Responder:
             return ResponsePlan(
                 ResponseIntent.ACCEPT_OFFER,
                 f"offer {when} {why}",
-                body=f"I will take {when}. Thank you!",
+                body=f"Yes, {when} works. Thank you!",
                 to_addr=case.contact_email,
                 proposed_local=f"{result.pickup_date} {clock or ''}".strip(),
             )
@@ -502,6 +503,8 @@ class Responder:
             case.reason = None
         elif plan.intent == ResponseIntent.FOLLOW_UP:
             case.status = CaseStatus.SENT.value
+        elif plan.intent == ResponseIntent.ACKNOWLEDGE:
+            pass  # the case already moved on the confirmation itself
         else:  # escalation: a person sends it and decides what happens to the pickup
             case.status = CaseStatus.NEEDS_HUMAN.value
             case.reason = plan.reason[:255]
@@ -540,14 +543,25 @@ class Responder:
         )
         if replied_since:
             return None
-        pos = " & ".join(str(p) for p in case.po_numbers) or f"load {case.load_id}"
         plan = ResponsePlan(
             ResponseIntent.FOLLOW_UP,
             f"no reply for {self.settings.booking_follow_up_hours} hours",
-            body=f"Following up on this. Can you please confirm a pickup time for PO# {pos}?",
+            body="Hello,\n\nFollowing up on this.",
             to_addr=case.contact_email,
         )
         return self.act(session, case, None, plan)
+
+    def acknowledge(
+        self, session: Session, case: BookingCase, reply: BookingMessage
+    ) -> BookingMessage | None:
+        """The pod always answers a confirmation with "Thank you!"; so does the agent."""
+        plan = ResponsePlan(
+            ResponseIntent.ACKNOWLEDGE,
+            "vendor confirmed",
+            body="Thank you!",
+            to_addr=reply.from_addr or case.contact_email,
+        )
+        return self.act(session, case, reply, plan)
 
     # -- helpers
 

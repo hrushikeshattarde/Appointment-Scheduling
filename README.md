@@ -137,14 +137,16 @@ facility-profiles booking approve 12 --by megan
 
 How a case moves: `scan` opens a case for every pickup stop whose appointment is not
 confirmed, keyed to the vendor profile (`needs_profile` when the profile has no verified
-email desk, `already_booked` when the load already carries a vendor pickup number). `draft` composes the request in the pod's own wording (PO numbers, requested
-date and time from the tender or backed off the Lidl delivery slot, delivery site and
-delivery number) and saves it as a draft. `sent` records that a person sent it. `inbox`
+email desk, `already_booked` when the load already carries a vendor pickup number). `draft` composes the request in the pod's own wording (`PO# X on MM/DD @ HHMM`, the
+requested time from the tender or backed off the Lidl delivery slot, and nothing else, exactly
+as the pod writes it) and saves it as a draft. `sent` records that a person sent it. `inbox`
 matches replies to cases by thread, PO number or sender, classifies each reply with a
 strict-schema model call (confirmed, counter-offer, question, rejected, unrelated), drops any
 date, time or pickup number the reply text does not contain verbatim, and moves the case:
-confirmed becomes `proposed` with the slot in UTC, everything else becomes `needs_human` with
-the reason. `approve` records the decision and prints the exact Transport Pro
+confirmed becomes `proposed` with the slot in UTC (a bare "SET" or a pickup number alone means
+the requested slot; a time alone means the requested date), deferred ("check back Monday") keeps
+waiting, everything else becomes `needs_human` with the reason. A confirmation is answered with
+the pod's "Thank you!". `approve` records the decision and prints the exact Transport Pro
 `set_appointment` payload; the write itself stays behind the client's write flag.
 
 The conversation policy (`booking/respond.py`) handles what comes back, still as drafts:

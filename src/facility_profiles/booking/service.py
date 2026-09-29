@@ -95,6 +95,7 @@ class IngestStats:
     needs_human: int = 0
     unrelated: int = 0
     responded: int = 0
+    deferred: int = 0
 
 
 # ------------------------------------------------------------------ profile and load helpers
@@ -288,52 +289,48 @@ def scan(
 
 
 def _fmt_local(value: str | None) -> tuple[str, str]:
-    """Turn "YYYY-MM-DD HH:MM" into ("MM/DD", "HH:MM")."""
+    """Turn "YYYY-MM-DD HH:MM" into ("MM/DD", "HHMM"), the way the pod writes it."""
     if not value:
-        return ("(date to confirm)", "(time to confirm)")
+        return ("(date to confirm)", "")
     day, _, clock = value.partition(" ")
     try:
         parsed = datetime.strptime(day, "%Y-%m-%d")
     except ValueError:
-        return (day, clock)
-    return (parsed.strftime("%m/%d"), clock or "")
+        return (day, clock.replace(":", ""))
+    return (parsed.strftime("%m/%d"), clock.replace(":", ""))
+
+
+def request_lines(case: BookingCase) -> list[str]:
+    """The PO lines exactly as the pod writes them: "PO# X on MM/DD @ HHMM"."""
+    mmdd, clock = _fmt_local(case.requested_local)
+    when = f"on {mmdd}" + (f" @ {clock}" if clock else "")
+    pos = [str(p) for p in case.po_numbers]
+    if not pos:
+        return [f"Load {case.load_id} {when}"]
+    if len(pos) > 1:
+        return [f"PO# {' & '.join(pos)} (ALL IN ONE TRUCK) {when}"]
+    return [f"PO# {pos[0]} {when}"]
 
 
 def compose_request(case: BookingCase, settings: Settings) -> OutboundDraft:
     """The request email, in the shape the pod already uses."""
-    mmdd, clock = _fmt_local(case.requested_local)
     pos = [str(p) for p in case.po_numbers]
     subject = (
         f"Pick Up Appointment: {' & '.join(pos)}"
         if pos
         else f"Pick Up Appointment: load {case.load_id}"
     )
-    customer = re.sub(
-        r"\s*-\s*(inbound|outbound)\s*$", "", case.customer_name or "Lidl", flags=re.I
-    ).strip()
     lines = [
         "Hello,",
         "",
-        f"Can I please schedule the following pickup for {customer}?",
+        "Can I please schedule the following?",
         "",
+        *request_lines(case),
+        "",
+        "Thank you!",
+        "",
+        settings.booking_signature,
     ]
-    if pos:
-        lines.extend(f"PO# {po} on {mmdd} @ {clock}".rstrip(" @") for po in pos)
-    else:
-        lines.append(f"Load {case.load_id} on {mmdd} @ {clock}".rstrip(" @"))
-    if case.delivery_site:
-        when = (
-            case.delivery_at_utc.astimezone(
-                ZoneInfo(case.vendor_timezone or "America/New_York")
-            ).strftime("%m/%d")
-            if case.delivery_at_utc
-            else ""
-        )
-        ref = f" ({case.delivery_ref})" if case.delivery_ref else ""
-        lines.append(f"Delivering to {case.delivery_site}{' on ' + when if when else ''}{ref}")
-    lines.extend(
-        ["Carrier: Circle Logistics, Inc.", "", "Thank you!", "", settings.booking_signature]
-    )
     return OutboundDraft(
         to_addr=case.contact_email or "",
         cc_addr=", ".join(settings.booking_cc),
@@ -431,7 +428,7 @@ def _local_to_utc(day: str, clock: str | None, timezone: str | None) -> datetime
     return parsed.replace(tzinfo=tz).astimezone(UTC)
 
 
-def apply_reply(
+def apply_reply(  # noqa: PLR0912 - one branch per reply status
     session: Session,
     case: BookingCase,
     result: ReplyClassification,
@@ -440,15 +437,17 @@ def apply_reply(
     actor: str = "agent",
 ) -> str:
     """Move the case according to the classified reply; return the new status."""
-    if result.status == ReplyStatus.CONFIRMED and result.pickup_date:
-        clock = result.pickup_time or (case.requested_local or "").partition(" ")[2] or None
-        start = _local_to_utc(result.pickup_date, clock, case.vendor_timezone)
+    requested_day, _, requested_clock = (case.requested_local or "").partition(" ")
+    if result.status == ReplyStatus.CONFIRMED and (result.pickup_date or requested_day):
+        day = result.pickup_date or requested_day
+        clock = result.pickup_time or requested_clock or None
+        start = _local_to_utc(day, clock, case.vendor_timezone)
         end = (
-            _local_to_utc(result.pickup_date, result.pickup_time_end, case.vendor_timezone)
+            _local_to_utc(day, result.pickup_time_end, case.vendor_timezone)
             if result.pickup_time_end
             else start
         )
-        case.confirmed_local = f"{result.pickup_date} {clock or ''}".strip()
+        case.confirmed_local = f"{day} {clock or ''}".strip()
         case.confirmed_start_utc = start
         case.confirmed_end_utc = end
         case.pickup_number = result.pickup_number or case.pickup_number
@@ -475,6 +474,14 @@ def apply_reply(
         case.status = CaseStatus.NEEDS_HUMAN.value
         case.reason = f"vendor asked: {result.question or 'see reply'}"[:255]
         _event(session, case, "question", actor=actor, reason=case.reason)
+    elif result.status == ReplyStatus.DEFERRED:
+        case.status = CaseStatus.SENT.value
+        case.reason = (
+            f"vendor asked to check back on {result.pickup_date}"
+            if result.pickup_date
+            else "vendor asked to check back later"
+        )
+        _event(session, case, "deferred", actor=actor, reason=case.reason)
     elif result.status == ReplyStatus.REJECTED:
         case.status = CaseStatus.NEEDS_HUMAN.value
         case.reason = (
@@ -555,6 +562,8 @@ def ingest(
             ReplyStatus.REJECTED,
         ):
             stats.needs_human += 1
+        elif result.status == ReplyStatus.DEFERRED:
+            stats.deferred += 1
         else:
             stats.unrelated += 1
         if responder is not None and result.status in (
@@ -568,6 +577,13 @@ def ingest(
             log.info(
                 "booking.responded", case=case.id, intent=plan.intent.value, reason=plan.reason
             )
+        elif (
+            responder is not None
+            and result.status == ReplyStatus.CONFIRMED
+            and case.status == CaseStatus.PROPOSED.value
+        ):
+            if responder.acknowledge(session, case, inbound) is not None:
+                stats.responded += 1
         session.flush()
     return stats
 

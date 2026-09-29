@@ -89,9 +89,7 @@ def test_counter_offer_is_accepted_when_it_makes_the_delivery(settings, sessions
         assert case.confirmed_local == "2026-10-01 11:00"
         assert as_utc(case.confirmed_start_utc) == datetime(2026, 10, 1, 15, 0, tzinfo=UTC)
         sent = mailer.drafts[-1]
-        assert sent.subject.startswith("Re: ") and sent.body.startswith(
-            "I will take 10/01 @ 11:00."
-        )
+        assert sent.subject.startswith("Re: ") and sent.body.startswith("Yes, 10/01 @ 1100 works.")
         assert sent.thread_id == "t1" and sent.in_reply_to == "c1"
         assert [e.action for e in case.events][-1] == "accept_offer"
 
@@ -262,10 +260,7 @@ def test_follow_up_once_after_the_configured_silence(settings, sessions):
         later = Responder(settings, mailer, now=NOW + timedelta(hours=30))
         message = later.follow_up(session, case)
         assert message is not None and message.kind == "follow_up"
-        assert (
-            "Following up on this. Can you please confirm a pickup time for PO# 226321092660?"
-            in mailer.drafts[-1].body
-        )
+        assert "Hello,\n\nFollowing up on this." in mailer.drafts[-1].body
         assert case.status == CaseStatus.SENT.value
         assert later.follow_up(session, case) is None  # only once
 
@@ -319,3 +314,98 @@ def test_rule_answers_and_safety_checks(settings, sessions):
         built = case_facts(case, settings)
         assert built["customer"] == "Lidl" and built["delivery_date"] == "10/02"
         assert built["po_numbers"] == ["226321092660"]
+
+
+def test_bare_set_and_time_only_confirmations_use_the_requested_slot(settings, sessions):
+    settings = settings.model_copy(update={"pilot_terminal_ids": [1089]})
+    mailer = RecordingMailer()
+    case_id = _prepared_case(settings, sessions, mailer)
+
+    def script(ctx: ReplyContext) -> ReplyClassification:
+        if "SET!" in ctx.body:
+            return ReplyClassification(
+                status=ReplyStatus.CONFIRMED,
+                pickup_number="4119085",
+                quotes=["SET!", "PU# 4119085"],
+            )
+        return ReplyClassification(
+            status=ReplyStatus.CONFIRMED, pickup_time="14:30", quotes=["This is good for 1430"]
+        )
+
+    classifier = FakeReplyClassifier(script)
+    responder = Responder(settings, mailer, now=NOW)
+    with session_scope(sessions) as session:
+        case = session.get(BookingCase, case_id)
+        assert case is not None
+        stats = ingest(
+            session,
+            [reply("SET!\n\nPU# 4119085", mid="s1")],
+            classifier,
+            internal_domains=["circledelivers.com"],
+            responder=responder,
+        )
+        # Bare "SET!" books the slot we asked for; the pod's "Thank you!" is drafted in the thread.
+        assert stats.proposed == 1 and stats.responded == 1
+        assert case.status == CaseStatus.PROPOSED.value
+        assert case.confirmed_local == "2026-10-01 09:00" and case.pickup_number == "4119085"
+        assert (
+            mailer.drafts[-1].body.startswith("Thank you!")
+            and case.messages[-1].kind == "acknowledge"
+        )
+
+        case.status = CaseStatus.SENT.value
+        case.confirmed_local = None
+        ingest(
+            session,
+            [reply("This is good for 1430", mid="t1")],
+            classifier,
+            internal_domains=["circledelivers.com"],
+            responder=responder,
+        )
+        # A time-only answer means the requested date at that time.
+        assert case.status == CaseStatus.PROPOSED.value
+        assert case.confirmed_local == "2026-10-01 14:30"
+        assert as_utc(case.confirmed_start_utc) == datetime(2026, 10, 1, 18, 30, tzinfo=UTC)
+
+
+def test_deferred_replies_keep_waiting_and_unbacked_confirmations_are_not_trusted(
+    settings, sessions
+):
+    settings = settings.model_copy(update={"pilot_terminal_ids": [1089]})
+    mailer = RecordingMailer()
+    case_id = _prepared_case(settings, sessions, mailer)
+
+    def script(ctx: ReplyContext) -> ReplyClassification:
+        if "check back" in ctx.body.lower():
+            return ReplyClassification(
+                status=ReplyStatus.DEFERRED,
+                pickup_date="2026-10-05",
+                quotes=["Please check back on Monday, 10/5"],
+            )
+        return ReplyClassification(status=ReplyStatus.CONFIRMED, quotes=["not in the text"])
+
+    classifier = FakeReplyClassifier(script)
+    with session_scope(sessions) as session:
+        case = session.get(BookingCase, case_id)
+        assert case is not None
+        stats = ingest(
+            session,
+            [reply("PO is unconfirmed in our system. Please check back on Monday, 10/5", mid="d1")],
+            classifier,
+            internal_domains=["circledelivers.com"],
+            responder=Responder(settings, mailer, now=NOW),
+        )
+        assert stats.deferred == 1 and case.status == CaseStatus.SENT.value
+        assert case.reason == "vendor asked to check back on 2026-10-05"
+        assert len(mailer.drafts) == 1  # nothing drafted back
+
+        stats = ingest(
+            session,
+            [reply("Sounds good.", mid="u2")],
+            classifier,
+            internal_domains=["circledelivers.com"],
+            responder=Responder(settings, mailer, now=NOW),
+        )
+        # "confirmed" with no quote found in the text is not a confirmation.
+        assert stats.unrelated == 1 and case.status == CaseStatus.SENT.value
+        assert case.messages[-1].classification["status"] == "unrelated"

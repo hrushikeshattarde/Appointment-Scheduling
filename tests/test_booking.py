@@ -224,9 +224,10 @@ def test_scan_draft_reply_and_approve_round_trip(settings, sessions):
         assert case.requested_local == "2026-10-01 09:00"
         draft = compose_request(case, settings)
         assert draft.subject == "Pick Up Appointment: 226321092660"
-        assert "PO# 226321092660 on 10/01 @ 09:00" in draft.body
-        assert "Lidl (Perryville, MD) on 10/02 (PYE_021026123)" in draft.body
-        assert "pickup for Lidl?" in draft.body
+        assert "Can I please schedule the following?" in draft.body
+        assert "PO# 226321092660 on 10/01 @ 0900" in draft.body
+        assert "Delivering" not in draft.body and "Carrier:" not in draft.body
+        assert draft.body.startswith("Hello,\n\nCan I please schedule")
         assert draft.cc_addr == "lidl@circledelivers.com"
         message = draft_case(session, case, mailer, settings)
         assert message.draft_ref == "memory:1" and case.status == CaseStatus.DRAFTED.value

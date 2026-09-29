@@ -28,7 +28,10 @@ SYSTEM_PROMPT = """You read one email reply from a shipping facility to a freigh
 appointment request and return a JSON object describing it.
 
 Rules:
-- status: "confirmed" when the vendor books the pickup (the requested slot, or one they state); \
+- status: "confirmed" when the vendor books the pickup: the requested slot ("SET!", "confirmed", \
+a pickup number alone), a restated slot, or a time only (then the date is the requested date); \
+"deferred" when they ask you to check back later because the order is not released or ready yet \
+(put the day to check back in pickup_date); \
 "counter_offer" when they offer a different date or time instead; "question" when they need \
 something before booking (order number, PO, carrier name, driver info); "rejected" when they \
 cannot book (order not ready, not in their system, closed that day); "unrelated" otherwise.
@@ -123,10 +126,13 @@ def validate_classification(
         if value and not backed:
             issues.append(ClassificationIssue(name, "no quote backs this value", value))
             data[name] = None
-    if data["status"] in (ReplyStatus.CONFIRMED, ReplyStatus.COUNTER_OFFER) and not (
+    if data["status"] == ReplyStatus.CONFIRMED and not kept_quotes:
+        issues.append(ClassificationIssue("status", "confirmation without any backed quote"))
+        data["status"] = ReplyStatus.QUESTION if data["question"] else ReplyStatus.UNRELATED
+    if data["status"] == ReplyStatus.COUNTER_OFFER and not (
         data["pickup_date"] or data["pickup_time"]
     ):
-        issues.append(ClassificationIssue("status", "confirmation without a backed date or time"))
+        issues.append(ClassificationIssue("status", "counter-offer without a backed date or time"))
         data["status"] = ReplyStatus.QUESTION if data["question"] else ReplyStatus.UNRELATED
     return ReplyClassification.model_validate(data), issues
 
