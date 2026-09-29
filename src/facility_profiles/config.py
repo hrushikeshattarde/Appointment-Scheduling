@@ -102,6 +102,10 @@ class Settings(BaseSettings):
     booking_min_notice_hours: int = Field(4, ge=0)
     booking_avg_mph: float = Field(50.0, gt=0)
     booking_load_hours: float = Field(2.0, ge=0)
+    # Desks that serve several shippers and need the shipper named in the request.
+    booking_shared_desks: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["cci@udfinc.com"]
+    )
 
     # --- Logging -------------------------------------------------------------------------
     log_level: str = "INFO"
@@ -125,7 +129,11 @@ class Settings(BaseSettings):
         raise TypeError(msg)
 
     @field_validator(
-        "internal_email_domains", "internal_phone_numbers", "booking_cc", mode="before"
+        "internal_email_domains",
+        "internal_phone_numbers",
+        "booking_cc",
+        "booking_shared_desks",
+        mode="before",
     )
     @classmethod
     def _split_csv(cls, value: object) -> list[str]:

@@ -25,7 +25,7 @@ from facility_profiles.booking.classify import (
 )
 from facility_profiles.booking.mail import InboundMessage, Mailer, OutboundDraft
 from facility_profiles.booking.models import BookingCase, BookingEvent, BookingMessage, CaseStatus
-from facility_profiles.booking.respond import Responder
+from facility_profiles.booking.respond import Responder, customer_label
 from facility_profiles.booking.schema import ReplyClassification, ReplyStatus
 from facility_profiles.config import Settings
 from facility_profiles.domain.resolution import FacilityResolver
@@ -61,6 +61,12 @@ class VendorProfile:
     contact_name: str | None
     appointment_required: bool | None
     summary: str | None
+    time_granularity: str | None = None
+
+    @property
+    def date_only(self) -> bool:
+        """First-come-first-served shippers get a date, not a time (the pod does the same)."""
+        return self.appointment_required is False or self.time_granularity == "window"
 
     @property
     def can_email(self) -> bool:
@@ -119,6 +125,7 @@ def vendor_profile(repo: Repository, key: str) -> VendorProfile:
         contact_name=trusted("contact_name"),
         appointment_required=trusted("appointment_required"),
         summary=profile.scheduling_summary if profile else None,
+        time_granularity=trusted("time_granularity"),
     )
 
 
@@ -300,10 +307,10 @@ def _fmt_local(value: str | None) -> tuple[str, str]:
     return (parsed.strftime("%m/%d"), clock.replace(":", ""))
 
 
-def request_lines(case: BookingCase) -> list[str]:
+def request_lines(case: BookingCase, *, date_only: bool = False) -> list[str]:
     """The PO lines exactly as the pod writes them: "PO# X on MM/DD @ HHMM"."""
     mmdd, clock = _fmt_local(case.requested_local)
-    when = f"on {mmdd}" + (f" @ {clock}" if clock else "")
+    when = f"on {mmdd}" + (f" @ {clock}" if clock and not date_only else "")
     pos = [str(p) for p in case.po_numbers]
     if not pos:
         return [f"Load {case.load_id} {when}"]
@@ -312,9 +319,25 @@ def request_lines(case: BookingCase) -> list[str]:
     return [f"PO# {pos[0]} {when}"]
 
 
-def compose_request(case: BookingCase, settings: Settings) -> OutboundDraft:
+def short_vendor(name: str | None) -> str:
+    """Drop the corporate suffix: "Koch Foods, Inc." becomes "Koch Foods"."""
+    return re.sub(r",?\s*\b(inc|llc|corp|co)\b\.?$", "", name or "the shipper", flags=re.I).strip()
+
+
+def compose_request(
+    case: BookingCase, settings: Settings, profile: VendorProfile | None = None
+) -> OutboundDraft:
     """The request email, in the shape the pod already uses."""
     pos = [str(p) for p in case.po_numbers]
+    shared = (case.contact_email or "").lower() in {
+        d.lower() for d in settings.booking_shared_desks
+    }
+    ask = (
+        f"Can I please schedule the following for {short_vendor(case.vendor_name)} going to "
+        f"{customer_label(case.customer_name)}?"
+        if shared
+        else "Can I please schedule the following?"
+    )
     subject = (
         f"Pick Up Appointment: {' & '.join(pos)}"
         if pos
@@ -323,9 +346,9 @@ def compose_request(case: BookingCase, settings: Settings) -> OutboundDraft:
     lines = [
         "Hello,",
         "",
-        "Can I please schedule the following?",
+        ask,
         "",
-        *request_lines(case),
+        *request_lines(case, date_only=bool(profile and profile.date_only)),
         "",
         "Thank you!",
         "",
@@ -349,7 +372,8 @@ def draft_case(
     if not case.contact_email:
         msg = f"case {case.id} has no booking email"
         raise ValueError(msg)
-    draft = compose_request(case, settings)
+    profile = vendor_profile(Repository(session), case.facility_key) if case.facility_key else None
+    draft = compose_request(case, settings, profile)
     ref = mailer.create_draft(draft)
     message = BookingMessage(
         case_id=case.id,
@@ -366,6 +390,77 @@ def draft_case(
     case.reason = None
     session.flush()
     _event(session, case, "drafted", draft_ref=ref, to=draft.to_addr, subject=draft.subject)
+    return message
+
+
+def reschedule_case(
+    session: Session,
+    case: BookingCase,
+    mailer: Mailer,
+    settings: Settings,
+    *,
+    requested_local: str,
+    by: str,
+    note: str | None = None,
+) -> BookingMessage:
+    """Ask the vendor for a new slot in the same thread (a Circle-side miss, most often)."""
+    if case.status in (CaseStatus.NEW.value, CaseStatus.DRAFTED.value, CaseStatus.CLOSED.value):
+        msg = f"case {case.id} is {case.status}; nothing to reschedule yet"
+        raise ValueError(msg)
+    if not case.contact_email:
+        msg = f"case {case.id} has no booking email"
+        raise ValueError(msg)
+    previous = case.confirmed_local or case.requested_local
+    case.requested_local = requested_local
+    case.confirmed_local = None
+    case.confirmed_start_utc = None
+    case.confirmed_end_utc = None
+    profile = vendor_profile(Repository(session), case.facility_key) if case.facility_key else None
+    line = request_lines(case, date_only=bool(profile and profile.date_only))[0]
+    body_lines = ["Hello,", ""]
+    if note:
+        body_lines.extend([note.strip(), ""])
+    body_lines.extend(
+        [f"Can we please reschedule {line}?", "", "Thank you!", "", settings.booking_signature]
+    )
+    original = next((m.subject for m in case.messages if m.direction == "out" and m.subject), None)
+    subject = original or f"Pick Up Appointment: {' & '.join(str(p) for p in case.po_numbers)}"
+    subject = subject if subject.lower().startswith("re:") else f"Re: {subject}"
+    last_in = next((m for m in reversed(case.messages) if m.direction == "in"), None)
+    draft = OutboundDraft(
+        to_addr=case.contact_email,
+        cc_addr=", ".join(settings.booking_cc),
+        subject=subject,
+        body="\n".join(body_lines),
+        thread_id=case.thread_id,
+        in_reply_to=last_in.message_id if last_in else None,
+    )
+    ref = mailer.create_draft(draft)
+    message = BookingMessage(
+        case_id=case.id,
+        direction="out",
+        kind="reschedule",
+        to_addr=draft.to_addr,
+        cc_addr=draft.cc_addr,
+        subject=subject,
+        body=draft.body,
+        thread_id=case.thread_id,
+        draft_ref=ref,
+    )
+    case.messages.append(message)
+    case.status = CaseStatus.SENT.value
+    case.reason = None
+    session.flush()
+    _event(
+        session,
+        case,
+        "reschedule",
+        actor=by,
+        previous=previous,
+        requested=requested_local,
+        note=note,
+        draft_ref=ref,
+    )
     return message
 
 
@@ -481,7 +576,14 @@ def apply_reply(
             if result.pickup_date
             else "vendor asked to check back later"
         )
-        _event(session, case, "deferred", actor=actor, reason=case.reason)
+        _event(
+            session,
+            case,
+            "deferred",
+            actor=actor,
+            reason=case.reason,
+            check_back=result.pickup_date,
+        )
     elif result.status == ReplyStatus.REJECTED:
         case.status = CaseStatus.NEEDS_HUMAN.value
         case.reason = (

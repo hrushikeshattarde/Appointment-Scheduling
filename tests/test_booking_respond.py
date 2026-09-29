@@ -409,3 +409,38 @@ def test_deferred_replies_keep_waiting_and_unbacked_confirmations_are_not_truste
         # "confirmed" with no quote found in the text is not a confirmation.
         assert stats.unrelated == 1 and case.status == CaseStatus.SENT.value
         assert case.messages[-1].classification["status"] == "unrelated"
+
+
+def test_follow_up_waits_for_the_vendor_check_back_day(settings, sessions):
+    settings = settings.model_copy(
+        update={"pilot_terminal_ids": [1089], "booking_follow_up_hours": 24}
+    )
+    mailer = RecordingMailer()
+    case_id = _prepared_case(settings, sessions, mailer)
+    classifier = FakeReplyClassifier(
+        lambda _c: ReplyClassification(
+            status=ReplyStatus.DEFERRED,
+            pickup_date="2026-10-05",
+            quotes=["check back on Monday, 10/5"],
+        )
+    )
+    with session_scope(sessions) as session:
+        case = session.get(BookingCase, case_id)
+        assert case is not None
+        ingest(
+            session,
+            [reply("PO is unconfirmed. Please check back on Monday, 10/5", mid="cb1")],
+            classifier,
+            internal_domains=["circledelivers.com"],
+        )
+        assert case.status == CaseStatus.SENT.value
+        # Two days later would normally trigger a nudge, but the vendor named a day.
+        assert (
+            Responder(settings, mailer, now=NOW + timedelta(days=2)).follow_up(session, case)
+            is None
+        )
+        due = Responder(settings, mailer, now=datetime(2026, 10, 5, 13, 0, tzinfo=UTC))
+        message = due.follow_up(session, case)
+        assert message is not None and message.kind == "follow_up"
+        assert mailer.drafts[-1].body.startswith("Good Morning,\n\nChecking in on this!")
+        assert "check back on 10/05" in case.events[-1].detail["reason"]

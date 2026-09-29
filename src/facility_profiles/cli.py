@@ -469,6 +469,38 @@ def booking_draft(
             )
 
 
+@booking_app.command("reschedule")
+def booking_reschedule(
+    case_id: int,
+    date: Annotated[str, typer.Option(help="New pickup date, YYYY-MM-DD")],
+    by: Annotated[str, typer.Option(help="Who is asking")],
+    time: Annotated[str | None, typer.Option(help="New pickup time, HH:MM local")] = None,
+    note: Annotated[
+        str | None, typer.Option(help="One line of context, e.g. the driver fell off")
+    ] = None,
+) -> None:
+    """Draft an in-thread request for a new pickup slot (after a missed pickup, for example)."""
+    from facility_profiles.booking.mail import LocalDraftMailer
+    from facility_profiles.booking.service import reschedule_case
+
+    settings = _settings()
+    mailer = LocalDraftMailer(Path(settings.booking_drafts_dir), sender=settings.booking_sender)
+    requested = f"{date} {time}" if time else date
+    with session_scope(_sessions(settings)) as session:
+        case = _booking_case(session, case_id)
+        try:
+            message = reschedule_case(
+                session, case, mailer, settings, requested_local=requested, by=by, note=note
+            )
+        except ValueError as exc:
+            typer.echo(str(exc))
+            raise typer.Exit(code=1) from exc
+    typer.echo(
+        f"#{case_id} reschedule drafted -> {message.to_addr}: {message.subject} "
+        f"[{message.draft_ref}]"
+    )
+
+
 @booking_app.command("sent")
 def booking_sent(
     case_id: int,

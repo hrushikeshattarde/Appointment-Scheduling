@@ -27,6 +27,7 @@ from facility_profiles.booking.service import (
     list_cases,
     mark_sent,
     requested_local,
+    reschedule_case,
     scan,
 )
 from facility_profiles.cli import app
@@ -224,7 +225,8 @@ def test_scan_draft_reply_and_approve_round_trip(settings, sessions):
         assert case.requested_local == "2026-10-01 09:00"
         draft = compose_request(case, settings)
         assert draft.subject == "Pick Up Appointment: 226321092660"
-        assert "Can I please schedule the following?" in draft.body
+        # The CCI desk serves several shippers, so the pod names the shipper and the customer.
+        assert "Can I please schedule the following for Koch Foods going to Lidl?" in draft.body
         assert "PO# 226321092660 on 10/01 @ 0900" in draft.body
         assert "Delivering" not in draft.body and "Carrier:" not in draft.body
         assert draft.body.startswith("Hello,\n\nCan I please schedule")
@@ -448,3 +450,62 @@ def test_booking_cli_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             assert runner.invoke(app, ["booking", command, "--help"]).exit_code == 0
     finally:
         get_settings.cache_clear()
+
+
+def test_first_come_first_served_vendors_get_a_date_only_request(settings, sessions):
+    settings = settings.model_copy(update={"pilot_terminal_ids": [1089]})
+    key = seed_vendor(sessions)
+    with session_scope(sessions) as session:
+        repo = Repository(session)
+        repo.set_field_human(
+            key, Role.SHIPPER, "appointment_required", False, state=FieldState.HUMAN_SET
+        )
+        repo.set_field_human(
+            key, Role.SHIPPER, "contact_email", "ncshipping@example.com", state=FieldState.HUMAN_SET
+        )
+    client = FakeTPro([lidl_load(9001, po="266621042660")], {})
+    scan(client, sessions, settings, days_ahead=7, now=NOW)  # type: ignore[arg-type]
+    mailer = RecordingMailer()
+    with session_scope(sessions) as session:
+        case = list_cases(session)[0]
+        draft_case(session, case, mailer, settings)
+    body = mailer.drafts[-1].body
+    assert "PO# 266621042660 on 10/01\n" in body and "@" not in body.split("Thank you!")[0]
+    assert "Can I please schedule the following?" in body
+
+
+def test_reschedule_drafts_in_thread_and_resets_the_slot(settings, sessions):
+    settings = settings.model_copy(update={"pilot_terminal_ids": [1089]})
+    seed_vendor(sessions)
+    client = FakeTPro([lidl_load(9002, po="104427082660")], {})
+    scan(client, sessions, settings, days_ahead=7, now=NOW)  # type: ignore[arg-type]
+    mailer = RecordingMailer()
+    with session_scope(sessions) as session:
+        case = list_cases(session)[0]
+        with pytest.raises(ValueError, match="nothing to reschedule"):
+            reschedule_case(
+                session, case, mailer, settings, requested_local="2026-10-02 09:00", by="megan"
+            )
+        draft_case(session, case, mailer, settings)
+        mark_sent(session, case, by="megan", thread_id="t9")
+        case.status = CaseStatus.APPROVED.value
+        case.confirmed_local = "2026-10-01 09:00"
+        message = reschedule_case(
+            session,
+            case,
+            mailer,
+            settings,
+            requested_local="2026-10-02 14:30",
+            by="megan",
+            note="Our driver fell off this morning, my apologies.",
+        )
+        assert message.kind == "reschedule" and case.status == CaseStatus.SENT.value
+        assert case.requested_local == "2026-10-02 14:30" and case.confirmed_local is None
+        sent = mailer.drafts[-1]
+        assert sent.subject == "Re: Pick Up Appointment: 104427082660" and sent.thread_id == "t9"
+        assert "Our driver fell off this morning, my apologies." in sent.body
+        assert "Can we please reschedule PO# 104427082660 on 10/02 @ 1430?" in sent.body
+        assert (
+            case.events[-1].action == "reschedule"
+            and case.events[-1].detail["previous"] == "2026-10-01 09:00"
+        )

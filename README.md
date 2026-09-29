@@ -160,6 +160,13 @@ asking for a new delivery slot; `booking follow-up` nudges once after
 `FP_BOOKING_FOLLOW_UP_HOURS` of silence. Replies that mention rates, fees, detention, claims
 or damage, and threads past `FP_BOOKING_MAX_ROUNDS`, go to a person untouched.
 
+Also from the threads: a desk that serves several shippers (`FP_BOOKING_SHARED_DESKS`, the CCI
+desk by default) is asked "for Koch Foods going to Lidl"; a first-come-first-served shipper
+(appointment not required, or window granularity on the profile) gets a date with no time; a
+vendor's "check back on Monday" is honoured, with the nudge sent that day as "Checking in on
+this!"; and `booking reschedule ID --date --time --by [--note]` drafts the in-thread request
+for a new slot after a Circle-side miss, the most common event in the archive.
+
 Tables: `booking_cases`, `booking_messages`, `booking_events` (created by `init-db`).
 Code: `booking/service.py` (cases), `booking/classify.py` (reply reading and validation),
 `booking/mail.py` (JSONL or Gmail in, `.eml` or Gmail drafts out).

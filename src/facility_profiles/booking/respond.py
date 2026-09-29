@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
@@ -533,23 +533,50 @@ class Responder:
         if not outbound or any(m.kind == ResponseIntent.FOLLOW_UP.value for m in outbound):
             return None
         last_out = as_utc(outbound[-1].sent_at) or as_utc(outbound[-1].created_at)
-        if last_out is None or self._now() - last_out < timedelta(
-            hours=self.settings.booking_follow_up_hours
-        ):
+        if last_out is None:
             return None
-        replied_since = any(
-            m.direction == "in" and (as_utc(m.sent_at) or last_out) > last_out
-            for m in case.messages
-        )
-        if replied_since:
-            return None
-        plan = ResponsePlan(
-            ResponseIntent.FOLLOW_UP,
-            f"no reply for {self.settings.booking_follow_up_hours} hours",
-            body="Hello,\n\nFollowing up on this.",
-            to_addr=case.contact_email,
-        )
+        check_back = self._check_back_date(session, case, since=last_out)
+        tz = ZoneInfo(case.vendor_timezone or "America/New_York")
+        if check_back is not None:
+            if self._now().astimezone(tz).date() < check_back:
+                return None  # the vendor said when to ask again; wait for that day
+            reason = f"vendor said to check back on {check_back:%m/%d}"
+            body = "Good Morning,\n\nChecking in on this!"
+        else:
+            if self._now() - last_out < timedelta(hours=self.settings.booking_follow_up_hours):
+                return None
+            replied_since = any(
+                m.direction == "in" and (as_utc(m.sent_at) or last_out) > last_out
+                for m in case.messages
+            )
+            if replied_since:
+                return None
+            reason = f"no reply for {self.settings.booking_follow_up_hours} hours"
+            body = "Hello,\n\nFollowing up on this."
+        plan = ResponsePlan(ResponseIntent.FOLLOW_UP, reason, body=body, to_addr=case.contact_email)
         return self.act(session, case, None, plan)
+
+    @staticmethod
+    def _check_back_date(session: Session, case: BookingCase, *, since: datetime) -> date | None:
+        """The day the vendor asked to be contacted again (latest deferral after ``since``)."""
+        from sqlalchemy import select  # noqa: PLC0415
+
+        events = session.scalars(
+            select(BookingEvent)
+            .where(BookingEvent.case_id == case.id, BookingEvent.action == "deferred")
+            .order_by(BookingEvent.id.desc())
+        )
+        for event in events:
+            created = as_utc(event.created_at)
+            if created is not None and created < since:
+                break
+            raw = (event.detail or {}).get("check_back")
+            if raw:
+                try:
+                    return date.fromisoformat(str(raw))
+                except ValueError:
+                    return None
+        return None
 
     def acknowledge(
         self, session: Session, case: BookingCase, reply: BookingMessage
