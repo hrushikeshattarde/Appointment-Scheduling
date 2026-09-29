@@ -25,6 +25,11 @@ jobs:
         run: |
           set -o pipefail
           uv run pytest -ra --cov-report=xml 2>&1 | tee pytest.log
+      - name: Surface pytest failures as annotations
+        if: failure()
+        run: |
+          grep -E '^(FAILED|ERROR|FAIL |E  |.*Error)' pytest.log | head -n 8 | while IFS= read -r line; do echo "::error title=pytest::${line:0:900}"; done
+          tail -n 3 pytest.log | while IFS= read -r line; do echo "::warning title=pytest tail::${line:0:900}"; done
       - name: Test summary
         if: always()
         run: |
