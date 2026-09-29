@@ -22,7 +22,13 @@ jobs:
       - name: Type check
         run: uv run mypy
       - name: Test
-        run: uv run pytest --cov-report=xml
+        run: |
+          set -o pipefail
+          uv run pytest -ra --cov-report=xml 2>&1 | tee pytest.log
+      - name: Test summary
+        if: always()
+        run: |
+          { echo '### pytest'; echo '```'; tail -n 80 pytest.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload coverage
         uses: actions/upload-artifact@v4
         with:

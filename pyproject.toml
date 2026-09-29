@@ -38,6 +38,7 @@ dev = [
   "ruff>=0.8",
   "fastapi>=0.115,<1",
   "httpx>=0.28,<1",
+  "pytest-github-actions-annotate-failures>=0.3",
 ]
 
 [build-system]
