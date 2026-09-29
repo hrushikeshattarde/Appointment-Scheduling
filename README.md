@@ -147,6 +147,17 @@ confirmed becomes `proposed` with the slot in UTC, everything else becomes `need
 the reason. `approve` records the decision and prints the exact Transport Pro
 `set_appointment` payload; the write itself stays behind the client's write flag.
 
+The conversation policy (`booking/respond.py`) handles what comes back, still as drafts:
+a counter-offer is accepted when the offered pickup still makes the customer's delivery
+slot (miles at `FP_BOOKING_AVG_MPH` plus `FP_BOOKING_LOAD_HOURS`), otherwise the agent asks for
+alternatives inside the workable window; a factual question is answered only from data on
+the case (PO numbers, carrier, delivery site and number, load number), by rule first and by
+the model second, and every number in the answer must exist on the case; a vendor that
+cannot ship gets a drafted note to the customer's inbound desk (`FP_BOOKING_CUSTOMER_DESK`)
+asking for a new delivery slot; `booking follow-up` nudges once after
+`FP_BOOKING_FOLLOW_UP_HOURS` of silence. Replies that mention rates, fees, detention, claims
+or damage, and threads past `FP_BOOKING_MAX_ROUNDS`, go to a person untouched.
+
 Tables: `booking_cases`, `booking_messages`, `booking_events` (created by `init-db`).
 Code: `booking/service.py` (cases), `booking/classify.py` (reply reading and validation),
 `booking/mail.py` (JSONL or Gmail in, `.eml` or Gmail drafts out).

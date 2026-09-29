@@ -500,8 +500,11 @@ def booking_inbox(
     fake: Annotated[
         bool, typer.Option(help="Classify every reply as unrelated (no model)")
     ] = False,
+    respond: Annotated[
+        bool, typer.Option("--respond/--no-respond", help="Draft answers and counter-offers")
+    ] = True,
 ) -> None:
-    """Read replies, match them to cases, classify them and move the cases."""
+    """Read replies, match them to cases, classify them, move the cases, draft answers."""
     from facility_profiles.booking.classify import (
         FakeReplyClassifier,
         OpenRouterReplyClassifier,
@@ -535,11 +538,57 @@ def booking_inbox(
     else:
         typer.echo("reply classification needs FP_LLM_PROVIDER=openrouter (or --fake)")
         raise typer.Exit(code=2)
+    responder = None
+    if respond:
+        from facility_profiles.booking.mail import LocalDraftMailer
+        from facility_profiles.booking.respond import OpenRouterAnswerComposer, Responder
+
+        composer = None
+        if not fake and settings.llm_provider == "openrouter" and settings.openrouter_api_key:
+            composer = OpenRouterAnswerComposer(
+                settings.openrouter_api_key.get_secret_value(),
+                model=settings.llm_model,
+                base_url=settings.openrouter_base_url,
+            )
+        responder = Responder(
+            settings,
+            LocalDraftMailer(Path(settings.booking_drafts_dir), sender=settings.booking_sender),
+            composer=composer,
+        )
     with session_scope(_sessions(settings)) as session:
         stats = ingest(
-            session, messages, classifier, internal_domains=settings.internal_email_domains
+            session,
+            messages,
+            classifier,
+            internal_domains=settings.internal_email_domains,
+            responder=responder,
         )
     typer.echo(json.dumps(stats.__dict__, indent=2))
+
+
+@booking_app.command("follow-up")
+def booking_follow_up() -> None:
+    """Draft one nudge for every sent request with no reply for the configured time."""
+    from facility_profiles.booking.mail import LocalDraftMailer
+    from facility_profiles.booking.models import CaseStatus
+    from facility_profiles.booking.respond import Responder
+    from facility_profiles.booking.service import list_cases
+
+    settings = _settings()
+    responder = Responder(
+        settings,
+        LocalDraftMailer(Path(settings.booking_drafts_dir), sender=settings.booking_sender),
+    )
+    count = 0
+    with session_scope(_sessions(settings)) as session:
+        for case in list_cases(session, CaseStatus.SENT.value):
+            message = responder.follow_up(session, case)
+            if message is not None:
+                count += 1
+                typer.echo(
+                    f"#{case.id} follow-up drafted -> {message.to_addr} [{message.draft_ref}]"
+                )
+    typer.echo(f"{count} follow-up(s) drafted")
 
 
 @booking_app.command("approve")

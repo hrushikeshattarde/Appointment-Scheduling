@@ -25,6 +25,7 @@ from facility_profiles.booking.classify import (
 )
 from facility_profiles.booking.mail import InboundMessage, Mailer, OutboundDraft
 from facility_profiles.booking.models import BookingCase, BookingEvent, BookingMessage, CaseStatus
+from facility_profiles.booking.respond import Responder
 from facility_profiles.booking.schema import ReplyClassification, ReplyStatus
 from facility_profiles.config import Settings
 from facility_profiles.domain.resolution import FacilityResolver
@@ -93,6 +94,7 @@ class IngestStats:
     proposed: int = 0
     needs_human: int = 0
     unrelated: int = 0
+    responded: int = 0
 
 
 # ------------------------------------------------------------------ profile and load helpers
@@ -362,7 +364,7 @@ def draft_case(
         body=draft.body,
         draft_ref=ref,
     )
-    session.add(message)
+    case.messages.append(message)
     case.status = CaseStatus.DRAFTED.value
     case.reason = None
     session.flush()
@@ -492,8 +494,9 @@ def ingest(
     classifier: ReplyClassifier,
     *,
     internal_domains: list[str],
+    responder: Responder | None = None,
 ) -> IngestStats:
-    """Match inbound mail to cases, classify the vendor replies and move the cases."""
+    """Match inbound mail to cases, classify the replies, move the cases, draft answers."""
     stats = IngestStats()
     internal = {d.lower() for d in internal_domains}
     for message in messages:
@@ -521,26 +524,26 @@ def ingest(
         output = classifier.classify(context)
         result, issues = validate_classification(output.result, message.body)
         stats.classified += 1
-        session.add(
-            BookingMessage(
-                case_id=case.id,
-                direction="in",
-                kind="reply",
-                from_addr=message.from_addr,
-                to_addr=message.to_addr,
-                cc_addr=message.cc_addr,
-                subject=message.subject,
-                body=message.body,
-                message_id=message.message_id,
-                thread_id=message.thread_id,
-                sent_at=message.sent_at,
-                classification={
-                    **result.model_dump(mode="json"),
-                    "issues": [i.__dict__ for i in issues],
-                    "model": output.model,
-                },
-            )
+        inbound = BookingMessage(
+            case_id=case.id,
+            direction="in",
+            kind="reply",
+            from_addr=message.from_addr,
+            to_addr=message.to_addr,
+            cc_addr=message.cc_addr,
+            subject=message.subject,
+            body=message.body,
+            message_id=message.message_id,
+            thread_id=message.thread_id,
+            sent_at=message.sent_at,
+            classification={
+                **result.model_dump(mode="json"),
+                "issues": [i.__dict__ for i in issues],
+                "model": output.model,
+            },
         )
+        case.messages.append(inbound)
+        session.flush()
         if case.thread_id is None and message.thread_id:
             case.thread_id = message.thread_id
         apply_reply(session, case, result, issues)
@@ -554,6 +557,17 @@ def ingest(
             stats.needs_human += 1
         else:
             stats.unrelated += 1
+        if responder is not None and result.status in (
+            ReplyStatus.COUNTER_OFFER,
+            ReplyStatus.QUESTION,
+            ReplyStatus.REJECTED,
+        ):
+            plan, drafted = responder.respond(session, case, inbound, result)
+            if drafted is not None:
+                stats.responded += 1
+            log.info(
+                "booking.responded", case=case.id, intent=plan.intent.value, reason=plan.reason
+            )
         session.flush()
     return stats
 

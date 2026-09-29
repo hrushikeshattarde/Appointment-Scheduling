@@ -95,6 +95,13 @@ class Settings(BaseSettings):
         "Circle Logistics, Inc. | Fort Wayne | 260-208-4500 | lidl@circledelivers.com"
     )
     booking_drafts_dir: str = "./exports/drafts"
+    booking_carrier_name: str = "Circle Logistics, Inc."
+    booking_customer_desk: str | None = "inbound@lidl.us"
+    booking_max_rounds: int = Field(3, gt=0)
+    booking_follow_up_hours: int = Field(24, gt=0)
+    booking_min_notice_hours: int = Field(4, ge=0)
+    booking_avg_mph: float = Field(50.0, gt=0)
+    booking_load_hours: float = Field(2.0, ge=0)
 
     # --- Logging -------------------------------------------------------------------------
     log_level: str = "INFO"
