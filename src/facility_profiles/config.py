@@ -82,8 +82,13 @@ class Settings(BaseSettings):
         default_factory=lambda: ["260-208-4500"]
     )
 
-    # --- Booking agent (prototype, draft mode) --------------------------------------------
-    booking_mode: Literal["draft"] = "draft"
+    # --- Booking agent ----------------------------------------------------------------------
+    # draft: every outbound message is a file or a Gmail draft a person sends.
+    # send: `booking send` delivers requests through the Gmail API as booking_gmail_user.
+    booking_mode: Literal["draft", "send"] = "draft"
+    booking_gmail_key: str | None = None  # service-account JSON key (gmail.send delegation)
+    booking_gmail_user: str | None = None  # the member mailbox the agent sends as
+    booking_send_daily_cap: int = Field(20, gt=0)  # outbound sends per rolling 24 hours
     booking_days_ahead: int = Field(7, gt=0)
     booking_default_pickup_time: str = "09:00"
     booking_transit_miles_per_day: int = Field(550, gt=0)

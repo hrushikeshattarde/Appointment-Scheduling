@@ -90,6 +90,11 @@ class BookingMessage(Base):
     body: Mapped[str | None] = mapped_column(Text)
     message_id: Mapped[str | None] = mapped_column(String(255), index=True)
     thread_id: Mapped[str | None] = mapped_column(String(128))
+    # RFC 5322 threading: the id this message carries, the id it answers, the chain it quotes.
+    # Gmail ids differ per mailbox; these do not, so replies are tied to requests through them.
+    rfc_message_id: Mapped[str | None] = mapped_column(String(255), index=True)
+    in_reply_to: Mapped[str | None] = mapped_column(Text)
+    references_header: Mapped[str | None] = mapped_column(Text)
     draft_ref: Mapped[str | None] = mapped_column(String(512))
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     classification: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)

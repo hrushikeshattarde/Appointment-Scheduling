@@ -188,6 +188,25 @@ Real-text regression: `tests/fixtures/lidl_morgan_foods_thread.jsonl` is the pod
 Morgan Foods thread in the mail pull's format, Outlook cruft included, and
 `tests/test_booking_real_thread.py` replays it with the model's recorded readings.
 
+### Sending as the agent, and tying replies to requests
+
+Every outbound message now carries its own RFC `Message-ID`, and every stored message keeps
+its `In-Reply-To` and `References`. A vendor's reply is matched to its case through those ids
+first, so the match holds whatever mailbox the reply is read from; the Gmail thread, a PO number
+in the reply's own words and a lone open case for the sender remain as fallbacks. A person's own
+send of a drafted request is recognised in the archive (same recipient desk, same subject or the
+case's POs) and links the case automatically, so `booking sent` is rarely needed.
+
+`FP_BOOKING_MODE=send` with `FP_BOOKING_GMAIL_KEY` and `FP_BOOKING_GMAIL_USER` lets
+`booking send [CASE]` deliver requests through the Gmail API as that mailbox (a Google Group
+cannot send; the agent writes from a member mailbox and copies the group). A send passes a
+deterministic gate first: send mode on, the recipient equal to the profile's trusted desk, and
+fewer than `FP_BOOKING_SEND_DAILY_CAP` sends in the last 24 hours. The case moves straight to
+`sent` with the Gmail id, thread and Message-ID recorded. Replies drafted by the conversation
+policy answer the vendor's Message-ID and go through the same outbox, so with a sending outbox
+they are sent too; the CLI keeps them as drafts until the policy gate for unattended replies
+lands. The service-account key needs `gmail.send` under domain-wide delegation.
+
 ### Group-mail archive in S3
 
 `facility-profiles mail-archive ...` keeps the lidl@ group's pickup-appointment threads in S3, on

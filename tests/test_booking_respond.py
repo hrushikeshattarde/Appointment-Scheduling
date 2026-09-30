@@ -90,7 +90,7 @@ def test_counter_offer_is_accepted_when_it_makes_the_delivery(settings, sessions
         assert as_utc(case.confirmed_start_utc) == datetime(2026, 10, 1, 15, 0, tzinfo=UTC)
         sent = mailer.drafts[-1]
         assert sent.subject.startswith("Re: ") and sent.body.startswith("Yes, 10/01 @ 1100 works.")
-        assert sent.thread_id == "t1" and sent.in_reply_to == "c1"
+        assert sent.thread_id == "t1" and sent.in_reply_to == "<c1@vendor.test>"
         assert [e.action for e in case.events][-1] == "accept_offer"
 
 

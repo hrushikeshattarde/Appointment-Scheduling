@@ -158,6 +158,7 @@ def reply(
         cc_addr="Lidl Group <lidl@circledelivers.com>",
         subject=subject,
         body=body,
+        rfc_message_id=f"<{mid}@vendor.test>",
     )
 
 

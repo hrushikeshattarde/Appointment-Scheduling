@@ -27,8 +27,9 @@ from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.orm import Session
 
 from facility_profiles import __version__
-from facility_profiles.booking.mail import Mailer, OutboundDraft
+from facility_profiles.booking.mail import Mailer, OutboundDraft, Sender
 from facility_profiles.booking.models import BookingCase, BookingEvent, BookingMessage, CaseStatus
+from facility_profiles.booking.outbox import dispatch
 from facility_profiles.booking.schema import ReplyClassification, ReplyStatus
 from facility_profiles.config import Settings
 from facility_profiles.extraction.llm import ExtractionError
@@ -346,7 +347,7 @@ class Responder:
     """Decides the next message for a case after a classified reply, and drafts it."""
 
     settings: Settings
-    mailer: Mailer
+    mailer: Mailer | Sender
     composer: AnswerComposer | None = None
     now: datetime | None = None
 
@@ -471,19 +472,18 @@ class Responder:
             self._event(session, case, "handoff", reason=plan.reason)
             return None
         subject = self._subject(case, reply, plan)
+        escalation = plan.intent == ResponseIntent.ESCALATE_TO_CUSTOMER
         draft = OutboundDraft(
             to_addr=plan.to_addr,
             cc_addr=", ".join(self.settings.booking_cc),
             subject=subject,
-            body=plan.body
-            if plan.intent == ResponseIntent.ESCALATE_TO_CUSTOMER
-            else (f"{plan.body}\n\n{self.settings.booking_signature}"),
-            thread_id=(
-                None if plan.intent == ResponseIntent.ESCALATE_TO_CUSTOMER else case.thread_id
-            ),
-            in_reply_to=reply.message_id if reply else None,
+            body=plan.body if escalation else (f"{plan.body}\n\n{self.settings.booking_signature}"),
+            thread_id=None if escalation else case.thread_id,
+            # A new thread to the customer desk answers nothing; everything else answers the
+            # vendor's message by its RFC Message-ID so the next reply threads back to the case.
+            in_reply_to=None if escalation or reply is None else reply.rfc_message_id,
+            references=None if escalation or reply is None else reply.references_header,
         )
-        ref = self.mailer.create_draft(draft)
         message = BookingMessage(
             case_id=case.id,
             direction="out",
@@ -493,9 +493,10 @@ class Responder:
             subject=subject,
             body=draft.body,
             thread_id=draft.thread_id,
-            draft_ref=ref,
         )
         case.messages.append(message)
+        session.flush()
+        ref = dispatch(session, case, message, self.mailer, draft).ref
         if plan.intent == ResponseIntent.ACCEPT_OFFER and plan.proposed_local:
             day, _, clock = plan.proposed_local.partition(" ")
             start = local_dt(day, clock or None, case.vendor_timezone).astimezone(UTC)

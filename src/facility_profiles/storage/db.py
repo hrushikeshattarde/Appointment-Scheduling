@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Engine, create_engine, event
+from sqlalchemy import Engine, create_engine, event, inspect, text
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -46,10 +46,44 @@ def make_engine(database_url: str, *, echo: bool = False) -> Engine:
 
 
 def init_db(engine: Engine) -> None:
-    """Create all tables that do not exist yet (including the booking agent's)."""
+    """Create all tables that do not exist yet (including the booking agent's), add new columns."""
     from facility_profiles.booking import models as _booking_models  # noqa: F401, PLC0415
 
     Base.metadata.create_all(engine)
+    ensure_columns(engine)
+
+
+def ensure_columns(engine: Engine) -> list[str]:
+    """Add columns the models gained since a store was created; return what was added.
+
+    ``create_all`` never alters an existing table, and the pilot stores are SQLite files that
+    predate some columns. Adding a nullable column is the one schema change SQLite does in
+    place, so it is done here; anything else waits for Alembic.
+    """
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+    added: list[str] = []
+    with engine.begin() as conn:
+        for table in Base.metadata.sorted_tables:
+            if table.name not in existing_tables:
+                continue
+            present = {c["name"] for c in inspector.get_columns(table.name)}
+            for column in table.columns:
+                if column.name in present:
+                    continue
+                ddl = column.type.compile(dialect=engine.dialect)
+                conn.execute(text(f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {ddl}'))
+                added.append(f"{table.name}.{column.name}")
+                present.add(column.name)
+            # An index the model declares on a column that was just added, or that an older
+            # store never had: create it so lookups by Message-ID stay cheap.
+            have_indexes = {i["name"] for i in inspector.get_indexes(table.name)}
+            for index in table.indexes:
+                if index.name in have_indexes or not all(c.name in present for c in index.columns):
+                    continue
+                index.create(bind=conn)
+                added.append(f"{table.name}.{index.name}")
+    return added
 
 
 def session_factory(engine: Engine) -> sessionmaker[Session]:

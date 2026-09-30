@@ -474,6 +474,48 @@ def booking_draft(
             )
 
 
+@booking_app.command("send")
+def booking_send(
+    case_id: Annotated[
+        int | None, typer.Argument(help="Case to send; omit for all new cases, one email per desk")
+    ] = None,
+    by: Annotated[str, typer.Option(help="Who is sending (recorded on the case)")] = "agent",
+) -> None:
+    """Send the request through Gmail as the agent's mailbox (FP_BOOKING_MODE=send)."""
+    from facility_profiles.booking.mail import GmailSender
+    from facility_profiles.booking.models import CaseStatus
+    from facility_profiles.booking.outbox import SendRefusedError
+    from facility_profiles.booking.service import draft_batch, draft_case, list_cases
+
+    settings = _settings()
+    if settings.booking_mode != "send":
+        typer.echo("FP_BOOKING_MODE is 'draft'; set it to 'send' to let the agent send")
+        raise typer.Exit(code=2)
+    if not settings.booking_gmail_key or not settings.booking_gmail_user:
+        typer.echo("set FP_BOOKING_GMAIL_KEY and FP_BOOKING_GMAIL_USER (the mailbox to send as)")
+        raise typer.Exit(code=2)
+    sender = GmailSender(
+        Path(settings.booking_gmail_key), settings.booking_gmail_user, settings.booking_gmail_user
+    )
+    with session_scope(_sessions(settings)) as session:
+        try:
+            if case_id is not None:
+                messages = [
+                    draft_case(session, _booking_case(session, case_id), sender, settings, by=by)
+                ]
+            else:
+                cases = [c for c in list_cases(session, CaseStatus.NEW.value) if c.contact_email]
+                messages = draft_batch(session, cases, sender, settings, by=by)
+        except (SendRefusedError, ValueError) as exc:
+            typer.echo(f"refused: {exc}")
+            raise typer.Exit(code=1) from exc
+        for message in messages:
+            typer.echo(
+                f"#{message.case_id} sent -> {message.to_addr}: {message.subject}  "
+                f"[{message.draft_ref}] {message.rfc_message_id}"
+            )
+
+
 @booking_app.command("delivery-updated")
 def booking_delivery_updated(
     case_id: int,
@@ -592,15 +634,23 @@ def booking_sent(
     case_id: int,
     by: Annotated[str, typer.Option(help="Who sent it")],
     thread: Annotated[str | None, typer.Option(help="Gmail thread ID, if known")] = None,
+    message_id: Annotated[
+        str | None,
+        typer.Option(help="The sent message's RFC Message-ID, e.g. <...@mail.gmail.com>"),
+    ] = None,
 ) -> None:
-    """Record that a person sent the draft, so the reply can be matched."""
+    """Record that a person sent the draft, so the reply can be matched.
+
+    Rarely needed now: replies are matched through their In-Reply-To header, and a person's own
+    send is recognised in the archive and linked to the case automatically.
+    """
     from facility_profiles.booking.service import mark_sent
 
     settings = _settings()
     with session_scope(_sessions(settings)) as session:
         case = _booking_case(session, case_id)
         try:
-            mark_sent(session, case, by=by, thread_id=thread)
+            mark_sent(session, case, by=by, thread_id=thread, rfc_message_id=message_id)
         except ValueError as exc:
             typer.echo(str(exc))
             raise typer.Exit(code=1) from exc

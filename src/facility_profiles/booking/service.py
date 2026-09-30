@@ -14,7 +14,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from facility_profiles.booking.classify import (
@@ -23,14 +23,27 @@ from facility_profiles.booking.classify import (
     ReplyContext,
     validate_classification,
 )
-from facility_profiles.booking.mail import InboundMessage, Mailer, OutboundDraft
+from facility_profiles.booking.mail import (
+    InboundMessage,
+    Mailer,
+    OutboundDraft,
+    Sender,
+    deliver,
+)
 from facility_profiles.booking.models import BookingCase, BookingEvent, BookingMessage, CaseStatus
+from facility_profiles.booking.outbox import (
+    check_send_gate,
+    dispatch,
+    is_sender,
+    record_delivery,
+)
 from facility_profiles.booking.respond import Responder, customer_label
 from facility_profiles.booking.schema import ReplyClassification, ReplyStatus
 from facility_profiles.config import Settings
 from facility_profiles.domain.resolution import FacilityResolver
 from facility_profiles.domain.schema import Role
 from facility_profiles.logging import get_logger
+from facility_profiles.mailarchive.filters import normalize_subject, participants
 from facility_profiles.pipeline.harvest import iter_terminal_loads, stop_identity
 from facility_profiles.storage.db import session_scope
 from facility_profiles.storage.repository import Repository, as_utc, unwrap
@@ -123,6 +136,8 @@ class IngestStats:
     deferred: int = 0
     delivery_updates: int = 0
     after_decision: int = 0  # mail on approved or closed cases, recorded but not classified
+    linked_outbound: int = 0  # a person's own send of a drafted request, recognised and linked
+    own_outbound: int = 0  # the agent's own sent mail seen again in the archive
 
 
 # ------------------------------------------------------------------ profile and load helpers
@@ -418,9 +433,19 @@ def compose_request(
 
 
 def draft_case(
-    session: Session, case: BookingCase, mailer: Mailer, settings: Settings
+    session: Session,
+    case: BookingCase,
+    mailer: Mailer | Sender,
+    settings: Settings,
+    *,
+    by: str = "agent",
 ) -> BookingMessage:
-    """Compose the request and hand it to the mailer as a draft."""
+    """Compose the request and hand it to the outbox: a draft for a person, or a send.
+
+    With a :class:`Sender` the request goes out only when the send gate passes (send mode on,
+    the recipient is the profile's trusted desk, the daily cap not reached) and the case moves
+    straight to ``sent`` with the ids a reply will point back at.
+    """
     if case.status not in (CaseStatus.NEW.value, CaseStatus.DRAFTED.value):
         msg = f"case {case.id} is {case.status}; only new cases can be drafted"
         raise ValueError(msg)
@@ -429,7 +454,9 @@ def draft_case(
         raise ValueError(msg)
     profile = vendor_profile(Repository(session), case.facility_key) if case.facility_key else None
     draft = compose_request(case, settings, profile)
-    ref = mailer.create_draft(draft)
+    if is_sender(mailer):
+        trusted = profile.contact_email if profile and profile.can_email else None
+        check_send_gate(session, case, draft, settings, trusted_desk=trusted)
     message = BookingMessage(
         case_id=case.id,
         direction="out",
@@ -438,20 +465,21 @@ def draft_case(
         cc_addr=draft.cc_addr,
         subject=draft.subject,
         body=draft.body,
-        draft_ref=ref,
     )
     case.messages.append(message)
-    case.status = CaseStatus.DRAFTED.value
+    session.flush()
+    result = dispatch(session, case, message, mailer, draft, actor=by)
+    case.status = CaseStatus.SENT.value if result.sent else CaseStatus.DRAFTED.value
     case.reason = None
     session.flush()
-    _event(session, case, "drafted", draft_ref=ref, to=draft.to_addr, subject=draft.subject)
+    _event(session, case, "drafted", draft_ref=result.ref, to=draft.to_addr, subject=draft.subject)
     return message
 
 
 def reschedule_case(
     session: Session,
     case: BookingCase,
-    mailer: Mailer,
+    mailer: Mailer | Sender,
     settings: Settings,
     *,
     requested_local: str,
@@ -488,9 +516,15 @@ def reschedule_case(
         subject=subject,
         body="\n".join(body_lines),
         thread_id=case.thread_id,
-        in_reply_to=last_in.message_id if last_in else None,
+        in_reply_to=last_in.rfc_message_id if last_in else None,
+        references=last_in.references_header if last_in else None,
     )
-    ref = mailer.create_draft(draft)
+    if is_sender(mailer):
+        profile = (
+            vendor_profile(Repository(session), case.facility_key) if case.facility_key else None
+        )
+        trusted = profile.contact_email if profile and profile.can_email else None
+        check_send_gate(session, case, draft, settings, trusted_desk=trusted)
     message = BookingMessage(
         case_id=case.id,
         direction="out",
@@ -500,9 +534,10 @@ def reschedule_case(
         subject=subject,
         body=draft.body,
         thread_id=case.thread_id,
-        draft_ref=ref,
     )
     case.messages.append(message)
+    session.flush()
+    result = dispatch(session, case, message, mailer, draft, actor=by)
     case.status = CaseStatus.SENT.value
     case.reason = None
     session.flush()
@@ -514,7 +549,7 @@ def reschedule_case(
         previous=previous,
         requested=requested_local,
         note=note,
-        draft_ref=ref,
+        draft_ref=result.ref,
     )
     return message
 
@@ -526,20 +561,35 @@ def mark_sent(
     by: str,
     thread_id: str | None = None,
     message_id: str | None = None,
+    rfc_message_id: str | None = None,
     sent_at: datetime | None = None,
 ) -> None:
-    """A person sent the draft; remember the thread so replies can be matched."""
-    if case.status not in (CaseStatus.DRAFTED.value, CaseStatus.NEW.value):
+    """A person sent the draft; remember the thread and Message-ID so replies can be matched.
+
+    Also accepted for a case already marked sent but without a thread, which is how a manual
+    ``booking sent`` gets its ids once the archive shows the message.
+    """
+    unlinked = case.status == CaseStatus.SENT.value and not case.thread_id
+    if case.status not in (CaseStatus.DRAFTED.value, CaseStatus.NEW.value) and not unlinked:
         msg = f"case {case.id} is {case.status}; nothing to mark as sent"
         raise ValueError(msg)
     request = next((m for m in reversed(case.messages) if m.direction == "out"), None)
     if request is not None:
-        request.sent_at = sent_at or datetime.now(tz=UTC)
+        request.sent_at = sent_at or request.sent_at or datetime.now(tz=UTC)
         request.thread_id = thread_id or request.thread_id
         request.message_id = message_id or request.message_id
+        request.rfc_message_id = rfc_message_id or request.rfc_message_id
     case.thread_id = thread_id or case.thread_id
     case.status = CaseStatus.SENT.value
-    _event(session, case, "sent", actor=by, thread_id=thread_id, message_id=message_id)
+    _event(
+        session,
+        case,
+        "sent",
+        actor=by,
+        thread_id=thread_id,
+        message_id=message_id,
+        rfc_message_id=rfc_message_id,
+    )
 
 
 # ------------------------------------------------------------------ replies
@@ -554,7 +604,24 @@ def list_cases(session: Session, status: str | None = None) -> list[BookingCase]
 
 
 def match_case(session: Session, message: InboundMessage) -> BookingCase | None:
-    """Match a reply to a case: by thread, then PO number, then a lone open case per sender."""
+    """Match a reply to a case.
+
+    In order: the Message-IDs the reply points at (In-Reply-To, then References) against what
+    the agent or a person sent; the Gmail thread, when the reply was read from the mailbox that
+    sent the request; a PO number in the reply's own words; a lone open case for the sender.
+    """
+    referenced = message.referenced_ids
+    if referenced:
+        answered = session.scalar(
+            select(BookingMessage)
+            .where(
+                BookingMessage.direction == "out",
+                func.lower(BookingMessage.rfc_message_id).in_(referenced),
+            )
+            .order_by(BookingMessage.id.desc())
+        )
+        if answered is not None:
+            return answered.case
     if message.thread_id:
         case = session.scalar(select(BookingCase).where(BookingCase.thread_id == message.thread_id))
         if case is not None:
@@ -699,11 +766,15 @@ def ingest(  # noqa: PLR0912 - one branch per reply outcome
     for message in messages:
         stats.messages += 1
         if message.from_domain in internal:
-            stats.skipped_internal += 1
+            outcome = link_outbound(session, message)
+            if outcome == "own":
+                stats.own_outbound += 1
+            elif outcome == "linked":
+                stats.linked_outbound += 1
+            else:
+                stats.skipped_internal += 1
             continue
-        if session.scalar(
-            select(BookingMessage).where(BookingMessage.message_id == message.message_id)
-        ):
+        if _already_recorded(session, message):
             stats.duplicates += 1
             continue
         case = match_case(session, message)
@@ -730,18 +801,10 @@ def ingest(  # noqa: PLR0912 - one branch per reply outcome
         output = classifier.classify(context)
         result, issues = validate_classification(output.result, message.body, message.quoted)
         stats.classified += 1
-        inbound = BookingMessage(
-            case_id=case.id,
-            direction="in",
+        inbound = _inbound_record(
+            case,
+            message,
             kind="reply",
-            from_addr=message.from_addr,
-            to_addr=message.to_addr,
-            cc_addr=message.cc_addr,
-            subject=message.subject,
-            body=message.body,
-            message_id=message.message_id,
-            thread_id=message.thread_id,
-            sent_at=message.sent_at,
             classification={
                 **result.model_dump(mode="json"),
                 "issues": [i.__dict__ for i in issues],
@@ -783,22 +846,111 @@ def ingest(  # noqa: PLR0912 - one branch per reply outcome
     return stats
 
 
+def _inbound_record(
+    case: BookingCase, message: InboundMessage, *, kind: str, classification: dict[str, Any]
+) -> BookingMessage:
+    """A stored copy of an inbound message, threading headers included."""
+    return BookingMessage(
+        case_id=case.id,
+        direction="in",
+        kind=kind,
+        from_addr=message.from_addr,
+        to_addr=message.to_addr,
+        cc_addr=message.cc_addr,
+        subject=message.subject,
+        body=message.body,
+        message_id=message.message_id,
+        thread_id=message.thread_id,
+        rfc_message_id=message.rfc_message_id,
+        in_reply_to=message.in_reply_to,
+        references_header=message.references,
+        sent_at=message.sent_at,
+        classification=classification,
+    )
+
+
+def _already_recorded(session: Session, message: InboundMessage) -> bool:
+    """Seen before, by the source's id or by the RFC Message-ID (two sources, one email)."""
+    if session.scalar(
+        select(BookingMessage.id).where(BookingMessage.message_id == message.message_id)
+    ):
+        return True
+    if message.rfc_message_id:
+        return (
+            session.scalar(
+                select(BookingMessage.id).where(
+                    BookingMessage.direction == "in",
+                    func.lower(BookingMessage.rfc_message_id) == message.rfc_message_id.lower(),
+                )
+            )
+            is not None
+        )
+    return False
+
+
+def link_outbound(session: Session, message: InboundMessage) -> str:
+    """Recognise Circle's own mail in the archive: ``own``, ``linked`` or ``""``.
+
+    ``own``: a message the agent sent, seen again through the archive; its Gmail id and thread
+    from that mailbox are recorded if missing. ``linked``: a person sent a drafted request
+    themselves; the case is marked sent with the message's thread and Message-ID, so the reply
+    can be matched without anyone typing ids in.
+    """
+    if message.rfc_message_id:
+        own = session.scalar(
+            select(BookingMessage).where(
+                BookingMessage.direction == "out",
+                func.lower(BookingMessage.rfc_message_id) == message.rfc_message_id.lower(),
+            )
+        )
+        if own is not None:
+            own.message_id = own.message_id or message.message_id
+            own.thread_id = own.thread_id or message.thread_id
+            if not own.case.thread_id and message.thread_id:
+                own.case.thread_id = message.thread_id
+            return "own"
+    recipients = participants(message.to_addr, message.cc_addr)
+    if not recipients:
+        return ""
+    candidates = list(
+        session.scalars(
+            select(BookingCase).where(
+                BookingCase.status.in_((CaseStatus.DRAFTED.value, CaseStatus.SENT.value)),
+                func.lower(BookingCase.contact_email).in_(sorted(recipients)),
+            )
+        )
+    )
+    subject = normalize_subject(message.subject).lower()
+    numbers = set(PO_RE.findall(f"{message.subject} {message.body}"))
+    linked = 0
+    for case in candidates:
+        if case.status == CaseStatus.SENT.value and case.thread_id:
+            continue
+        same_subject = any(
+            normalize_subject(m.subject).lower() == subject
+            for m in case.messages
+            if m.direction == "out" and m.subject
+        )
+        pos = {str(p) for p in case.po_numbers}
+        if same_subject or (pos and pos <= numbers):
+            mark_sent(
+                session,
+                case,
+                by="archive",
+                thread_id=message.thread_id,
+                message_id=message.message_id,
+                rfc_message_id=message.rfc_message_id,
+                sent_at=message.sent_at,
+            )
+            linked += 1
+    return "linked" if linked else ""
+
+
 def _record_after_decision(session: Session, case: BookingCase, message: InboundMessage) -> None:
     """Keep a message that arrived after approval or closure without reading it as an answer."""
     case.messages.append(
-        BookingMessage(
-            case_id=case.id,
-            direction="in",
-            kind="reply",
-            from_addr=message.from_addr,
-            to_addr=message.to_addr,
-            cc_addr=message.cc_addr,
-            subject=message.subject,
-            body=message.body,
-            message_id=message.message_id,
-            thread_id=message.thread_id,
-            sent_at=message.sent_at,
-            classification={"skipped": f"case is {case.status}"},
+        _inbound_record(
+            case, message, kind="reply", classification={"skipped": f"case is {case.status}"}
         )
     )
     session.flush()
@@ -812,18 +964,10 @@ def _apply_customer_desk_message(
     slot = parse_delivery_slot(
         message.full_text, year=message.sent_at.year, timezone=case.vendor_timezone
     )
-    inbound = BookingMessage(
-        case_id=case.id,
-        direction="in",
+    inbound = _inbound_record(
+        case,
+        message,
         kind="customer_desk",
-        from_addr=message.from_addr,
-        to_addr=message.to_addr,
-        cc_addr=message.cc_addr,
-        subject=message.subject,
-        body=message.body,
-        message_id=message.message_id,
-        thread_id=message.thread_id,
-        sent_at=message.sent_at,
         classification=(
             {"delivery_ref": slot[1], "delivery_at_utc": slot[0].isoformat()} if slot else {}
         ),
@@ -880,9 +1024,14 @@ def _apply_customer_desk_message(
 
 
 def draft_batch(
-    session: Session, cases: list[BookingCase], mailer: Mailer, settings: Settings
+    session: Session,
+    cases: list[BookingCase],
+    mailer: Mailer | Sender,
+    settings: Settings,
+    *,
+    by: str = "agent",
 ) -> list[BookingMessage]:
-    """Draft new cases, one email per vendor desk, the way the pod batches its requests."""
+    """Draft (or send) new cases, one email per vendor desk, the way the pod batches requests."""
     groups: dict[str, list[BookingCase]] = {}
     for case in cases:
         groups.setdefault((case.contact_email or "").lower(), []).append(case)
@@ -891,7 +1040,7 @@ def draft_batch(
     for desk, group in groups.items():
         if len(group) == 1 or not desk:
             for case in group:
-                messages.append(draft_case(session, case, mailer, settings))
+                messages.append(draft_case(session, case, mailer, settings, by=by))
             continue
         group.sort(key=lambda c: c.requested_local or "")
         profile = vendor_profile(repo, group[0].facility_key) if group[0].facility_key else None
@@ -910,7 +1059,11 @@ def draft_batch(
             subject=subject,
             body="\n".join(lines),
         )
-        ref = mailer.create_draft(draft)
+        if is_sender(mailer):
+            trusted = profile.contact_email if profile and profile.can_email else None
+            for case in group:
+                check_send_gate(session, case, draft, settings, trusted_desk=trusted)
+        result = deliver(mailer, draft)
         for case in group:
             message = BookingMessage(
                 case_id=case.id,
@@ -920,17 +1073,18 @@ def draft_batch(
                 cc_addr=draft.cc_addr,
                 subject=subject,
                 body=draft.body,
-                draft_ref=ref,
             )
             case.messages.append(message)
-            case.status = CaseStatus.DRAFTED.value
+            session.flush()
+            record_delivery(session, case, message, draft, result, actor=by)
+            case.status = CaseStatus.SENT.value if result.sent else CaseStatus.DRAFTED.value
             case.reason = None
             session.flush()
             _event(
                 session,
                 case,
                 "drafted",
-                draft_ref=ref,
+                draft_ref=result.ref,
                 to=desk,
                 subject=subject,
                 batched_with=[c.id for c in group if c.id != case.id],

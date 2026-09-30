@@ -39,6 +39,7 @@ def to_inbound(envelope: dict[str, Any], key: str) -> InboundMessage:
         in_reply_to=envelope.get("in_reply_to") or None,
         quoted=str(envelope.get("quoted") or ""),
         rfc_message_id=envelope.get("message_id") or None,
+        references=envelope.get("references") or None,
     )
 
 

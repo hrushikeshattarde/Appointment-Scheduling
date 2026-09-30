@@ -1,8 +1,10 @@
-"""Mail adapters: inbound messages from a JSONL pull or Gmail, outbound drafts to disk or Gmail.
+"""Mail adapters: inbound from the archive, a JSONL pull or Gmail; outbound as drafts or sends.
 
-The prototype runs in draft mode: :class:`LocalDraftMailer` writes ``.eml`` files a person can
-open and send. :class:`GmailDraftMailer` creates real Gmail drafts once the service account has
-the ``gmail.compose`` scope; it never sends.
+Two kinds of outbox. A :class:`Mailer` only drafts (``.eml`` files on disk, or Gmail drafts a
+person sends); a :class:`Sender` delivers the message itself. Both build the same MIME through
+:func:`build_mime`, which stamps every outbound message with its own RFC ``Message-ID`` so a
+vendor's reply can be tied back to the request through ``In-Reply-To`` and ``References``
+whatever mailbox it is read from.
 """
 
 from __future__ import annotations
@@ -14,13 +16,15 @@ import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.message import EmailMessage
-from email.utils import parseaddr
+from email.utils import make_msgid, parseaddr
 from pathlib import Path
 from typing import Any, Protocol
 
 GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me"
 SCOPE_READ = "https://www.googleapis.com/auth/gmail.readonly"
 SCOPE_COMPOSE = "https://www.googleapis.com/auth/gmail.compose"
+SCOPE_SEND = "https://www.googleapis.com/auth/gmail.send"
+_MSGID_RE = re.compile(r"<[^<>\s]+>")
 
 
 @dataclass(frozen=True)
@@ -38,6 +42,7 @@ class InboundMessage:
     in_reply_to: str | None = None
     quoted: str = ""  # the quoted history under the reply (vendors edit times in it)
     rfc_message_id: str | None = None  # the RFC Message-ID header, when the source keeps it
+    references: str | None = None  # the References header, when the source keeps it
 
     @property
     def full_text(self) -> str:
@@ -57,6 +62,22 @@ class InboundMessage:
     def from_domain(self) -> str:
         """Sender domain."""
         return self.from_email.split("@")[-1]
+
+    @property
+    def referenced_ids(self) -> list[str]:
+        """Every Message-ID this reply points at, In-Reply-To first, lower-cased."""
+        return message_ids(self.in_reply_to, self.references)
+
+
+def message_ids(*headers: str | None) -> list[str]:
+    """Distinct ``<id>`` tokens from In-Reply-To or References header values, lower-cased."""
+    out: list[str] = []
+    for value in headers:
+        for token in _MSGID_RE.findall(value or ""):
+            lowered = token.lower()
+            if lowered not in out:
+                out.append(lowered)
+    return out
 
 
 _QUOTE_SPLIT = re.compile(
@@ -99,9 +120,14 @@ def load_messages_jsonl(path: Path) -> list[InboundMessage]:
                     body=m.get("own_text") or own,
                     in_reply_to=m.get("in_reply_to") or None,
                     quoted=quoted,
+                    rfc_message_id=m.get("message_id") or None,
+                    references=m.get("references") or None,
                 )
             )
     return sorted(out, key=lambda x: x.sent_at)
+
+
+# ------------------------------------------------------------------------------ outbound ----
 
 
 @dataclass(frozen=True)
@@ -113,15 +139,75 @@ class OutboundDraft:
     subject: str
     body: str
     thread_id: str | None = None
-    in_reply_to: str | None = None
+    in_reply_to: str | None = None  # the RFC Message-ID this answers
+    references: str | None = None  # the References chain of the message this answers
+
+
+@dataclass(frozen=True)
+class Delivery:
+    """What an outbox did with a draft."""
+
+    ref: str  # a file path, a Gmail draft id, or "gmail:<message id>"
+    sent: bool = False
+    gmail_id: str | None = None
+    thread_id: str | None = None
+    rfc_message_id: str | None = None
 
 
 class Mailer(Protocol):
-    """Where drafts go."""
+    """An outbox that only drafts; a person sends."""
 
     def create_draft(self, draft: OutboundDraft) -> str:
         """Create the draft; return a reference a person can find it by."""
         ...
+
+
+class Sender(Protocol):
+    """An outbox that sends."""
+
+    def deliver(self, draft: OutboundDraft) -> Delivery:
+        """Send the message; return what went out and the ids it carries."""
+        ...
+
+
+def deliver(outbox: Mailer | Sender, draft: OutboundDraft) -> Delivery:
+    """Hand a draft to whichever kind of outbox this is."""
+    send = getattr(outbox, "deliver", None)
+    if callable(send):
+        result: Delivery = send(draft)
+        return result
+    return Delivery(ref=outbox.create_draft(draft))  # type: ignore[union-attr]
+
+
+def build_mime(
+    draft: OutboundDraft,
+    sender: str,
+    *,
+    message_id: str | None = None,
+    extra_headers: dict[str, str] | None = None,
+) -> EmailMessage:
+    """The message as it will travel: headers, threading ids and the plain-text body."""
+    msg = EmailMessage()
+    msg["From"] = sender
+    msg["To"] = draft.to_addr
+    if draft.cc_addr:
+        msg["Cc"] = draft.cc_addr
+    msg["Subject"] = draft.subject
+    msg["Message-ID"] = message_id or new_message_id(sender)
+    if draft.in_reply_to:
+        msg["In-Reply-To"] = draft.in_reply_to
+        chain = message_ids(draft.references, draft.in_reply_to)
+        msg["References"] = " ".join(chain)
+    for name, value in (extra_headers or {}).items():
+        msg[name] = value
+    msg.set_content(draft.body)
+    return msg
+
+
+def new_message_id(sender: str) -> str:
+    """A fresh RFC Message-ID in the sender's domain."""
+    domain = parseaddr(sender)[1].split("@")[-1] or "circledelivers.com"
+    return make_msgid(domain=domain)
 
 
 @dataclass
@@ -135,17 +221,9 @@ class LocalDraftMailer:
     def create_draft(self, draft: OutboundDraft) -> str:
         """Write the draft and return its path."""
         self.directory.mkdir(parents=True, exist_ok=True)
-        msg = EmailMessage()
-        msg["From"] = self.sender
-        msg["To"] = draft.to_addr
-        if draft.cc_addr:
-            msg["Cc"] = draft.cc_addr
-        msg["Subject"] = draft.subject
-        if draft.in_reply_to:
-            msg["In-Reply-To"] = draft.in_reply_to
-            msg["References"] = draft.in_reply_to
-        msg["X-Facility-Profiles-Draft"] = "draft mode; not sent"
-        msg.set_content(draft.body)
+        msg = build_mime(
+            draft, self.sender, extra_headers={"X-Facility-Profiles-Draft": "draft mode; not sent"}
+        )
         stamp = datetime.now(tz=UTC).strftime("%Y%m%d-%H%M%S")
         safe = re.sub(r"[^A-Za-z0-9]+", "-", draft.subject)[:60].strip("-")
         path = self.directory / f"{stamp}-{safe or 'draft'}.eml"
@@ -166,6 +244,29 @@ class RecordingMailer:
         return f"memory:{len(self.drafts)}"
 
 
+@dataclass
+class RecordingSender:
+    """Pretends to send (tests): records the draft and hands back ids like Gmail would."""
+
+    sender: str = "lidl-appointments@circledelivers.com"
+    drafts: list[OutboundDraft] = field(default_factory=list)
+    deliveries: list[Delivery] = field(default_factory=list)
+
+    def deliver(self, draft: OutboundDraft) -> Delivery:
+        """Record the draft; the Message-ID is minted the way the real sender mints it."""
+        self.drafts.append(draft)
+        n = len(self.drafts)
+        result = Delivery(
+            ref=f"gmail:sent-{n}",
+            sent=True,
+            gmail_id=f"sent-{n}",
+            thread_id=draft.thread_id or f"thread-{n}",
+            rfc_message_id=str(build_mime(draft, self.sender)["Message-ID"]),
+        )
+        self.deliveries.append(result)
+        return result
+
+
 def _gmail_session(key_path: Path, subject: str, scope: str) -> Any:
     """An authorised Gmail session; the Google client is the optional ``gmail`` extra."""
     try:
@@ -180,6 +281,10 @@ def _gmail_session(key_path: Path, subject: str, scope: str) -> Any:
     return transport.AuthorizedSession(creds)
 
 
+def _raw(msg: EmailMessage) -> str:
+    return base64.urlsafe_b64encode(bytes(msg)).decode()
+
+
 @dataclass
 class GmailDraftMailer:
     """Create Gmail drafts as ``subject_user`` (needs domain-wide delegation for gmail.compose)."""
@@ -190,18 +295,7 @@ class GmailDraftMailer:
 
     def create_draft(self, draft: OutboundDraft) -> str:  # pragma: no cover - live API
         """POST users/me/drafts; returns the draft ID."""
-        msg = EmailMessage()
-        msg["From"] = self.sender
-        msg["To"] = draft.to_addr
-        if draft.cc_addr:
-            msg["Cc"] = draft.cc_addr
-        msg["Subject"] = draft.subject
-        if draft.in_reply_to:
-            msg["In-Reply-To"] = draft.in_reply_to
-            msg["References"] = draft.in_reply_to
-        msg.set_content(draft.body)
-        raw = base64.urlsafe_b64encode(bytes(msg)).decode()
-        payload: dict[str, Any] = {"message": {"raw": raw}}
+        payload: dict[str, Any] = {"message": {"raw": _raw(build_mime(draft, self.sender))}}
         if draft.thread_id:
             payload["message"]["threadId"] = draft.thread_id
         session = _gmail_session(self.key_path, self.subject_user, SCOPE_COMPOSE)
@@ -210,6 +304,41 @@ class GmailDraftMailer:
             msg_text = f"Gmail draft failed {resp.status_code}: {resp.text[:300]}"
             raise RuntimeError(msg_text)
         return str(resp.json().get("id"))
+
+
+@dataclass
+class GmailSender:
+    """Send as ``subject_user`` through the Gmail API (domain-wide delegation for gmail.send).
+
+    The From address is the mailbox itself: a Google Group cannot send through the API, so the
+    agent writes from a member mailbox and copies the group. The Message-ID is minted here, before
+    the send, so the case can record it whatever Gmail does with the message afterwards.
+    """
+
+    key_path: Path
+    subject_user: str
+    sender: str | None = None
+
+    def deliver(self, draft: OutboundDraft) -> Delivery:  # pragma: no cover - live API
+        """POST users/me/messages/send; returns the Gmail ids and the Message-ID that went out."""
+        sender = self.sender or self.subject_user
+        message_id = new_message_id(sender)
+        payload: dict[str, Any] = {"raw": _raw(build_mime(draft, sender, message_id=message_id))}
+        if draft.thread_id:
+            payload["threadId"] = draft.thread_id
+        session = _gmail_session(self.key_path, self.subject_user, SCOPE_SEND)
+        resp = session.post(f"{GMAIL_API}/messages/send", json=payload, timeout=60)
+        if resp.status_code not in (200, 201):
+            msg_text = f"Gmail send failed {resp.status_code}: {resp.text[:300]}"
+            raise RuntimeError(msg_text)
+        data = resp.json()
+        return Delivery(
+            ref=f"gmail:{data.get('id')}",
+            sent=True,
+            gmail_id=str(data.get("id")),
+            thread_id=str(data.get("threadId") or draft.thread_id or ""),
+            rfc_message_id=message_id,
+        )
 
 
 @dataclass
@@ -289,4 +418,6 @@ def _from_gmail(msg: dict[str, Any]) -> InboundMessage:
         body=split_quoted(body)[0],
         in_reply_to=headers.get("in-reply-to"),
         quoted=split_quoted(body)[1],
+        rfc_message_id=headers.get("message-id"),
+        references=headers.get("references"),
     )
