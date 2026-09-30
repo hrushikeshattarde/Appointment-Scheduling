@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -22,7 +23,7 @@ from facility_profiles.extraction.openrouter import (
     strict_json_schema,
 )
 
-PROMPT_VERSION = "reply-v1"
+PROMPT_VERSION = "reply-v2"
 
 SYSTEM_PROMPT = """You read one email reply from a shipping facility to a freight broker's pickup \
 appointment request and return a JSON object describing it.
@@ -30,20 +31,34 @@ appointment request and return a JSON object describing it.
 Rules:
 - status: "confirmed" when the vendor books the pickup: the requested slot ("SET!", "confirmed", \
 a pickup number alone), a restated slot, or a time only (then the date is the requested date); \
-"deferred" when they ask you to check back later because the order is not released or ready yet \
-(a reply like "these are good for the adjusted time below" with edited times in the quoted \
-text is a counter_offer at those edited times); \
-(put the day to check back in pickup_date); \
-"counter_offer" when they offer a different date or time instead; "question" when they need \
+"counter_offer" when they offer a different date or time instead (a reply like "these are good \
+for the adjusted time below" with edited times in the quoted text is a counter_offer at those \
+edited times); "deferred" when they ask you to check back later because the order is not \
+released or ready yet (put the day to check back in pickup_date); "question" when they need \
 something before booking (order number, PO, carrier name, driver info); "rejected" when they \
 cannot book (order not ready, not in their system, closed that day); "unrelated" otherwise.
+- A reply written after the requested time has passed that gives a latest arrival time, offers \
+to work the driver in, or asks for the driver's ETA is a "question" (put their ask in question), \
+not a confirmation.
 - pickup_date is YYYY-MM-DD and pickup_time is HH:MM in 24-hour local time. Resolve relative \
 dates ("tomorrow", "Monday") from the reply date given to you. Use null when not stated.
 - pickup_number is the vendor's pickup, confirmation or appointment number, if given.
-- quotes are short verbatim snippets copied from the reply that contain each date, time and \
-number you report. Never paraphrase inside quotes.
+- quotes are short verbatim snippets copied from the reply's own words (the text above any \
+quoted earlier messages) that contain each date, time and number you report. Never paraphrase \
+inside quotes. Only for a counter_offer where the vendor edited dates or times inside the \
+quoted text may a quote come from that quoted text.
 - conditions are rules the vendor states (arrive early, bring load bars, register at gate).
 - Only use the reply text. Do not invent values that are not written there."""
+
+# Outlook wraps numbers and addresses in link cruft ("115802102660<tel:(580)%20210-2660>",
+# "name@x.com<mailto:name@x.com>"); the model quotes the clean line, so both sides are cleaned.
+_LINK_CRUFT_RE = re.compile(r"<(?:tel|mailto|sms|callto|https?):[^>\s]*>", re.I)
+_CID_RE = re.compile(r"\[cid:[^\]]*\]", re.I)
+_RELATIVE_DAY_RE = re.compile(
+    r"\b(?:today|tonight|tomorrow|mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|"
+    r"fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b",
+    re.I,
+)
 
 
 @dataclass(frozen=True)
@@ -104,6 +119,11 @@ def render_user_message(context: ReplyContext) -> str:
     )
 
 
+def clean_mail_text(text: str | None) -> str:
+    """Drop the link cruft mail clients wrap around numbers and addresses, and inline image tags."""
+    return _CID_RE.sub("", _LINK_CRUFT_RE.sub("", text or ""))
+
+
 def _number_in_text(number: str, text: str) -> bool:
     """A pickup number counts only when it appears verbatim or as its full digit run."""
     if number.lower() in text.lower():
@@ -112,31 +132,109 @@ def _number_in_text(number: str, text: str) -> bool:
     return len(run) >= 4 and run in text
 
 
-def validate_classification(
-    result: ReplyClassification, text: str
-) -> tuple[ReplyClassification, list[ClassificationIssue]]:
-    """Drop values without a verbatim quote in the reply; return what survives and why."""
+def _digit_runs(text: str) -> set[str]:
+    return set(re.findall(r"\d+", text))
+
+
+def date_is_backed(value: str, quotes: str) -> bool:
+    """The day of the month, or a relative day word, appears in the backing quotes."""
+    try:
+        day = datetime.strptime(value, "%Y-%m-%d").day
+    except ValueError:
+        return False
+    runs = _digit_runs(quotes)
+    if str(day) in runs or f"{day:02d}" in runs:
+        return True
+    return _RELATIVE_DAY_RE.search(quotes) is not None
+
+
+def time_is_backed(value: str, quotes: str) -> bool:
+    """The hour appears in the backing quotes in one of the ways vendors write it."""
+    try:
+        clock = datetime.strptime(value, "%H:%M")
+    except ValueError:
+        return False
+    hour12 = clock.hour % 12 or 12
+    forms = {
+        str(clock.hour),
+        f"{clock.hour:02d}",
+        str(hour12),
+        f"{clock.hour:02d}{clock.minute:02d}",
+        f"{clock.hour}{clock.minute:02d}",
+        f"{hour12}{clock.minute:02d}",
+    }
+    if _digit_runs(quotes) & forms:
+        return True
+    return clock.hour in (0, 12) and re.search(r"\b(?:noon|midnight)\b", quotes, re.I) is not None
+
+
+def _sort_quotes(
+    quotes: list[str], own: str, history: str, *, allow_history: bool
+) -> tuple[list[str], list[str], list[ClassificationIssue]]:
+    """Split the model's quotes into (found in the reply's own words, kept, issues)."""
+    own_quotes: list[str] = []
+    kept: list[str] = []
     issues: list[ClassificationIssue] = []
-    kept_quotes = [q for q in result.quotes if q.strip() and quote_in_source(q, text)]
-    for q in result.quotes:
-        if q not in kept_quotes:
+    for q in quotes:
+        cleaned = clean_mail_text(q)
+        if not cleaned.strip():
+            continue
+        if quote_in_source(cleaned, own):
+            own_quotes.append(q)
+            kept.append(q)
+        elif history and quote_in_source(cleaned, history):
+            if allow_history:
+                kept.append(q)
+            else:
+                issues.append(
+                    ClassificationIssue(
+                        "quotes", "quote is from the quoted history, not the reply", q
+                    )
+                )
+        else:
             issues.append(ClassificationIssue("quotes", "quote not found in reply", q))
-    backed = " ".join(kept_quotes)
+    return own_quotes, kept, issues
+
+
+def validate_classification(
+    result: ReplyClassification, text: str, quoted: str = ""
+) -> tuple[ReplyClassification, list[ClassificationIssue]]:
+    """Keep only what the reply's own words back; return what survives and why.
+
+    ``text`` is the reply's own words, ``quoted`` the history under it. A quote found only in
+    the history backs a counter-offer (vendors edit times inside the quoted request) and nothing
+    else: a chaser that carries the old confirmation underneath must not re-confirm the slot.
+    """
+    own = clean_mail_text(text)
+    history = clean_mail_text(quoted)
+    own_quotes, kept_quotes, issues = _sort_quotes(
+        result.quotes, own, history, allow_history=result.status == ReplyStatus.COUNTER_OFFER
+    )
+    backing = " ".join(clean_mail_text(q) for q in kept_quotes)
     data = result.model_dump()
     data["quotes"] = kept_quotes
 
-    if result.pickup_number and not _number_in_text(result.pickup_number, text):
+    if result.pickup_number and not _number_in_text(result.pickup_number, own):
         issues.append(
-            ClassificationIssue("pickup_number", "number not in reply", result.pickup_number)
+            ClassificationIssue(
+                "pickup_number", "number not in the reply's own words", result.pickup_number
+            )
         )
         data["pickup_number"] = None
-    for name in ("pickup_date", "pickup_time"):
+    if result.pickup_date and not date_is_backed(result.pickup_date, backing):
+        issues.append(
+            ClassificationIssue("pickup_date", "no quote backs this value", result.pickup_date)
+        )
+        data["pickup_date"] = None
+    for name in ("pickup_time", "pickup_time_end"):
         value = getattr(result, name)
-        if value and not backed:
+        if value and not time_is_backed(value, backing):
             issues.append(ClassificationIssue(name, "no quote backs this value", value))
             data[name] = None
-    if data["status"] == ReplyStatus.CONFIRMED and not kept_quotes:
-        issues.append(ClassificationIssue("status", "confirmation without any backed quote"))
+    if data["status"] == ReplyStatus.CONFIRMED and not own_quotes:
+        issues.append(
+            ClassificationIssue("status", "confirmation without a quote from the reply's own words")
+        )
         data["status"] = ReplyStatus.QUESTION if data["question"] else ReplyStatus.UNRELATED
     if data["status"] == ReplyStatus.COUNTER_OFFER and not (
         data["pickup_date"] or data["pickup_time"]

@@ -61,6 +61,13 @@ OPEN_STATUSES = (
     CaseStatus.PROPOSED.value,
     CaseStatus.NEEDS_HUMAN.value,
 )
+# A person has decided; later mail in the thread (ETAs, securement, "did this get resolved?")
+# is kept on the case but never read as a new answer to the request.
+DECIDED_STATUSES = (CaseStatus.APPROVED.value, CaseStatus.CLOSED.value)
+# A "confirmation" of a slot that had already passed when the vendor wrote is a work-in or a
+# late-arrival note ("latest is 9pm tonight"), not a booking. Same-day replies a few minutes
+# after the slot still count.
+STALE_CONFIRMATION_GRACE = timedelta(minutes=30)
 
 
 @dataclass(frozen=True)
@@ -115,6 +122,7 @@ class IngestStats:
     responded: int = 0
     deferred: int = 0
     delivery_updates: int = 0
+    after_decision: int = 0  # mail on approved or closed cases, recorded but not classified
 
 
 # ------------------------------------------------------------------ profile and load helpers
@@ -577,8 +585,12 @@ def apply_reply(
     issues: list[ClassificationIssue],
     *,
     actor: str = "agent",
+    reply_sent_at: datetime | None = None,
 ) -> str:
-    """Move the case according to the classified reply; return the new status."""
+    """Move the case according to the classified reply; return the event recorded."""
+    if case.status in DECIDED_STATUSES:
+        _event(session, case, "reply_ignored", actor=actor, reason=f"case is {case.status}")
+        return "reply_ignored"
     requested_day, _, requested_clock = (case.requested_local or "").partition(" ")
     if result.status == ReplyStatus.CONFIRMED and (result.pickup_date or requested_day):
         day = result.pickup_date or requested_day
@@ -589,6 +601,24 @@ def apply_reply(
             if result.pickup_time_end
             else start
         )
+        written_at = as_utc(reply_sent_at)
+        if written_at is not None and start < written_at - STALE_CONFIRMATION_GRACE:
+            local = f"{day} {clock or ''}".strip()
+            case.status = CaseStatus.NEEDS_HUMAN.value
+            case.reason = (
+                f"vendor 'confirmed' {local}, already past when they wrote; "
+                "read it as a work-in or late-arrival note"
+            )[:255]
+            _event(
+                session,
+                case,
+                "stale_confirmation",
+                actor=actor,
+                local=local,
+                reply_sent_at=written_at.isoformat(),
+                issues=[i.__dict__ for i in issues],
+            )
+            return "stale_confirmation"
         case.confirmed_local = f"{day} {clock or ''}".strip()
         case.confirmed_start_utc = start
         case.confirmed_end_utc = end
@@ -605,18 +635,23 @@ def apply_reply(
             conditions=result.conditions,
             issues=[i.__dict__ for i in issues],
         )
-    elif result.status == ReplyStatus.COUNTER_OFFER:
+        return "vendor_confirmed"
+    if result.status == ReplyStatus.COUNTER_OFFER:
+        # Morgan Foods assigns the pickup number with the counter ("10/2 @ 9am pickup# 20463798").
+        case.pickup_number = result.pickup_number or case.pickup_number
         case.status = CaseStatus.NEEDS_HUMAN.value
         case.reason = (
             f"vendor offered {result.pickup_date or '?'} {result.pickup_time or ''}".strip()
             + (f" to {result.pickup_time_end}" if result.pickup_time_end else "")
         )
         _event(session, case, "counter_offer", actor=actor, reason=case.reason)
-    elif result.status == ReplyStatus.QUESTION:
+        return "counter_offer"
+    if result.status == ReplyStatus.QUESTION:
         case.status = CaseStatus.NEEDS_HUMAN.value
         case.reason = f"vendor asked: {result.question or 'see reply'}"[:255]
         _event(session, case, "question", actor=actor, reason=case.reason)
-    elif result.status == ReplyStatus.DEFERRED:
+        return "question"
+    if result.status == ReplyStatus.DEFERRED:
         case.status = CaseStatus.SENT.value
         case.reason = (
             f"vendor asked to check back on {result.pickup_date}"
@@ -631,7 +666,8 @@ def apply_reply(
             reason=case.reason,
             check_back=result.pickup_date,
         )
-    elif result.status == ReplyStatus.REJECTED:
+        return "deferred"
+    if result.status == ReplyStatus.REJECTED:
         case.status = CaseStatus.NEEDS_HUMAN.value
         case.reason = (
             f"vendor cannot book: {result.question or '; '.join(result.conditions) or 'see reply'}"[
@@ -639,9 +675,9 @@ def apply_reply(
             ]
         )
         _event(session, case, "rejected_by_vendor", actor=actor, reason=case.reason)
-    else:
-        _event(session, case, "reply_unrelated", actor=actor, issues=[i.__dict__ for i in issues])
-    return case.status
+        return "rejected_by_vendor"
+    _event(session, case, "reply_unrelated", actor=actor, issues=[i.__dict__ for i in issues])
+    return "reply_unrelated"
 
 
 def ingest(  # noqa: PLR0912 - one branch per reply outcome
@@ -678,6 +714,10 @@ def ingest(  # noqa: PLR0912 - one branch per reply outcome
             if _apply_customer_desk_message(session, case, message, responder):
                 stats.delivery_updates += 1
             continue
+        if case.status in DECIDED_STATUSES:
+            _record_after_decision(session, case, message)
+            stats.after_decision += 1
+            continue
         context = ReplyContext(
             vendor_name=case.vendor_name or "",
             po_numbers=[str(p) for p in case.po_numbers],
@@ -688,7 +728,7 @@ def ingest(  # noqa: PLR0912 - one branch per reply outcome
             quoted=message.quoted,
         )
         output = classifier.classify(context)
-        result, issues = validate_classification(output.result, message.full_text)
+        result, issues = validate_classification(output.result, message.body, message.quoted)
         stats.classified += 1
         inbound = BookingMessage(
             case_id=case.id,
@@ -712,16 +752,12 @@ def ingest(  # noqa: PLR0912 - one branch per reply outcome
         session.flush()
         if case.thread_id is None and message.thread_id:
             case.thread_id = message.thread_id
-        apply_reply(session, case, result, issues)
-        if result.status == ReplyStatus.CONFIRMED and case.status == CaseStatus.PROPOSED.value:
+        action = apply_reply(session, case, result, issues, reply_sent_at=message.sent_at)
+        if action == "vendor_confirmed":
             stats.proposed += 1
-        elif result.status in (
-            ReplyStatus.COUNTER_OFFER,
-            ReplyStatus.QUESTION,
-            ReplyStatus.REJECTED,
-        ):
+        elif action in ("counter_offer", "question", "rejected_by_vendor", "stale_confirmation"):
             stats.needs_human += 1
-        elif result.status == ReplyStatus.DEFERRED:
+        elif action == "deferred":
             stats.deferred += 1
         else:
             stats.unrelated += 1
@@ -745,6 +781,28 @@ def ingest(  # noqa: PLR0912 - one branch per reply outcome
                 stats.responded += 1
         session.flush()
     return stats
+
+
+def _record_after_decision(session: Session, case: BookingCase, message: InboundMessage) -> None:
+    """Keep a message that arrived after approval or closure without reading it as an answer."""
+    case.messages.append(
+        BookingMessage(
+            case_id=case.id,
+            direction="in",
+            kind="reply",
+            from_addr=message.from_addr,
+            to_addr=message.to_addr,
+            cc_addr=message.cc_addr,
+            subject=message.subject,
+            body=message.body,
+            message_id=message.message_id,
+            thread_id=message.thread_id,
+            sent_at=message.sent_at,
+            classification={"skipped": f"case is {case.status}"},
+        )
+    )
+    session.flush()
+    _event(session, case, "reply_after_decision", subject=message.subject, status=case.status)
 
 
 def _apply_customer_desk_message(

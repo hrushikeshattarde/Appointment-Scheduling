@@ -587,7 +587,12 @@ class Responder:
     def acknowledge(
         self, session: Session, case: BookingCase, reply: BookingMessage
     ) -> BookingMessage | None:
-        """The pod always answers a confirmation with "Thank you!"; so does the agent."""
+        """The pod always answers a confirmation with "Thank you!"; so does the agent, once."""
+        if any(
+            m.direction == "out" and m.kind == ResponseIntent.ACKNOWLEDGE.value
+            for m in case.messages
+        ):
+            return None
         plan = ResponsePlan(
             ResponseIntent.ACKNOWLEDGE,
             "vendor confirmed",

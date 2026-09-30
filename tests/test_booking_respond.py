@@ -470,10 +470,18 @@ def test_edited_times_in_the_quoted_text_count_as_a_counter_offer(settings, sess
             quotes=["PO# 226321092660 on 10/01 @ 1430"],
         )
 
+    # The quoted history may back a counter-offer (the vendor edited the time inside it)...
     kept, issues = validate_classification(
-        script(ReplyContext("", [], None, NOW, "", own, quoted)), f"{own}\n{quoted}"
+        script(ReplyContext("", [], None, NOW, "", own, quoted)), own, quoted
     )
     assert kept.status == ReplyStatus.COUNTER_OFFER and not issues
+    # ...but never a confirmation: a chaser carrying the old slot underneath must not re-book it.
+    as_confirmed = script(ReplyContext("", [], None, NOW, "", own, quoted)).model_copy(
+        update={"status": ReplyStatus.CONFIRMED}
+    )
+    kept, issues = validate_classification(as_confirmed, "Did this get resolved?", quoted)
+    assert kept.status == ReplyStatus.UNRELATED and kept.pickup_date is None
+    assert any("quoted history" in i.reason for i in issues)
 
     classifier = FakeReplyClassifier(script)
     responder = Responder(settings, mailer, now=NOW)
