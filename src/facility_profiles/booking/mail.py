@@ -37,6 +37,7 @@ class InboundMessage:
     body: str
     in_reply_to: str | None = None
     quoted: str = ""  # the quoted history under the reply (vendors edit times in it)
+    rfc_message_id: str | None = None  # the RFC Message-ID header, when the source keeps it
 
     @property
     def full_text(self) -> str:

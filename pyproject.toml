@@ -24,6 +24,7 @@ dependencies = [
 api = ["fastapi>=0.115,<1", "uvicorn[standard]>=0.32,<1"]
 postgres = ["psycopg[binary]>=3.2,<4"]
 gmail = ["google-auth>=2.30,<3", "requests>=2.32,<3"]
+aws = ["boto3>=1.35,<2"]
 
 [project.scripts]
 facility-profiles = "facility_profiles.cli:app"
@@ -80,7 +81,7 @@ mypy_path = "src"
 packages = ["facility_profiles"]
 
 [[tool.mypy.overrides]]
-module = ["rapidfuzz.*", "respx.*", "openpyxl.*", "google.*", "requests.*"]
+module = ["rapidfuzz.*", "respx.*", "openpyxl.*", "google.*", "requests.*", "boto3.*", "botocore.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

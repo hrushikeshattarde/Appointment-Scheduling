@@ -107,6 +107,11 @@ class Settings(BaseSettings):
         default_factory=lambda: ["cci@udfinc.com"]
     )
 
+    # --- Group-mail archive in S3 (Pick Up Appointment threads) ---------------------------
+    mail_archive_bucket: str | None = None
+    mail_archive_prefix: str = ""
+    mail_archive_gmail_user: str | None = None  # the group member whose mailbox is read
+
     # --- Logging -------------------------------------------------------------------------
     log_level: str = "INFO"
     log_json: bool = False

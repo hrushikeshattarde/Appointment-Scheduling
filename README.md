@@ -142,12 +142,17 @@ requested time from the tender or backed off the Lidl delivery slot, and nothing
 as the pod writes it) and saves it as a draft. `sent` records that a person sent it. `inbox`
 matches replies to cases by thread, PO number or sender, classifies each reply with a
 strict-schema model call (confirmed, counter-offer, question, rejected, unrelated), drops any
-date, time or pickup number the reply text does not contain verbatim, and moves the case:
-confirmed becomes `proposed` with the slot in UTC (a bare "SET" or a pickup number alone means
-the requested slot; a time alone means the requested date), deferred ("check back Monday") keeps
-waiting, everything else becomes `needs_human` with the reason. A confirmation is answered with
-the pod's "Thank you!". `approve` records the decision and prints the exact Transport Pro
-`set_appointment` payload; the write itself stays behind the client's write flag.
+date, time or pickup number the reply's own words do not back (link cruft such as
+`115802102660<tel:(580)%20210-2660>` is stripped first, and a quote from the quoted history
+under the reply only ever backs a counter-offer), and moves the case: confirmed becomes
+`proposed` with the slot in UTC (a bare "SET" or a pickup number alone means the requested slot;
+a time alone means the requested date), deferred ("check back Monday") keeps waiting, everything
+else becomes `needs_human` with the reason. A "confirmation" of a slot that had already passed
+when the vendor wrote ("latest is 9pm tonight" after a missed pickup) goes to a person as a
+work-in note. A confirmation is answered once with the pod's "Thank you!". `approve` records the
+decision and prints the exact Transport Pro `set_appointment` payload; the write itself stays
+behind the client's write flag. Mail that arrives on an approved or closed case (driver ETAs,
+securement, "did this get resolved?") is kept on the case and never read as a new answer.
 
 The conversation policy (`booking/respond.py`) handles what comes back, still as drafts:
 a counter-offer is accepted when the offered pickup still makes the customer's delivery
@@ -168,7 +173,7 @@ this!"; and `booking reschedule ID --date --time --by [--note]` drafts the in-th
 for a new slot after a Circle-side miss, the most common event in the archive.
 
 Third pass through the archive added: the quoted history under a reply is shown to the classifier
-and counts for quote checks (vendors edit times inside it); `booking draft` batches new cases into
+and can back a counter-offer (vendors edit times inside it); `booking draft` batches new cases into
 one email per desk with one line per PO, like the pod; mail from the customer's inbound desk is
 never treated as a vendor reply but is read for a new delivery slot ("8/20 7AM - GRM_200826926"
 or "FRG_200526615 05/20 @ 1100"), which moves the pickup request in the vendor thread; and
@@ -179,6 +184,38 @@ Circle books directly; the desk only helps when no slot is free.
 Tables: `booking_cases`, `booking_messages`, `booking_events` (created by `init-db`).
 Code: `booking/service.py` (cases), `booking/classify.py` (reply reading and validation),
 `booking/mail.py` (JSONL or Gmail in, `.eml` or Gmail drafts out).
+Real-text regression: `tests/fixtures/lidl_morgan_foods_thread.jsonl` is the pod's September 2026
+Morgan Foods thread in the mail pull's format, Outlook cruft included, and
+`tests/test_booking_real_thread.py` replays it with the model's recorded readings.
+
+### Group-mail archive in S3
+
+`facility-profiles mail-archive ...` keeps the lidl@ group's pickup-appointment threads in S3, on
+the doc-intake bot's pattern. A Google Group has no mailbox, so the collector reads the group's
+traffic through a member's mailbox (Gmail API, domain-wide delegation, read-only), keeps the
+threads that are about booking a pickup (`mailarchive/filters.py`: the pod's "Pick Up
+Appointment" subjects, the inbound desk's PO-number and RESCHEDULE subjects, the portals'
+appointment notices, and any message a known appointment desk took part in; tour planning and
+Emerge notices are dropped), and writes each message as `mail/yyyy/mm/dd/<key>.eml` (raw RFC822)
+plus `<key>.json` (headers including Message-ID, the reply's own words, the quoted history, PO and
+pickup numbers, DCT references, why it was kept) with every attachment once under
+`attachments/<sha256>`. `<key>` is derived from the RFC Message-ID, so the same message read from
+two members' mailboxes is one object and a backfill from a long-standing member merges cleanly. A
+thread is kept as a whole once any message in it qualifies, and the earlier messages of a newly
+matched thread are collected with it.
+
+```powershell
+facility-profiles mail-archive collect --key <service-account.json> --subject <member> --bucket <bucket> --days 10
+facility-profiles mail-archive status --bucket <bucket>
+facility-profiles booking inbox --s3 s3://<bucket> --days 7      # replies straight from the archive
+python scripts/deploy_lidl_mail_archive.py bucket | deploy | invoke | status | schedule on|off
+```
+
+In AWS the same code runs as Lambda `circle-lidl-mail-collector` every 15 minutes (EventBridge
+Scheduler `circle-lidl-mail-every-15-min`), reading the service-account key from Secrets Manager
+and listing the last three days each pass; keys are content-derived, so a pass may stop anywhere
+and the next one stores only what is missing. Settings: `FP_MAIL_ARCHIVE_BUCKET`,
+`FP_MAIL_ARCHIVE_PREFIX`, `FP_MAIL_ARCHIVE_GMAIL_USER`; the `aws` extra adds boto3.
 
 ## Review flow for CSRs
 

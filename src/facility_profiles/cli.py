@@ -46,6 +46,11 @@ booking_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(booking_app, name="booking")
+mail_app = typer.Typer(
+    help="Group-mail archive in S3: collect Pick Up Appointment threads, check what is there.",
+    no_args_is_help=True,
+)
+app.add_typer(mail_app, name="mail-archive")
 
 log = get_logger(__name__)
 
@@ -609,7 +614,11 @@ def booking_inbox(
         Path | None, typer.Option(help="Service-account key for a live Gmail read")
     ] = None,
     subject: Annotated[str | None, typer.Option(help="Mailbox to read as (Gmail)")] = None,
-    days: Annotated[int, typer.Option(help="How far back to read (Gmail)")] = 7,
+    s3: Annotated[
+        str | None,
+        typer.Option(help="Read replies from the archive: s3://bucket or s3://bucket/prefix"),
+    ] = None,
+    days: Annotated[int, typer.Option(help="How far back to read (Gmail or the archive)")] = 7,
     fake: Annotated[
         bool, typer.Option(help="Classify every reply as unrelated (no model)")
     ] = False,
@@ -630,13 +639,19 @@ def booking_inbox(
     settings = _settings()
     if file is not None:
         messages = load_messages_jsonl(file)
+    elif s3 is not None:
+        from facility_profiles.mailarchive.reader import S3MailReader
+        from facility_profiles.mailarchive.store import Store
+
+        s3_bucket, _, s3_prefix = s3.removeprefix("s3://").strip("/").partition("/")
+        messages = S3MailReader(Store(s3_bucket, s3_prefix)).fetch(days=days)
     elif key is not None and subject:
         group = settings.booking_sender
         messages = GmailReader(key, subject).fetch(
             f"(to:{group} OR cc:{group} OR deliveredto:{group}) newer_than:{days}d"
         )
     else:
-        typer.echo("give --file messages.jsonl, or --key and --subject for Gmail")
+        typer.echo("give --file messages.jsonl, --s3 s3://bucket, or --key and --subject for Gmail")
         raise typer.Exit(code=2)
     if fake:
         classifier: ReplyClassifier = FakeReplyClassifier(
@@ -740,6 +755,92 @@ def booking_close(
     with session_scope(_sessions(settings)) as session:
         close_case(session, _booking_case(session, case_id), by=by, reason=reason)
     typer.echo(f"#{case_id} closed")
+
+
+@mail_app.command("collect")
+def mail_archive_collect(
+    key: Annotated[Path, typer.Option(help="Service-account JSON key (gmail.readonly delegation)")],
+    subject: Annotated[
+        str | None,
+        typer.Option(help="Group member whose mailbox is read (FP_MAIL_ARCHIVE_GMAIL_USER)"),
+    ] = None,
+    bucket: Annotated[
+        str | None, typer.Option(help="Archive bucket (FP_MAIL_ARCHIVE_BUCKET)")
+    ] = None,
+    prefix: Annotated[str | None, typer.Option(help="Key prefix (FP_MAIL_ARCHIVE_PREFIX)")] = None,
+    group: Annotated[str, typer.Option(help="The group address")] = "lidl@circledelivers.com",
+    days: Annotated[int, typer.Option(help="How many days back to list")] = 3,
+    max_messages: Annotated[int, typer.Option("--max", help="Per-pass cap")] = 300,
+    desk: Annotated[
+        list[str] | None, typer.Option(help="Extra appointment-desk address (repeatable)")
+    ] = None,
+    verbose: Annotated[bool, typer.Option(help="Print every stored message")] = False,
+) -> None:
+    """One collection pass from this machine: the same code the Lambda runs every 15 minutes."""
+    from facility_profiles.mailarchive import filters
+    from facility_profiles.mailarchive.collector import run
+    from facility_profiles.mailarchive.gmail import Delegated, load_service_account
+    from facility_profiles.mailarchive.store import Store
+
+    settings = _settings()
+    bucket = bucket or settings.mail_archive_bucket
+    subject = subject or settings.mail_archive_gmail_user
+    if not bucket or not subject:
+        typer.echo(
+            "give --bucket and --subject, or set FP_MAIL_ARCHIVE_BUCKET and "
+            "FP_MAIL_ARCHIVE_GMAIL_USER"
+        )
+        raise typer.Exit(code=2)
+    store = Store(bucket, prefix if prefix is not None else settings.mail_archive_prefix)
+    ok, why = store.writable()
+    if not ok:
+        typer.echo(why)
+        raise typer.Exit(code=1)
+    gmail = Delegated(load_service_account(key), subject=subject)
+    stats = run(
+        gmail,
+        store,
+        mailbox=subject,
+        group=group,
+        days=days,
+        desks=filters.DEFAULT_DESKS | {d.strip().lower() for d in desk or [] if d.strip()},
+        max_messages=max_messages,
+        verbose=verbose,
+    )
+    typer.echo(stats.line())
+    if stats.error:
+        raise typer.Exit(code=1)
+
+
+@mail_app.command("status")
+def mail_archive_status(
+    bucket: Annotated[
+        str | None, typer.Option(help="Archive bucket (FP_MAIL_ARCHIVE_BUCKET)")
+    ] = None,
+    prefix: Annotated[str | None, typer.Option(help="Key prefix (FP_MAIL_ARCHIVE_PREFIX)")] = None,
+    days: Annotated[int, typer.Option(help="Days to count messages for")] = 7,
+) -> None:
+    """What the archive holds: the last pass, the kept threads, messages per day."""
+    from facility_profiles.mailarchive.reader import day_prefixes
+    from facility_profiles.mailarchive.store import LAST_RUN_KEY, THREADS_KEY, Store
+
+    settings = _settings()
+    bucket = bucket or settings.mail_archive_bucket
+    if not bucket:
+        typer.echo("give --bucket or set FP_MAIL_ARCHIVE_BUCKET")
+        raise typer.Exit(code=2)
+    store = Store(bucket, prefix if prefix is not None else settings.mail_archive_prefix)
+    last = store.get_json(LAST_RUN_KEY)
+    typer.echo(
+        f"last pass: {last.get('at')} as {last.get('mailbox')}" if last else "no pass recorded yet"
+    )
+    if last:
+        typer.echo(f"  {last.get('line')}")
+    threads = store.get_json(THREADS_KEY) or {}
+    typer.echo(f"{len(threads)} thread(s) kept")
+    for day_prefix in day_prefixes(days=days):
+        count = sum(1 for k in store.list_keys(day_prefix) if k.endswith(".json"))
+        typer.echo(f"  {day_prefix} {count}")
 
 
 @app.command("repair-links")
