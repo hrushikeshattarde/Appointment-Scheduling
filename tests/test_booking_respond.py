@@ -31,7 +31,7 @@ def _prepared_case(settings, sessions, mailer: RecordingMailer, *, po: str = "22
     scan(client, sessions, settings, days_ahead=7, now=NOW)  # type: ignore[arg-type]
     with session_scope(sessions) as session:
         case = list_cases(session)[0]
-        draft_case(session, case, mailer, settings)
+        draft_case(session, case, mailer, settings, now=NOW)
         mark_sent(session, case, by="megan", thread_id="t1", sent_at=NOW)
         return case.id
 

@@ -232,7 +232,7 @@ def test_scan_draft_reply_and_approve_round_trip(settings, sessions):
         assert "Delivering" not in draft.body and "Carrier:" not in draft.body
         assert draft.body.startswith("Hello,\n\nCan I please schedule")
         assert draft.cc_addr == "lidl@circledelivers.com"
-        message = draft_case(session, case, mailer, settings)
+        message = draft_case(session, case, mailer, settings, now=NOW)
         assert message.draft_ref == "memory:1" and case.status == CaseStatus.DRAFTED.value
         mark_sent(session, case, by="megan", thread_id="t1")
         assert case.status == CaseStatus.SENT.value
@@ -378,7 +378,7 @@ def test_scan_skips_loads_that_already_carry_a_pickup_number(settings, sessions)
         assert case.status == CaseStatus.ALREADY_BOOKED.value
         assert case.pickup_number == "20463798" and case.po_numbers == ["115802102660"]
         with pytest.raises(ValueError, match="only new cases"):
-            draft_case(session, case, RecordingMailer(), settings)
+            draft_case(session, case, RecordingMailer(), settings, now=NOW)
 
 
 def test_validate_classification_keeps_backed_values_only():
@@ -419,11 +419,11 @@ def test_scan_without_a_verified_desk_needs_profile_and_local_drafts_are_files(
         case = list_cases(session)[0]
         assert case.status == CaseStatus.NEEDS_PROFILE.value
         with pytest.raises(ValueError, match="only new cases"):
-            draft_case(session, case, RecordingMailer(), settings)
+            draft_case(session, case, RecordingMailer(), settings, now=NOW)
         case.status = CaseStatus.NEW.value
         case.contact_email = "desk@example.com"
         mailer = LocalDraftMailer(tmp_path / "drafts", sender="lidl@circledelivers.com")
-        message = draft_case(session, case, mailer, settings)
+        message = draft_case(session, case, mailer, settings, now=NOW)
         path = Path(message.draft_ref or "")
         assert path.exists() and path.suffix == ".eml"
         raw = path.read_text(encoding="utf-8")
@@ -469,7 +469,7 @@ def test_first_come_first_served_vendors_get_a_date_only_request(settings, sessi
     mailer = RecordingMailer()
     with session_scope(sessions) as session:
         case = list_cases(session)[0]
-        draft_case(session, case, mailer, settings)
+        draft_case(session, case, mailer, settings, now=NOW)
     body = mailer.drafts[-1].body
     assert "PO# 266621042660 on 10/01\n" in body and "@" not in body.split("Thank you!")[0]
     assert "Can I please schedule the following?" in body
@@ -487,7 +487,7 @@ def test_reschedule_drafts_in_thread_and_resets_the_slot(settings, sessions):
             reschedule_case(
                 session, case, mailer, settings, requested_local="2026-10-02 09:00", by="megan"
             )
-        draft_case(session, case, mailer, settings)
+        draft_case(session, case, mailer, settings, now=NOW)
         mark_sent(session, case, by="megan", thread_id="t9")
         case.status = CaseStatus.APPROVED.value
         case.confirmed_local = "2026-10-01 09:00"
@@ -531,8 +531,9 @@ def test_parse_delivery_slot_reads_both_forms_lidl_uses():
         timezone="America/New_York",
     )
     assert got is not None and got[1] == "FRG_200826660" and got[0].hour == 12
+    # The desk's wording after the 9/29 delivery miss: time and reference with no dash between.
     got = parse_delivery_slot("9/30 at 1100 PYE_300926723", year=2026, timezone="America/New_York")
-    assert got is None  # no dash and reference after a bare 24h time: not one of the two forms
+    assert got == (datetime(2026, 9, 30, 15, 0, tzinfo=UTC), "PYE_300926723")
     assert parse_delivery_slot("Thanks for the update!", year=2026, timezone=None) is None
 
 
@@ -547,7 +548,7 @@ def test_customer_desk_slot_moves_the_pickup_and_redrafts_in_thread(settings, se
     classifier = FakeReplyClassifier(lambda _c: ReplyClassification(status=ReplyStatus.UNRELATED))
     with session_scope(sessions) as session:
         case = list_cases(session)[0]
-        draft_case(session, case, mailer, settings)
+        draft_case(session, case, mailer, settings, now=NOW)
         mark_sent(session, case, by="megan", thread_id="tv")
         case.status = CaseStatus.NEEDS_HUMAN.value
         lidl = InboundMessage(
@@ -615,7 +616,7 @@ def test_draft_batch_writes_one_email_per_desk(settings, sessions):
     mailer = RecordingMailer()
     with session_scope(sessions) as session:
         cases = list_cases(session, CaseStatus.NEW.value)
-        messages = draft_batch(session, cases, mailer, settings)
+        messages = draft_batch(session, cases, mailer, settings, now=NOW)
         assert len(messages) == 2 and len(mailer.drafts) == 1
         draft = mailer.drafts[0]
         assert draft.subject == "Pick Up Appointments: 104419082630 & 104421082660"

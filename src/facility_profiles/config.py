@@ -111,6 +111,11 @@ class Settings(BaseSettings):
     booking_shared_desks: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["cci@udfinc.com"]
     )
+    # Desks that read the date inside a Lidl PO as the earliest pickup date ("this is showing a
+    # pickup date of 10/2, we cannot schedule early pickups"): never ask them for an earlier day.
+    booking_po_date_floor_desks: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["shipping.appointments@morganfoods.com"]
+    )
 
     # --- Group-mail archive in S3 (Pick Up Appointment threads) ---------------------------
     mail_archive_bucket: str | None = None
@@ -143,6 +148,7 @@ class Settings(BaseSettings):
         "internal_phone_numbers",
         "booking_cc",
         "booking_shared_desks",
+        "booking_po_date_floor_desks",
         mode="before",
     )
     @classmethod

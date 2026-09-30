@@ -206,8 +206,14 @@ def test_outlook_link_cruft_does_not_hide_a_real_confirmation():
 
 
 def test_replay_of_the_morgan_foods_thread(settings, sessions):
+    # The fixture replays the day the pod asked Morgan Foods for 10/01 and was pushed to 10/02;
+    # the PO-date floor that now prevents that ask is switched off so the replay stays faithful.
     settings = settings.model_copy(
-        update={"pilot_terminal_ids": [1089], "pilot_customer_ids": [7211]}
+        update={
+            "pilot_terminal_ids": [1089],
+            "pilot_customer_ids": [7211],
+            "booking_po_date_floor_desks": [],
+        }
     )
     seed_morgan(sessions)
     messages = load_messages_jsonl(FIXTURE)
@@ -230,7 +236,9 @@ def test_replay_of_the_morgan_foods_thread(settings, sessions):
         case = list_cases(session)[0]
         assert case.requested_local == "2026-10-01 09:00"
         assert case.po_numbers == ["115802102660", "115802102661"]
-        draft = draft_case(session, case, mailer, settings)
+        draft = draft_case(
+            session, case, mailer, settings, now=datetime(2026, 9, 23, 12, 0, tzinfo=UTC)
+        )
         assert "PO# 115802102660 & 115802102661 (ALL IN ONE TRUCK) on 10/01 @ 0900" in (
             draft.body or ""
         )
@@ -310,8 +318,14 @@ def test_replay_of_the_morgan_foods_thread(settings, sessions):
 
 def test_a_slot_already_past_when_the_vendor_wrote_is_not_a_confirmation(settings, sessions):
     """ "Latest is 9pm tonight" after a missed 09:00 pickup is a work-in note, not a booking."""
+    # The fixture replays the day the pod asked Morgan Foods for 10/01 and was pushed to 10/02;
+    # the PO-date floor that now prevents that ask is switched off so the replay stays faithful.
     settings = settings.model_copy(
-        update={"pilot_terminal_ids": [1089], "pilot_customer_ids": [7211]}
+        update={
+            "pilot_terminal_ids": [1089],
+            "pilot_customer_ids": [7211],
+            "booking_po_date_floor_desks": [],
+        }
     )
     seed_morgan(sessions)
     messages = load_messages_jsonl(FIXTURE)
@@ -329,7 +343,7 @@ def test_a_slot_already_past_when_the_vendor_wrote_is_not_a_confirmation(setting
     with session_scope(sessions) as session:
         case = list_cases(session)[0]
         assert case.requested_local == "2026-09-28 09:00"
-        draft_case(session, case, mailer, settings)
+        draft_case(session, case, mailer, settings, now=datetime(2026, 9, 23, 12, 0, tzinfo=UTC))
         mark_sent(session, case, by="megan", thread_id="t-first", sent_at=messages[0].sent_at)
         responder = Responder(settings, mailer, now=work_in.sent_at)
         stats = ingest(

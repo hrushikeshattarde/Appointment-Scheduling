@@ -188,6 +188,17 @@ Real-text regression: `tests/fixtures/lidl_morgan_foods_thread.jsonl` is the pod
 Morgan Foods thread in the mail pull's format, Outlook cruft included, and
 `tests/test_booking_real_thread.py` replays it with the model's recorded readings.
 
+### Three rules from the live threads
+
+A freshly scanned case is checked before any email is written. A desk listed in
+`FP_BOOKING_PO_DATE_FLOOR_DESKS` (Morgan Foods by default) reads the DDMMYY date inside a Lidl PO
+as the earliest pickup, so a request earlier than that day is moved up to it (weekends roll to
+Monday); if the floored day can no longer make the delivery the case goes to a person instead.
+A requested slot that has already passed, or sits inside `FP_BOOKING_MIN_NOTICE_HOURS`, goes to
+a person too, at scan time and again at draft or send time, because a same-day ask is a phone
+call. The inbound desk's delivery slots are read in every wording seen so far, including the
+two-line "9/30 at 1100" then "PYE_300926723".
+
 ### Sending as the agent, and tying replies to requests
 
 Every outbound message now carries its own RFC `Message-ID`, and every stored message keeps

@@ -91,7 +91,7 @@ def test_send_moves_the_case_to_sent_with_the_ids_a_reply_will_carry(settings, s
     with_ids = None
     with sessions() as session:
         case = list_cases(session)[0]
-        message = draft_case(session, case, sender, settings, by="megan")
+        message = draft_case(session, case, sender, settings, by="megan", now=NOW)
         session.commit()
         assert case.status == CaseStatus.SENT.value
         assert message.sent_at is not None and message.message_id == "sent-1"
@@ -112,7 +112,7 @@ def test_send_gate_refuses_draft_mode_untrusted_desks_and_the_daily_cap(settings
     with sessions() as session:
         first, second, third = sorted(list_cases(session), key=lambda c: c.id)
         with pytest.raises(SendRefusedError, match="not 'send'"):
-            draft_case(session, first, sender, draft_only)
+            draft_case(session, first, sender, draft_only, now=NOW)
         assert first.status == CaseStatus.NEW.value and not sender.drafts
 
     send = _send_settings(settings).model_copy(update={"booking_send_daily_cap": 1})
@@ -120,11 +120,11 @@ def test_send_gate_refuses_draft_mode_untrusted_desks_and_the_daily_cap(settings
         first, second, third = sorted(list_cases(session), key=lambda c: c.id)
         second.contact_email = "someone-else@example.com"
         with pytest.raises(SendRefusedError, match="not the trusted desk"):
-            draft_case(session, second, sender, send)
-        draft_case(session, first, sender, send)
+            draft_case(session, second, sender, send, now=NOW)
+        draft_case(session, first, sender, send, now=NOW)
         session.commit()
         with pytest.raises(SendRefusedError, match="daily send cap"):
-            draft_case(session, third, sender, send)
+            draft_case(session, third, sender, send, now=NOW)
         assert len(sender.drafts) == 1 and third.status == CaseStatus.NEW.value
 
 
@@ -134,7 +134,7 @@ def test_batched_send_records_the_same_message_on_every_case(settings, sessions)
     sender = RecordingSender()
     with sessions() as session:
         cases = list_cases(session, CaseStatus.NEW.value)
-        messages = draft_batch(session, cases, sender, settings)
+        messages = draft_batch(session, cases, sender, settings, now=NOW)
         session.commit()
         assert len(sender.drafts) == 1 and len(messages) == 2
         assert {m.rfc_message_id for m in messages} == {sender.deliveries[0].rfc_message_id}
@@ -149,7 +149,7 @@ def _sent_case(settings, sessions):  # type: ignore[no-untyped-def]
     sender = RecordingSender()
     with sessions() as session:
         case = list_cases(session)[0]
-        message = draft_case(session, case, sender, settings)
+        message = draft_case(session, case, sender, settings, now=NOW)
         session.commit()
         return case.id, message.rfc_message_id
 
@@ -210,7 +210,7 @@ def test_a_persons_send_seen_in_the_archive_links_the_drafted_case(settings, ses
     _scanned(settings, sessions, "226321092660")
     with sessions() as session:
         case = list_cases(session)[0]
-        draft_case(session, case, RecordingMailer(), settings)
+        draft_case(session, case, RecordingMailer(), settings, now=NOW)
         session.commit()
         case_id = case.id
         assert case.status == CaseStatus.DRAFTED.value and case.thread_id is None

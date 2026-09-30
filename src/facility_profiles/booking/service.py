@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -37,7 +37,12 @@ from facility_profiles.booking.outbox import (
     is_sender,
     record_delivery,
 )
-from facility_profiles.booking.respond import Responder, customer_label
+from facility_profiles.booking.respond import (
+    Responder,
+    customer_label,
+    local_dt,
+    offer_is_feasible,
+)
 from facility_profiles.booking.schema import ReplyClassification, ReplyStatus
 from facility_profiles.config import Settings
 from facility_profiles.domain.resolution import FacilityResolver
@@ -54,13 +59,18 @@ log = get_logger(__name__)
 
 DELIVERY_REF_RE = re.compile(r"\b[A-Z]{3}_\d{6,}\b")
 PO_RE = re.compile(r"\b\d{9,15}\b")
-# Lidl's inbound desk writes a delivery slot as "8/20 7AM - GRM_200826926"; the pod writes its
-# own DCT bookings as "FRG_200526615 05/20 @ 1100". Both forms are read.
+# Lidl's inbound desk writes a delivery slot as "8/20 7AM - GRM_200826926", as "10/6 730AM -
+# PYE_061026919", or on two lines ("9/30 at 1100" then "PYE_300926723"); the pod writes its own
+# DCT bookings as "FRG_200526615 05/20 @ 1100". All forms are read.
 DELIVERY_SLOT_RE = re.compile(
     r"(?P<m>\d{1,2})/(?P<d>\d{1,2})(?:/(?P<y>\d{2,4}))?\s*(?:@|at)?\s*(?P<h>\d{1,2})(?::?(?P<min>\d{2}))?"
-    r"\s*(?P<ampm>AM|PM)?\s*-\s*(?P<ref>[A-Z]{3}_\d{6,})",
+    r"\s*(?P<ampm>AM|PM)?[\s,;:\-\u2013\u2014]*(?P<ref>[A-Z]{3}_\d{6,})",
     re.I,
 )
+# Lidl PO numbers are twelve digits with the delivery date as DDMMYY in digits five to ten
+# ("115802102660" is 2 October 2026). Morgan Foods reads that date as the earliest pickup.
+LIDL_PO_RE = re.compile(r"^\d{12}$")
+PO_DATE_WINDOW_DAYS = 60
 DELIVERY_SLOT_REF_FIRST_RE = re.compile(
     r"(?P<ref>[A-Z]{3}_\d{6,})\s+(?P<m>\d{1,2})/(?P<d>\d{1,2})(?:/(?P<y>\d{2,4}))?\s*(?:@|at)?\s*"
     r"(?P<h>\d{1,2})(?::?(?P<min>\d{2}))?\s*(?P<ampm>AM|PM)?",
@@ -213,6 +223,84 @@ def requested_local(
     return f"{day:%Y-%m-%d} {settings.booking_default_pickup_time}"
 
 
+def po_embedded_date(po: str, *, near: date) -> date | None:
+    """The DDMMYY date inside a Lidl PO, when it is a real date within two months of ``near``."""
+    if not LIDL_PO_RE.match(po):
+        return None
+    try:
+        found = date(2000 + int(po[8:10]), int(po[6:8]), int(po[4:6]))
+    except ValueError:
+        return None
+    return found if abs((found - near).days) <= PO_DATE_WINDOW_DAYS else None
+
+
+def pickup_floor(case: BookingCase, settings: Settings) -> date | None:
+    """The earliest day the desk will load, for desks that read the PO date as the pickup date."""
+    desk = (case.contact_email or "").lower()
+    if desk not in {d.lower() for d in settings.booking_po_date_floor_desks}:
+        return None
+    tz = ZoneInfo(case.vendor_timezone or "America/New_York")
+    anchor = as_utc(case.delivery_at_utc) or as_utc(case.tendered_pickup_utc)
+    near = (anchor or datetime.now(tz=UTC)).astimezone(tz).date()
+    found = [d for d in (po_embedded_date(str(p), near=near) for p in case.po_numbers) if d]
+    return max(found) if found else None
+
+
+def floor_requested(
+    case: BookingCase, requested: str | None, settings: Settings, *, now: datetime
+) -> tuple[str | None, str | None, bool]:
+    """Apply the desk's PO-date floor to a requested slot.
+
+    Returns the slot to use, why it moved (or None), and whether that slot can still make the
+    customer's delivery. A weekend floor rolls forward to Monday.
+    """
+    floor = pickup_floor(case, settings)
+    if floor is None or not requested:
+        return requested, None, True
+    day_text, _, clock = requested.partition(" ")
+    try:
+        day = date.fromisoformat(day_text)
+    except ValueError:
+        return requested, None, True
+    if day >= floor:
+        return requested, None, True
+    target = floor
+    while target.weekday() >= 5:
+        target += timedelta(days=1)
+    moved = f"{target:%Y-%m-%d} {clock}".strip()
+    feasible, verdict = offer_is_feasible(
+        case, local_dt(f"{target:%Y-%m-%d}", clock or None, case.vendor_timezone), settings, now=now
+    )
+    why = (
+        f"moved from {requested} to {moved}: {short_vendor(case.vendor_name)} reads the PO date "
+        f"{floor:%m/%d} as the earliest pickup"
+    )
+    if not feasible:
+        why += f"; that {verdict}"
+    return moved, why, feasible
+
+
+def slot_is_stale(
+    requested: str | None, timezone: str | None, settings: Settings, *, now: datetime
+) -> str | None:
+    """Why a requested slot can no longer be asked for by email, or None when it still can."""
+    if not requested:
+        return None
+    day, _, clock = requested.partition(" ")
+    try:
+        pickup = local_dt(day, clock or None, timezone)
+    except ValueError:
+        return None
+    if pickup <= now:
+        return f"requested slot {requested} has already passed"
+    if pickup <= now + timedelta(hours=settings.booking_min_notice_hours):
+        return (
+            f"requested slot {requested} is inside the {settings.booking_min_notice_hours} h "
+            "notice window; a same-day ask needs a person"
+        )
+    return None
+
+
 def parse_delivery_slot(
     text: str, *, year: int, timezone: str | None
 ) -> tuple[datetime, str] | None:
@@ -353,6 +441,7 @@ def scan(
             session.add(case)
             session.flush()
             _event(session, case, "scanned", status=case.status, reason=case.reason)
+            _check_requested_slot(session, case, settings, now=now)
             stats.created += 1
             stats.case_ids.append(case.id)
             if status == CaseStatus.ALREADY_BOOKED.value:
@@ -360,6 +449,32 @@ def scan(
             elif status == CaseStatus.NEEDS_PROFILE.value:
                 stats.needs_profile += 1
     return stats
+
+
+def _check_requested_slot(
+    session: Session, case: BookingCase, settings: Settings, *, now: datetime
+) -> None:
+    """Apply the PO-date floor and the notice window to a freshly scanned case.
+
+    Only a case the agent could email is affected. A floor that still makes the delivery just
+    moves the ask; one that does not, or a slot already inside the notice window, hands the
+    case to a person before any email is written.
+    """
+    if case.status != CaseStatus.NEW.value:
+        return
+    moved, why, feasible = floor_requested(case, case.requested_local, settings, now=now)
+    if why:
+        case.requested_local = moved
+        _event(session, case, "po_date_floor", reason=why, feasible=feasible)
+        if not feasible:
+            case.status = CaseStatus.NEEDS_HUMAN.value
+            case.reason = why[:255]
+            return
+    stale = slot_is_stale(case.requested_local, case.vendor_timezone, settings, now=now)
+    if stale:
+        case.status = CaseStatus.NEEDS_HUMAN.value
+        case.reason = stale[:255]
+        _event(session, case, "stale_slot", reason=stale)
 
 
 # ------------------------------------------------------------------ compose and draft
@@ -439,18 +554,26 @@ def draft_case(
     settings: Settings,
     *,
     by: str = "agent",
+    now: datetime | None = None,
 ) -> BookingMessage:
     """Compose the request and hand it to the outbox: a draft for a person, or a send.
 
     With a :class:`Sender` the request goes out only when the send gate passes (send mode on,
     the recipient is the profile's trusted desk, the daily cap not reached) and the case moves
-    straight to ``sent`` with the ids a reply will point back at.
+    straight to ``sent`` with the ids a reply will point back at. A slot that has gone stale
+    since the scan is refused either way: a same-day ask needs a person.
     """
     if case.status not in (CaseStatus.NEW.value, CaseStatus.DRAFTED.value):
         msg = f"case {case.id} is {case.status}; only new cases can be drafted"
         raise ValueError(msg)
     if not case.contact_email:
         msg = f"case {case.id} has no booking email"
+        raise ValueError(msg)
+    stale = slot_is_stale(
+        case.requested_local, case.vendor_timezone, settings, now=now or datetime.now(tz=UTC)
+    )
+    if stale:
+        msg = f"case {case.id}: {stale}; reschedule it first"
         raise ValueError(msg)
     profile = vendor_profile(Repository(session), case.facility_key) if case.facility_key else None
     draft = compose_request(case, settings, profile)
@@ -1006,6 +1129,16 @@ def _apply_customer_desk_message(
     )
     if new_request is None:
         return True
+    now = responder.now if responder is not None and responder.now else datetime.now(tz=UTC)
+    floored, why, feasible = floor_requested(case, new_request, settings, now=now)
+    new_request = floored or new_request
+    if why:
+        _event(session, case, "po_date_floor", reason=why, feasible=feasible)
+    if not feasible:
+        case.requested_local = new_request
+        case.status = CaseStatus.NEEDS_HUMAN.value
+        case.reason = (why or f"delivery moved to {ref}; the pickup cannot be re-requested")[:255]
+        return True
     if any(m.direction == "out" for m in case.messages) and responder is not None:
         reschedule_case(
             session,
@@ -1030,8 +1163,10 @@ def draft_batch(
     settings: Settings,
     *,
     by: str = "agent",
+    now: datetime | None = None,
 ) -> list[BookingMessage]:
     """Draft (or send) new cases, one email per vendor desk, the way the pod batches requests."""
+    now = now or datetime.now(tz=UTC)
     groups: dict[str, list[BookingCase]] = {}
     for case in cases:
         groups.setdefault((case.contact_email or "").lower(), []).append(case)
@@ -1040,8 +1175,13 @@ def draft_batch(
     for desk, group in groups.items():
         if len(group) == 1 or not desk:
             for case in group:
-                messages.append(draft_case(session, case, mailer, settings, by=by))
+                messages.append(draft_case(session, case, mailer, settings, by=by, now=now))
             continue
+        for case in group:
+            stale = slot_is_stale(case.requested_local, case.vendor_timezone, settings, now=now)
+            if stale:
+                msg = f"case {case.id}: {stale}; reschedule it first"
+                raise ValueError(msg)
         group.sort(key=lambda c: c.requested_local or "")
         profile = vendor_profile(repo, group[0].facility_key) if group[0].facility_key else None
         date_only = bool(profile and profile.date_only)
