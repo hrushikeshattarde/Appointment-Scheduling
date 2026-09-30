@@ -199,6 +199,16 @@ a person too, at scan time and again at draft or send time, because a same-day a
 call. The inbound desk's delivery slots are read in every wording seen so far, including the
 two-line "9/30 at 1100" then "PYE_300926723".
 
+### One reply, several POs
+
+A batched request covers several cases with one email, and Morgan Foods answers it line by
+line ("A & B-9/28 @ 9am pickup# 20463264" then "C & D-10/2 @ 9am pickup# 20463798, we cannot
+schedule early pickups"). The classifier returns one entry per PO line (`items`), each checked
+against the text like the whole reply and dropped when its POs are nowhere in the message; a reply
+is matched to every case it belongs to (by Message-ID, thread, or PO numbers) and applied line by
+line, a case whose POs the reply never names is left where it was, and at most one message goes
+back for one reply: the conversation policy's answer if there is one, else a single "Thank you!".
+
 ### Sending as the agent, and tying replies to requests
 
 Every outbound message now carries its own RFC `Message-ID`, and every stored message keeps

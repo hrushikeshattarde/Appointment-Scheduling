@@ -23,7 +23,7 @@ from facility_profiles.extraction.openrouter import (
     strict_json_schema,
 )
 
-PROMPT_VERSION = "reply-v2"
+PROMPT_VERSION = "reply-v3"
 
 SYSTEM_PROMPT = """You read one email reply from a shipping facility to a freight broker's pickup \
 appointment request and return a JSON object describing it.
@@ -48,6 +48,11 @@ quoted earlier messages) that contain each date, time and number you report. Nev
 inside quotes. Only for a counter_offer where the vendor edited dates or times inside the \
 quoted text may a quote come from that quoted text.
 - conditions are rules the vendor states (arrive early, bring load bars, register at gate).
+- When the reply answers several PO lines separately (one line per PO or PO pair, each with \
+its own date, time, pickup number or verdict), fill items with one entry per line: that line's \
+PO numbers as written, its status, date, time and pickup number, and quotes from that line. \
+Set the top-level fields to the line about the POs marked as ours, or to the overall reading. \
+Leave items empty when the reply has one reading for everything.
 - Only use the reply text. Do not invent values that are not written there."""
 
 # Outlook wraps numbers and addresses in link cruft ("115802102660<tel:(580)%20210-2660>",
@@ -72,6 +77,8 @@ class ReplyContext:
     subject: str
     body: str
     quoted: str = ""
+    # Every request in the thread when a batched email covered several cases: (POs, slot).
+    requests: list[tuple[list[str], str | None]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -104,10 +111,23 @@ class ReplyClassifier(Protocol):
 def render_user_message(context: ReplyContext) -> str:
     """The user turn: the request being answered and the reply itself."""
     requested = context.requested_local or "not stated"
+    if len(context.requests) > 1:
+        lines = "\n".join(
+            f"- PO {' & '.join(pos) or 'unknown'}, requested {slot or 'not stated'}"
+            for pos, slot in context.requests
+        )
+        ours = ", ".join(context.po_numbers) or "unknown"
+        head = (
+            f"Our requests in this thread, pickups at {context.vendor_name}:\n{lines}\n"
+            f"Ours for the top-level fields: PO {ours}, requested {requested}.\n"
+        )
+    else:
+        head = (
+            f"Our request: pickup at {context.vendor_name} for PO "
+            f"{', '.join(context.po_numbers) or 'unknown'}, requested {requested}.\n"
+        )
     return (
-        f"Our request: pickup at {context.vendor_name} for PO "
-        f"{', '.join(context.po_numbers) or 'unknown'}, requested {requested}.\n"
-        f"Reply date: {context.reply_sent_at:%Y-%m-%d %A %H:%M}\n"
+        head + f"Reply date: {context.reply_sent_at:%Y-%m-%d %A %H:%M}\n"
         f"Subject: {context.subject}\n\n"
         f'Reply text:\n"""\n{context.body.strip()}\n"""'
         + (
@@ -196,6 +216,57 @@ def _sort_quotes(
     return own_quotes, kept, issues
 
 
+def _validate_slot(
+    data: dict[str, Any], own: str, history: str, *, label: str = ""
+) -> list[ClassificationIssue]:
+    """Check one reading (the whole reply, or one PO line) against the text, in place."""
+    prefix = f"{label}." if label else ""
+    own_quotes, kept_quotes, issues = _sort_quotes(
+        list(data.get("quotes") or []),
+        own,
+        history,
+        allow_history=data.get("status") == ReplyStatus.COUNTER_OFFER,
+    )
+    for issue in issues:
+        issue.field_name = prefix + issue.field_name
+    backing = " ".join(clean_mail_text(q) for q in kept_quotes)
+    data["quotes"] = kept_quotes
+
+    number = data.get("pickup_number")
+    if number and not _number_in_text(str(number), own):
+        issues.append(
+            ClassificationIssue(
+                prefix + "pickup_number", "number not in the reply's own words", number
+            )
+        )
+        data["pickup_number"] = None
+    day = data.get("pickup_date")
+    if day and not date_is_backed(str(day), backing):
+        issues.append(ClassificationIssue(prefix + "pickup_date", "no quote backs this value", day))
+        data["pickup_date"] = None
+    for name in ("pickup_time", "pickup_time_end"):
+        value = data.get(name)
+        if value and not time_is_backed(str(value), backing):
+            issues.append(ClassificationIssue(prefix + name, "no quote backs this value", value))
+            data[name] = None
+    question = data.get("question")
+    if data["status"] == ReplyStatus.CONFIRMED and not own_quotes:
+        issues.append(
+            ClassificationIssue(
+                prefix + "status", "confirmation without a quote from the reply's own words"
+            )
+        )
+        data["status"] = ReplyStatus.QUESTION if question else ReplyStatus.UNRELATED
+    if data["status"] == ReplyStatus.COUNTER_OFFER and not (
+        data["pickup_date"] or data["pickup_time"]
+    ):
+        issues.append(
+            ClassificationIssue(prefix + "status", "counter-offer without a backed date or time")
+        )
+        data["status"] = ReplyStatus.QUESTION if question else ReplyStatus.UNRELATED
+    return issues
+
+
 def validate_classification(
     result: ReplyClassification, text: str, quoted: str = ""
 ) -> tuple[ReplyClassification, list[ClassificationIssue]]:
@@ -204,44 +275,60 @@ def validate_classification(
     ``text`` is the reply's own words, ``quoted`` the history under it. A quote found only in
     the history backs a counter-offer (vendors edit times inside the quoted request) and nothing
     else: a chaser that carries the old confirmation underneath must not re-confirm the slot.
+    Each PO line in ``items`` is checked the same way, and a line whose PO numbers are nowhere
+    in the message is dropped: it cannot be about anything the message says.
     """
     own = clean_mail_text(text)
     history = clean_mail_text(quoted)
-    own_quotes, kept_quotes, issues = _sort_quotes(
-        result.quotes, own, history, allow_history=result.status == ReplyStatus.COUNTER_OFFER
-    )
-    backing = " ".join(clean_mail_text(q) for q in kept_quotes)
     data = result.model_dump()
-    data["quotes"] = kept_quotes
-
-    if result.pickup_number and not _number_in_text(result.pickup_number, own):
-        issues.append(
-            ClassificationIssue(
-                "pickup_number", "number not in the reply's own words", result.pickup_number
+    issues = _validate_slot(data, own, history)
+    everything = f"{own}\n{history}"
+    kept_items: list[dict[str, Any]] = []
+    for index, item in enumerate(data.get("items") or []):
+        label = f"items[{index}]"
+        pos = [str(p) for p in item.get("po_numbers") or []]
+        missing = [p for p in pos if not _number_in_text(p, everything)]
+        if missing:
+            issues.append(
+                ClassificationIssue(label + ".po_numbers", "PO not in the message", missing)
             )
-        )
-        data["pickup_number"] = None
-    if result.pickup_date and not date_is_backed(result.pickup_date, backing):
-        issues.append(
-            ClassificationIssue("pickup_date", "no quote backs this value", result.pickup_date)
-        )
-        data["pickup_date"] = None
-    for name in ("pickup_time", "pickup_time_end"):
-        value = getattr(result, name)
-        if value and not time_is_backed(value, backing):
-            issues.append(ClassificationIssue(name, "no quote backs this value", value))
-            data[name] = None
-    if data["status"] == ReplyStatus.CONFIRMED and not own_quotes:
-        issues.append(
-            ClassificationIssue("status", "confirmation without a quote from the reply's own words")
-        )
-        data["status"] = ReplyStatus.QUESTION if data["question"] else ReplyStatus.UNRELATED
-    if data["status"] == ReplyStatus.COUNTER_OFFER and not (
-        data["pickup_date"] or data["pickup_time"]
-    ):
-        issues.append(ClassificationIssue("status", "counter-offer without a backed date or time"))
-        data["status"] = ReplyStatus.QUESTION if data["question"] else ReplyStatus.UNRELATED
+            continue
+        item["question"] = None  # lines carry verdicts and values, the reply carries the question
+        issues.extend(_validate_slot(item, own, history, label=label))
+        item.pop("question", None)
+        kept_items.append(item)
+    data["items"] = kept_items
     return ReplyClassification.model_validate(data), issues
+
+
+def for_case(result: ReplyClassification, po_numbers: list[str]) -> ReplyClassification | None:
+    """The reading that applies to one case's POs.
+
+    With no PO lines, the whole reply applies. With lines, the first line naming one of the
+    case's POs applies; failing that, a line with no POs (a verdict for everything); failing
+    that, the reply is not about this case at all and None is returned.
+    """
+    if not result.items:
+        return result
+    wanted = {p.strip() for p in po_numbers}
+    chosen = next(
+        (item for item in result.items if wanted & {p.strip() for p in item.po_numbers}), None
+    ) or next((item for item in result.items if not item.po_numbers), None)
+    if chosen is None:
+        return None
+    return ReplyClassification(
+        status=chosen.status,
+        pickup_date=chosen.pickup_date,
+        pickup_time=chosen.pickup_time,
+        pickup_time_end=chosen.pickup_time_end,
+        pickup_number=chosen.pickup_number,
+        conditions=list(chosen.conditions)
+        + [c for c in result.conditions if c not in chosen.conditions],
+        question=result.question,
+        quotes=list(chosen.quotes),
+        items=[],
+        confidence=result.confidence,
+    )
 
 
 class OpenRouterReplyClassifier:

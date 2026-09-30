@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -21,6 +22,7 @@ from facility_profiles.booking.classify import (
     ClassificationIssue,
     ReplyClassifier,
     ReplyContext,
+    for_case,
     validate_classification,
 )
 from facility_profiles.booking.mail import (
@@ -147,6 +149,7 @@ class IngestStats:
     delivery_updates: int = 0
     after_decision: int = 0  # mail on approved or closed cases, recorded but not classified
     linked_outbound: int = 0  # a person's own send of a drafted request, recognised and linked
+    not_about_case: int = 0  # a reply that named other POs than this case's
     own_outbound: int = 0  # the agent's own sent mail seen again in the archive
 
 
@@ -726,40 +729,64 @@ def list_cases(session: Session, status: str | None = None) -> list[BookingCase]
     return list(session.scalars(stmt))
 
 
-def match_case(session: Session, message: InboundMessage) -> BookingCase | None:
-    """Match a reply to a case.
+def match_cases(session: Session, message: InboundMessage) -> list[BookingCase]:
+    """Every case a reply belongs to, oldest first.
 
-    In order: the Message-IDs the reply points at (In-Reply-To, then References) against what
-    the agent or a person sent; the Gmail thread, when the reply was read from the mailbox that
-    sent the request; a PO number in the reply's own words; a lone open case for the sender.
+    A batched request covers several cases with one email, so one reply can answer several
+    cases. In order: the Message-IDs the reply points at (In-Reply-To, then References) against
+    what the agent or a person sent; the Gmail thread, when the reply was read from the mailbox
+    that sent the request; PO numbers in the reply's own words; a lone open case for the sender.
     """
     referenced = message.referenced_ids
     if referenced:
-        answered = session.scalar(
-            select(BookingMessage)
-            .where(
-                BookingMessage.direction == "out",
-                func.lower(BookingMessage.rfc_message_id).in_(referenced),
+        answered = list(
+            session.scalars(
+                select(BookingMessage).where(
+                    BookingMessage.direction == "out",
+                    func.lower(BookingMessage.rfc_message_id).in_(referenced),
+                )
             )
-            .order_by(BookingMessage.id.desc())
         )
-        if answered is not None:
-            return answered.case
+        if answered:
+            return _distinct(m.case for m in answered)
     if message.thread_id:
-        case = session.scalar(select(BookingCase).where(BookingCase.thread_id == message.thread_id))
-        if case is not None:
-            return case
+        in_thread = list(
+            session.scalars(
+                select(BookingCase)
+                .where(BookingCase.thread_id == message.thread_id)
+                .order_by(BookingCase.id)
+            )
+        )
+        if in_thread:
+            return in_thread
     open_cases = list(
-        session.scalars(select(BookingCase).where(BookingCase.status.in_(OPEN_STATUSES)))
+        session.scalars(
+            select(BookingCase)
+            .where(BookingCase.status.in_(OPEN_STATUSES))
+            .order_by(BookingCase.id)
+        )
     )
     numbers = set(PO_RE.findall(f"{message.subject} {message.body}"))
     if numbers:
         hits = [c for c in open_cases if numbers & {str(p) for p in c.po_numbers}]
-        if len(hits) == 1:
-            return hits[0]
+        if hits:
+            return hits
     sender = message.from_email
     by_sender = [c for c in open_cases if (c.contact_email or "").lower() == sender]
-    return by_sender[0] if len(by_sender) == 1 else None
+    return by_sender if len(by_sender) == 1 else []
+
+
+def _distinct(cases: Iterable[BookingCase]) -> list[BookingCase]:
+    seen: dict[int, BookingCase] = {}
+    for case in cases:
+        seen.setdefault(case.id, case)
+    return [seen[k] for k in sorted(seen)]
+
+
+def match_case(session: Session, message: InboundMessage) -> BookingCase | None:
+    """The first case a reply belongs to, or None."""
+    cases = match_cases(session, message)
+    return cases[0] if cases else None
 
 
 def _local_to_utc(day: str, clock: str | None, timezone: str | None) -> datetime:
@@ -900,36 +927,83 @@ def ingest(  # noqa: PLR0912 - one branch per reply outcome
         if _already_recorded(session, message):
             stats.duplicates += 1
             continue
-        case = match_case(session, message)
-        if case is None:
+        cases = match_cases(session, message)
+        if not cases:
             stats.unmatched += 1
             continue
         if customer_desk and message.from_email == customer_desk.lower():
-            if _apply_customer_desk_message(session, case, message, responder):
+            moved = [_apply_customer_desk_message(session, c, message, responder) for c in cases]
+            if any(moved):
                 stats.delivery_updates += 1
             continue
-        if case.status in DECIDED_STATUSES:
-            _record_after_decision(session, case, message)
-            stats.after_decision += 1
+        live: list[BookingCase] = []
+        for case in cases:
+            if case.status in DECIDED_STATUSES:
+                _record_after_decision(session, case, message)
+                stats.after_decision += 1
+            else:
+                live.append(case)
+        if not live:
             continue
-        context = ReplyContext(
-            vendor_name=case.vendor_name or "",
-            po_numbers=[str(p) for p in case.po_numbers],
-            requested_local=case.requested_local,
-            reply_sent_at=message.sent_at,
-            subject=message.subject,
-            body=message.body,
-            quoted=message.quoted,
+        _ingest_reply(
+            session, message, cases=live, classifier=classifier, responder=responder, stats=stats
         )
-        output = classifier.classify(context)
-        result, issues = validate_classification(output.result, message.body, message.quoted)
-        stats.classified += 1
+        session.flush()
+    return stats
+
+
+def _ingest_reply(
+    session: Session,
+    message: InboundMessage,
+    *,
+    cases: list[BookingCase],
+    classifier: ReplyClassifier,
+    responder: Responder | None,
+    stats: IngestStats,
+) -> None:
+    """Classify one vendor reply once and apply it to every live case it answers.
+
+    A reply that answers PO lines separately is applied line by line; a case whose POs the
+    reply never names is left where it was. Whatever happens, at most one message goes back
+    for one reply: the conversation policy's answers first, else a single "Thank you!".
+    """
+    first = cases[0]
+    context = ReplyContext(
+        vendor_name=first.vendor_name or "",
+        po_numbers=[str(p) for c in cases for p in c.po_numbers],
+        requested_local=first.requested_local,
+        reply_sent_at=message.sent_at,
+        subject=message.subject,
+        body=message.body,
+        quoted=message.quoted,
+        requests=[([str(p) for p in c.po_numbers], c.requested_local) for c in cases],
+    )
+    output = classifier.classify(context)
+    result, issues = validate_classification(output.result, message.body, message.quoted)
+    stats.classified += 1
+    answered: list[tuple[BookingCase, BookingMessage, ReplyClassification]] = []
+    for case in cases:
+        reading = for_case(result, [str(p) for p in case.po_numbers])
+        if reading is None:
+            case.messages.append(
+                _inbound_record(
+                    case,
+                    message,
+                    kind="reply",
+                    classification={"skipped": "reply names other POs", "model": output.model},
+                )
+            )
+            session.flush()
+            _event(session, case, "reply_not_about_this_po", subject=message.subject)
+            stats.not_about_case += 1
+            continue
         inbound = _inbound_record(
             case,
             message,
             kind="reply",
             classification={
-                **result.model_dump(mode="json"),
+                **reading.model_dump(mode="json"),
+                "line_items": len(result.items),
                 "issues": [i.__dict__ for i in issues],
                 "model": output.model,
             },
@@ -938,7 +1012,7 @@ def ingest(  # noqa: PLR0912 - one branch per reply outcome
         session.flush()
         if case.thread_id is None and message.thread_id:
             case.thread_id = message.thread_id
-        action = apply_reply(session, case, result, issues, reply_sent_at=message.sent_at)
+        action = apply_reply(session, case, reading, issues, reply_sent_at=message.sent_at)
         if action == "vendor_confirmed":
             stats.proposed += 1
         elif action in ("counter_offer", "question", "rejected_by_vendor", "stale_confirmation"):
@@ -947,26 +1021,39 @@ def ingest(  # noqa: PLR0912 - one branch per reply outcome
             stats.deferred += 1
         else:
             stats.unrelated += 1
-        if responder is not None and result.status in (
+        answered.append((case, inbound, reading))
+    if responder is not None:
+        _answer_once(session, responder, answered, stats)
+
+
+def _answer_once(
+    session: Session,
+    responder: Responder,
+    answered: list[tuple[BookingCase, BookingMessage, ReplyClassification]],
+    stats: IngestStats,
+) -> None:
+    """At most one message back for one reply: policy answers first, else a single thanks."""
+    drafted_any = False
+    for case, inbound, reading in answered:
+        if reading.status in (
             ReplyStatus.COUNTER_OFFER,
             ReplyStatus.QUESTION,
             ReplyStatus.REJECTED,
         ):
-            plan, drafted = responder.respond(session, case, inbound, result)
+            plan, drafted = responder.respond(session, case, inbound, reading)
             if drafted is not None:
                 stats.responded += 1
+                drafted_any = True
             log.info(
                 "booking.responded", case=case.id, intent=plan.intent.value, reason=plan.reason
             )
-        elif (
-            responder is not None
-            and result.status == ReplyStatus.CONFIRMED
-            and case.status == CaseStatus.PROPOSED.value
-        ):
+    if drafted_any:
+        return
+    for case, inbound, reading in answered:
+        if reading.status == ReplyStatus.CONFIRMED and case.status == CaseStatus.PROPOSED.value:
             if responder.acknowledge(session, case, inbound) is not None:
                 stats.responded += 1
-        session.flush()
-    return stats
+            return
 
 
 def _inbound_record(

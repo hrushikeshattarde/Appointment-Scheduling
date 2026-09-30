@@ -86,6 +86,11 @@ def main() -> int:
         kept, issues = validate_classification(output.result, m.body, m.quoted)
         raw = output.result.model_dump()
         print("model read:", json.dumps({k: raw[k] for k in SHOW if raw.get(k) is not None}))
+        for item in raw.get("items") or []:
+            print(
+                "  line    :",
+                json.dumps({k: v for k, v in item.items() if v not in (None, [], "")}),
+            )
         print("quotes    :", json.dumps(raw["quotes"], ensure_ascii=False))
         kept_d = kept.model_dump()
         print("kept      :", json.dumps({k: kept_d[k] for k in SHOW if kept_d.get(k) is not None}))
