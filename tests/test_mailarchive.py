@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import re
 from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage
 from email.utils import format_datetime
@@ -574,6 +575,10 @@ def test_mail_archive_cli_help(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setenv("TPRO_USERNAME", "u")
     monkeypatch.setenv("TPRO_PASSWORD", "p")
     monkeypatch.setenv("FP_DATABASE_URL", f"sqlite:///{(tmp_path / 'fp.db').as_posix()}")
+    # CI runners report a colour-capable terminal; keep the help text plain and wide.
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setenv("TERM", "dumb")
+    monkeypatch.setenv("COLUMNS", "200")
     monkeypatch.chdir(tmp_path)
     from facility_profiles.config import get_settings
 
@@ -588,6 +593,7 @@ def test_mail_archive_cli_help(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         key.write_text("{}", encoding="utf-8")
         result = runner.invoke(app, ["mail-archive", "collect", "--key", str(key)])
         assert result.exit_code == 2 and "--bucket" in result.output
-        assert "--s3" in runner.invoke(app, ["booking", "inbox", "--help"]).output
+        help_text = runner.invoke(app, ["booking", "inbox", "--help"]).output
+        assert "--s3" in re.sub(r"\x1b\[[0-9;]*m", "", help_text), help_text
     finally:
         get_settings.cache_clear()
