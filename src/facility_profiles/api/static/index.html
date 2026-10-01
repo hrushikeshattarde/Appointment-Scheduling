@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Pickup appointments</title>
+    <link rel="stylesheet" href="app.css" />
+    <script type="module" src="app.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand"><span class="logo" aria-hidden="true">&#9638;</span> Pickup appointments</div>
+      <nav class="tabs" aria-label="Views">
+        <a href="#overview" data-tab="overview">Overview</a>
+        <a href="#appointments" data-tab="appointments">Appointments</a>
+        <a href="#week" data-tab="week">This week</a>
+      </nav>
+      <div class="tools">
+        <label>Customer
+          <select id="customer"><option value="">All customers</option></select>
+        </label>
+        <label>You
+          <input id="me" type="text" placeholder="your name" autocomplete="name" size="11" />
+        </label>
+        <button id="refresh" class="btn" type="button">Refresh</button>
+        <span id="stamp" class="stamp" aria-live="polite"></span>
+      </div>
+    </header>
+    <main id="view" tabindex="-1"><p class="muted">Loading&hellip;</p></main>
+    <div id="scrim" class="scrim" hidden></div>
+    <aside id="drawer" class="drawer" role="dialog" aria-modal="true" aria-labelledby="case-title" hidden></aside>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>

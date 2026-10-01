@@ -1,0 +1,557 @@
+"""Fill a demo store with made-up pickup appointments in every state, to show the board.
+
+Every vendor, PO, address and email here is invented (``.example`` domains). The cases are built
+the way the agent builds them: a request drafted and sent, a vendor reply read by a scripted
+classifier and checked by the real validator, the conversation policy answering, a person
+approving or booking by phone. Times are spread over the last and next few business days so the
+overview, the list and the week view all have something to show.
+
+    python scripts/seed_booking_demo.py --db sqlite:///./data/booking-demo.db
+    facility-profiles serve --db sqlite:///./data/booking-demo.db
+
+The store must be new or empty: the demo is never mixed into a real store.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import UTC, date, datetime, timedelta
+from zoneinfo import ZoneInfo
+
+from sqlalchemy import func, select, update
+from sqlalchemy.orm import Session
+
+from facility_profiles.booking.classify import FakeReplyClassifier
+from facility_profiles.booking.mail import InboundMessage, RecordingMailer
+from facility_profiles.booking.models import (
+    BookingCase,
+    BookingEvent,
+    BookingMessage,
+    CaseException,
+    ExceptionType,
+)
+from facility_profiles.booking.respond import Responder
+from facility_profiles.booking.schema import ReplyClassification, ReplyStatus
+from facility_profiles.booking.service import (
+    approve,
+    close_case,
+    draft_case,
+    ingest,
+    mark_booked,
+    mark_sent,
+)
+from facility_profiles.booking.worklist import flag, method_exception
+from facility_profiles.config import Settings
+from facility_profiles.storage.db import init_db, make_engine, session_factory, session_scope
+
+ET = ZoneInfo("America/New_York")
+CT = ZoneInfo("America/Chicago")
+CUSTOMER = "Demo Grocer - Inbound"
+DC = "Demo Grocer DC (Harrisburg, PA)"
+INTERNAL = ["circledelivers.com"]
+
+
+def demo_settings(db: str) -> Settings:
+    """Settings for the demo only: no real desk, mailbox or signature is used."""
+    return Settings(
+        _env_file=None,  # type: ignore[call-arg]
+        TPRO_BASE_URL="https://tpro.invalid",
+        TPRO_USERNAME="demo",
+        TPRO_PASSWORD="demo",  # noqa: S106 - a placeholder; the demo never calls Transport Pro
+        database_url=db,
+        booking_sender="booking-demo@example.com",
+        booking_cc=["booking-demo@example.com"],
+        booking_signature="Circle Logistics, Inc. (demo)",
+        booking_customer_desk="inbound@demo-grocer.example",
+        booking_shared_desks=[],
+        booking_po_date_floor_desks=[],
+    )
+
+
+class Demo:
+    """Builds the cases; ``now`` is when the demo pretends it is."""
+
+    def __init__(self, session: Session, settings: Settings, now: datetime) -> None:
+        self.session = session
+        self.settings = settings
+        self.now = now
+        self.today = now.astimezone(ET).date()
+        self.last_step: dict[int, datetime] = {}
+
+    # -- time
+
+    def day(self, offset: int) -> date:
+        """The business day ``offset`` business days from today (negative: before)."""
+        day, step, left = self.today, (1 if offset >= 0 else -1), abs(offset)
+        while day.weekday() >= 5:
+            day += timedelta(days=1)
+        while left:
+            day += timedelta(days=step)
+            if day.weekday() < 5:
+                left -= 1
+        return day
+
+    def at(self, offset: int, clock: str, tz: ZoneInfo = ET) -> datetime:
+        """A moment on a business day, as an aware UTC datetime."""
+        hour, minute = (int(x) for x in clock.split(":"))
+        d = self.day(offset)
+        return datetime(d.year, d.month, d.day, hour, minute, tzinfo=tz).astimezone(UTC)
+
+    def ago(self, hours: float) -> datetime:
+        """A moment ``hours`` before the demo's now."""
+        return self.now - timedelta(hours=hours)
+
+    @contextmanager
+    def step(self, case: BookingCase, when: datetime, *, sent: bool = True) -> Iterator[None]:
+        """Whatever the block writes happened at ``when`` (events, exceptions, messages).
+
+        With ``sent``, a message the agent drafted in the block is treated as sent ten minutes
+        later by the person on duty, so threads read the way they would in the mailbox.
+        """
+        s = self.session
+        s.flush()
+        last_event = s.scalar(select(func.max(BookingEvent.id))) or 0
+        last_exc = s.scalar(select(func.max(CaseException.id))) or 0
+        last_msg = s.scalar(select(func.max(BookingMessage.id))) or 0
+        open_before = {e.id for e in s.scalars(select(CaseException)) if e.resolved_at is None}
+        yield
+        s.flush()
+        for event in s.scalars(select(BookingEvent).where(BookingEvent.id > last_event)):
+            event.created_at = when
+        for exc in s.scalars(select(CaseException).where(CaseException.id > last_exc)):
+            exc.raised_at = when
+            if exc.resolved_at is not None:
+                exc.resolved_at = when
+        for exc in s.scalars(select(CaseException).where(CaseException.id.in_(open_before))):
+            if exc.resolved_at is not None:
+                exc.resolved_at = when
+        for message in s.scalars(select(BookingMessage).where(BookingMessage.id > last_msg)):
+            message.created_at = when
+            if sent and message.direction == "out" and message.sent_at is None:
+                message.sent_at = when + timedelta(minutes=10)
+                message.draft_ref = None
+        self.last_step[case.id] = max(when, self.last_step.get(case.id, when))
+        s.flush()
+
+    # -- building blocks
+
+    def case(
+        self,
+        n: int,
+        vendor: str,
+        city: str,
+        *,
+        pickup: tuple[int, str],
+        desk: str | None,
+        method: str | None = "email",
+        tz: ZoneInfo = ET,
+        found: datetime | None = None,
+    ) -> BookingCase:
+        """A case as the scan opens it.
+
+        It is found three business days before the pickup, and never later than three
+        business days ago unless ``found`` says otherwise.
+        """
+        day = self.day(pickup[0])
+        delivery_day = self.day(pickup[0] + 1)
+        delivery = datetime(
+            delivery_day.year, delivery_day.month, delivery_day.day, 7, 30, tzinfo=ET
+        )
+        po = f"77{n:02d}{day:%d%m%y}{n:02d}"
+        case = BookingCase(
+            load_id=2_700_000 + n,
+            waypoint_index=0,
+            customer_id=900,
+            customer_name=CUSTOMER,
+            facility_key=f"demo:{n}",
+            vendor_name=vendor,
+            vendor_city=city,
+            vendor_timezone=tz.key,
+            po_numbers=[po],
+            booking_method=method,
+            contact_email=desk,
+            delivery_site=DC,
+            delivery_ref=f"DG_{delivery_day:%d%m%y}{n:03d}",
+            delivery_at_utc=delivery.astimezone(UTC),
+            tendered_pickup_utc=self.at(pickup[0], pickup[1], tz),
+            requested_local=f"{day:%Y-%m-%d} {pickup[1]}",
+            miles=280,
+        )
+        when = found or self.at(min(pickup[0] - 3, -3), "07:05")
+        with self.step(case, when):
+            self.session.add(case)
+            self.session.flush()
+            case.created_at = when
+            case.events.append(BookingEvent(action="scanned", detail={"status": case.status}))
+        return case
+
+    def send(self, case: BookingCase, when: datetime) -> None:
+        """The request drafted by the agent and sent by the person on duty."""
+        with self.step(case, when, sent=False):
+            draft_case(self.session, case, RecordingMailer(), self.settings, now=when)
+            mark_sent(
+                self.session,
+                case,
+                by="Demo user",
+                thread_id=f"demo-thread-{case.id}",
+                rfc_message_id=f"<demo-request-{case.id}@booking-demo.example>",
+                sent_at=when + timedelta(minutes=5),
+            )
+
+    def reply(
+        self,
+        case: BookingCase,
+        when: datetime,
+        body: str,
+        reading: ReplyClassification,
+        *,
+        respond: bool = True,
+    ) -> None:
+        """A vendor reply, read by a scripted classifier and checked by the real validator."""
+        message = InboundMessage(
+            message_id=f"demo-reply-{case.id}-{int(when.timestamp())}",
+            thread_id=f"demo-thread-{case.id}",
+            sent_at=when,
+            from_addr=f"Appointments desk <{case.contact_email}>",
+            to_addr="Booking desk <booking-demo@example.com>",
+            cc_addr="booking-demo@example.com",
+            subject=f"Re: Pick Up Appointment: {case.po_numbers[0]}",
+            body=body,
+            rfc_message_id=f"<demo-reply-{case.id}-{int(when.timestamp())}@vendor.example>",
+        )
+        responder = Responder(self.settings, RecordingMailer(), now=when) if respond else None
+        with self.step(case, when):
+            ingest(
+                self.session,
+                [message],
+                FakeReplyClassifier(lambda _ctx: reading),
+                internal_domains=INTERNAL,
+                responder=responder,
+            )
+
+    @staticmethod
+    def mmdd(d: date) -> str:
+        """A date the way desks write it: MM/DD."""
+        return f"{d:%m/%d}"
+
+
+def build(demo: Demo) -> int:
+    """Seventeen cases, one per situation the board has to show."""
+    s, d = demo.session, demo
+    made = 0
+
+    # Booked: confirmed by the vendor and approved by a person.
+    c = d.case(
+        1,
+        "Harbor Beverage Co.",
+        "Baltimore, MD",
+        pickup=(1, "08:00"),
+        desk="appointments@harborbev.example",
+    )
+    d.send(c, d.at(-2, "10:15"))
+    text = f"Confirmed for {d.mmdd(d.day(1))} @ 0800. Pickup# 44710"
+    d.reply(
+        c,
+        d.at(-1, "09:40"),
+        text,
+        ReplyClassification(
+            status=ReplyStatus.CONFIRMED,
+            pickup_date=f"{d.day(1)}",
+            pickup_time="08:00",
+            pickup_number="44710",
+            quotes=[text],
+            confidence=0.95,
+        ),
+    )
+    with d.step(c, d.at(-1, "11:05")):
+        approve(s, c, by="Demo user")
+    made += 1
+
+    # Confirmed by the vendor, waiting for a person's approval.
+    c = d.case(
+        2, "Ridgeline Snacks", "Hanover, PA", pickup=(2, "10:00"), desk="shipping@ridgeline.example"
+    )
+    d.send(c, d.at(-1, "14:00"))
+    text = f"SET! {d.mmdd(d.day(2))} @ 1000 PU# 55120"
+    d.reply(
+        c,
+        d.ago(2),
+        text,
+        ReplyClassification(
+            status=ReplyStatus.CONFIRMED,
+            pickup_date=f"{d.day(2)}",
+            pickup_time="10:00",
+            pickup_number="55120",
+            quotes=[text],
+            confidence=0.9,
+        ),
+    )
+    made += 1
+
+    # The vendor offered another time; the agent accepted it because it makes the delivery.
+    c = d.case(
+        3,
+        "Cedar Mill Grains",
+        "Ripon, WI",
+        pickup=(3, "09:00"),
+        desk="dock@cedarmill.example",
+        tz=CT,
+    )
+    d.send(c, d.at(-1, "15:30"))
+    offer = f"I have {d.mmdd(d.day(3))} at 1300"
+    d.reply(
+        c,
+        d.ago(5),
+        f"We are full that morning. {offer}.",
+        ReplyClassification(
+            status=ReplyStatus.COUNTER_OFFER,
+            pickup_date=f"{d.day(3)}",
+            pickup_time="13:00",
+            quotes=[offer],
+            confidence=0.85,
+        ),
+    )
+    made += 1
+
+    # A money question the agent will not answer: handed to a person.
+    c = d.case(
+        4, "Bluewater Foods", "Erlanger, KY", pickup=(2, "07:00"), desk="cci@bluewater.example"
+    )
+    d.send(c, d.at(-1, "09:00"))
+    question = "Who pays the lumper fee at our dock?"
+    d.reply(
+        c,
+        d.ago(1),
+        question,
+        ReplyClassification(
+            status=ReplyStatus.QUESTION, question=question, quotes=[question], confidence=0.9
+        ),
+    )
+    made += 1
+
+    # A factual question the agent answered from the load; waiting on the vendor again.
+    c = d.case(
+        5,
+        "Granite State Foods",
+        "Manchester, NH",
+        pickup=(4, "11:00"),
+        desk="appts@granitestate.example",
+    )
+    d.send(c, d.at(-2, "08:30"))
+    question = "Which carrier is picking this up?"
+    d.reply(
+        c,
+        d.at(-1, "16:10"),
+        question,
+        ReplyClassification(
+            status=ReplyStatus.QUESTION, question=question, quotes=[question], confidence=0.9
+        ),
+    )
+    made += 1
+
+    # Sent this morning, no answer yet.
+    c = d.case(
+        6,
+        "Summit Springs Water",
+        "Fitzgerald, GA",
+        pickup=(5, "09:00"),
+        desk="orders@summitsprings.example",
+    )
+    d.send(c, d.ago(4))
+    made += 1
+
+    # The vendor asked to be asked again later.
+    c = d.case(
+        7,
+        "Lakeshore Dairy",
+        "Oshkosh, WI",
+        pickup=(6, "08:00"),
+        desk="loads@lakeshore.example",
+        tz=CT,
+    )
+    d.send(c, d.at(-1, "13:00"))
+    later = f"please check back on {d.mmdd(d.day(1))}"
+    d.reply(
+        c,
+        d.ago(6),
+        f"PO is not released yet, {later}.",
+        ReplyClassification(
+            status=ReplyStatus.DEFERRED, pickup_date=f"{d.day(1)}", quotes=[later], confidence=0.85
+        ),
+    )
+    made += 1
+
+    # The vendor cannot ship as asked; the agent drafted a note to the customer's desk.
+    c = d.case(
+        8,
+        "Prairie Pasta Co.",
+        "Lebanon, PA",
+        pickup=(3, "14:00"),
+        desk="shipping@prairiepasta.example",
+    )
+    d.send(c, d.at(-1, "10:00"))
+    text = "We cannot ship this PO until next week, the order is not ready."
+    d.reply(
+        c,
+        d.ago(3),
+        text,
+        ReplyClassification(
+            status=ReplyStatus.REJECTED, question=text, quotes=[text], confidence=0.9
+        ),
+    )
+    made += 1
+
+    # No booking desk on the vendor's profile.
+    c = d.case(9, "Oak Valley Produce", "Vineland, NJ", pickup=(4, "09:00"), desk=None, method=None)
+    with d.step(c, c.created_at):
+        kind, why = method_exception(None)
+        flag(s, c, kind, why)
+    made += 1
+
+    # The vendor books on a portal, which the agent cannot use.
+    c = d.case(
+        10,
+        "Northgate Paper",
+        "Green Bay, WI",
+        pickup=(5, "13:00"),
+        desk=None,
+        method="web_portal",
+        tz=CT,
+    )
+    with d.step(c, c.created_at):
+        kind, why = method_exception("web_portal")
+        flag(s, c, kind, why, method="web_portal")
+    made += 1
+
+    # Drafted by the agent an hour ago; nobody has sent it yet.
+    c = d.case(
+        11,
+        "Riverbend Bottling",
+        "Harrisburg, PA",
+        pickup=(6, "10:00"),
+        desk="dispatch@riverbend.example",
+        found=d.ago(26),
+    )
+    with d.step(c, d.ago(1), sent=False):
+        draft_case(s, c, RecordingMailer(), d.settings, now=d.ago(1))
+    made += 1
+
+    # Found on a load, nothing asked yet.
+    c = d.case(
+        12,
+        "Copper Ridge Canning",
+        "Lancaster, PA",
+        pickup=(8, "09:00"),
+        desk="shipping@copperridge.example",
+        found=d.ago(3),
+    )
+    made += 1
+
+    # Asked days ago, never answered, and the pickup time has passed.
+    c = d.case(
+        13,
+        "Elm Street Bakery",
+        "Allentown, PA",
+        pickup=(-1, "09:00"),
+        desk="orders@elmstreet.example",
+    )
+    d.send(c, d.at(-4, "10:00"))
+    made += 1
+
+    # Booked by phone by a person; the board records it.
+    c = d.case(
+        14, "Maple Leaf Imports", "Buffalo, NY", pickup=(3, "12:00"), desk="appts@mapleleaf.example"
+    )
+    with d.step(c, d.at(-1, "15:20")):
+        day = d.day(3)
+        mark_booked(
+            s,
+            c,
+            by="Demo user",
+            via="phone",
+            local=f"{day:%Y-%m-%d} 12:00",
+            pickup_number="TEL20811",
+            note="no email slots left, booked with the desk",
+        )
+    made += 1
+
+    # No longer needed.
+    c = d.case(
+        15, "Willow Creek Farms", "York, PA", pickup=(2, "09:00"), desk="loads@willowcreek.example"
+    )
+    d.send(c, d.at(-2, "09:30"))
+    with d.step(c, d.at(-1, "12:00")):
+        close_case(s, c, by="Demo user", reason="load canceled by the customer")
+    made += 1
+
+    # A "confirmation" of yesterday's slot, written today: a work-in note for a person.
+    c = d.case(
+        16, "Bayside Seafood", "Salisbury, MD", pickup=(-1, "09:00"), desk="dock@bayside.example"
+    )
+    d.send(c, d.at(-3, "11:00"))
+    text = f"Confirmed {d.mmdd(d.day(-1))} @ 0900, latest is 9pm tonight"
+    d.reply(
+        c,
+        d.ago(2),
+        text,
+        ReplyClassification(
+            status=ReplyStatus.CONFIRMED,
+            pickup_date=f"{d.day(-1)}",
+            pickup_time="09:00",
+            quotes=[text],
+            confidence=0.6,
+        ),
+    )
+    made += 1
+
+    # The slot to ask for had already passed when the load was found.
+    c = d.case(
+        17,
+        "Sunrise Citrus",
+        "Lakeland, FL",
+        pickup=(-1, "06:00"),
+        desk="appointments@sunrise.example",
+        found=d.ago(1),
+    )
+    with d.step(c, d.ago(1)):
+        flag(
+            s,
+            c,
+            ExceptionType.SLOT_UNWORKABLE,
+            f"requested slot {c.requested_local} has already passed",
+            requested=c.requested_local,
+        )
+    made += 1
+
+    # Each case's last change is when its last step happened, not when the demo was built.
+    for case_id, when in demo.last_step.items():
+        s.execute(update(BookingCase).where(BookingCase.id == case_id).values(updated_at=when))
+    return made
+
+
+def main() -> int:
+    """Seed the demo store named by --db."""
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--db", default="sqlite:///./data/booking-demo.db", help="demo store URL")
+    args = parser.parse_args()
+    settings = demo_settings(args.db)
+    engine = make_engine(args.db)
+    init_db(engine)
+    sessions = session_factory(engine)
+    with session_scope(sessions) as session:
+        existing = session.scalar(select(func.count()).select_from(BookingCase)) or 0
+        if existing:
+            print(f"{args.db} already has {existing} cases; the demo only goes into an empty store")
+            return 1
+        made = build(Demo(session, settings, datetime.now(tz=UTC)))
+    engine.dispose()
+    print(f"{made} demo cases in {args.db}")
+    print(f"run: facility-profiles serve --db {args.db}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

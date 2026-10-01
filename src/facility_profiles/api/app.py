@@ -1,20 +1,26 @@
-"""FastAPI lookup page and review endpoints (FR-10, FR-11).
+"""FastAPI lookup page and review endpoints (FR-10, FR-11), and the appointments board.
 
-Run with ``uvicorn facility_profiles.api.app:create_app --factory``. Authentication is left to
-the reverse proxy / single sign-on in front of this service (see the NFR section of the PRD).
+Run with ``facility-profiles serve`` (or ``uvicorn facility_profiles.api.app:create_app
+--factory``); the board is at ``/app/`` and its API under ``/api/booking``. Authentication is
+left to the reverse proxy / single sign-on in front of this service (see the NFR section of the
+PRD).
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterator
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from facility_profiles import __version__
+from facility_profiles.api import booking as booking_api
 from facility_profiles.config import Settings, get_settings
 from facility_profiles.pipeline.collect import identity_from_record
 from facility_profiles.pipeline.digest import render_digest
@@ -22,6 +28,8 @@ from facility_profiles.pipeline.profile import profile_from_records
 from facility_profiles.review.queue import ReviewError, ReviewService
 from facility_profiles.storage.db import init_db, make_engine, session_factory
 from facility_profiles.storage.repository import Repository, unwrap
+
+BOARD = Path(__file__).parent / "static"
 
 
 class Decision(BaseModel):
@@ -51,6 +59,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             session.close()
 
     app = FastAPI(title="Facility scheduling profiles", version=__version__)
+    app.state.sessions = sessions
+    app.include_router(booking_api.router)
+    app.mount("/app", StaticFiles(directory=BOARD, html=True), name="board")
+
+    @app.get("/", include_in_schema=False)
+    def home() -> RedirectResponse:
+        return RedirectResponse("/app/")
 
     @app.get("/health")
     def health() -> dict[str, str]:

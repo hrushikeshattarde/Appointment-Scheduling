@@ -109,6 +109,29 @@ def init_db_cmd() -> None:
     typer.echo(f"schema ready at {settings.database_url}")
 
 
+@app.command()
+def serve(
+    host: Annotated[str, typer.Option(help="Interface to listen on")] = "127.0.0.1",
+    port: Annotated[int, typer.Option(help="Port to listen on")] = 8000,
+    db: Annotated[
+        str | None, typer.Option(help="Store to serve, e.g. sqlite:///./data/<pod>.db")
+    ] = None,
+) -> None:
+    """Run the appointments board (/app/) and the HTTP API. Needs the api extra."""
+    try:
+        import uvicorn
+    except ImportError as exc:
+        typer.echo("the board needs the api extra: uv sync --extra api")
+        raise typer.Exit(code=2) from exc
+    from facility_profiles.api.app import create_app
+
+    settings = _settings()
+    if db:
+        settings = settings.model_copy(update={"database_url": db})
+    typer.echo(f"appointments board: http://{host}:{port}/app/  (store {settings.database_url})")
+    uvicorn.run(create_app(settings), host=host, port=port, log_level="warning")
+
+
 @app.command("check-tpro")
 def check_tpro() -> None:
     """Authenticate against Transport Pro and read one terminal (read-only smoke test)."""

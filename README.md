@@ -65,7 +65,7 @@ MCP server, so the existing file can be reused. Never commit `.env`.
 | `facility-profiles export-xlsx [--out file.xlsx] [--facility F ...]` | Reviewer workbook: a Review Queue sheet with Decision (accept/edit/reject), Corrected value and Reviewer columns, plus Profile Fields, Scheduling Summaries, Facilities, Audit Log and Runs sheets. `--facility` (repeatable) restricts every sheet to those facilities, for a focused hand-off. |
 | `facility-profiles review import file.xlsx [--by NAME] [--dry-run]` | Reads the filled-in Review Queue sheet and applies each decision as a human-set value; rows with a blank Decision are skipped and problems are listed per row. |
 | `facility-profiles digest [--out file.md]` | Markdown digest for the pod lead: what the run did, what needs a decision (FR-13). |
-| `uvicorn facility_profiles.api.app:create_app --factory` | Lookup and review HTTP API (`/facilities/{id}`, `/facilities?name=`, `/review`, `/digest`). Needs the `api` extra. |
+| `facility-profiles serve [--db URL] [--port 8000]` | The appointments board at `/app/` (see below) plus the lookup and review HTTP API (`/facilities/{id}`, `/facilities?name=`, `/review`, `/digest`) and the board's API under `/api/booking`. Needs the `api` extra. `uvicorn facility_profiles.api.app:create_app --factory` serves the same app. |
 
 Run modes: `FP_MODE=recommend` (default; qualifying fields are stored as recommendations and
 audited as `recommend`) or `FP_MODE=write`. Switching back to `recommend` is the kill switch
@@ -137,6 +137,31 @@ facility-profiles booking approve 12 --by megan
 facility-profiles booking resolve 12 facility_question --by megan --note "answered by phone"
 facility-profiles booking booked 12 --by megan --via phone --date 2026-10-05 --time 09:00
 ```
+
+### Appointments board
+
+A web page for account managers and the pod to keep track of every pickup appointment, on the
+same store the agent writes. Start it with `facility-profiles serve --db <store>` and open
+`http://127.0.0.1:8000/app/`.
+
+- **Overview**: what needs a person (with what to do about it), pickups whose time passed without
+  a booking, what is coming up in the next seven days, totals, and to-dos by type. Every tile and
+  bar opens the matching list.
+- **Appointments**: every case by pickup time, filtered by status, to-do, customer, pickup dates
+  and past due, and searched by PO, load, vendor, pickup number or delivery reference.
+- **This week**: a calendar of pickups by day, coloured by status, with to-do counts.
+- **One case** (a side panel): progress (not requested, requested, booked), the open to-dos with
+  a hint each, the appointment's facts, the email thread with how the agent read each reply, and
+  a timeline of events and to-dos. Actions: approve the vendor's confirmation, resolve a to-do
+  with a note, mark a pickup booked another way (phone, portal, email), cancel. Each decision is
+  recorded under the name entered in the page.
+
+The board never sends mail and never writes to Transport Pro; approving records the decision as
+`booking approve` does. It has no login of its own: keep it on `127.0.0.1`, or put it behind the
+company's single sign-on before anyone else can reach it. One server shows one store, so run one
+per pod (`--db`) until the stores move to Postgres. To show it without real data,
+`python scripts/seed_booking_demo.py --db sqlite:///./data/booking-demo.db` fills a new store with
+17 invented cases, one per situation, built through the agent's own code.
 
 ### Status and exceptions
 
