@@ -3,8 +3,9 @@
 Every vendor, PO, address and email here is invented (``.example`` domains). The cases are built
 the way the agent builds them: a request drafted and sent, a vendor reply read by a scripted
 classifier and checked by the real validator, the conversation policy answering, a person
-approving or booking by phone. Times are spread over the last and next few business days so the
-overview, the list and the week view all have something to show.
+approving or booking by phone, the timers raising what time alone brings. Times are spread over
+the last and next few business days so the overview, the list, the week view and the daily
+summary all have something to show.
 
     python scripts/seed_booking_demo.py --db sqlite:///./data/booking-demo.db
     facility-profiles serve --db sqlite:///./data/booking-demo.db
@@ -43,6 +44,7 @@ from facility_profiles.booking.service import (
     mark_booked,
     mark_sent,
 )
+from facility_profiles.booking.timers import sweep
 from facility_profiles.booking.worklist import flag, method_exception
 from facility_profiles.config import Settings
 from facility_profiles.storage.db import init_db, make_engine, session_factory, session_scope
@@ -103,6 +105,15 @@ class Demo:
     def ago(self, hours: float) -> datetime:
         """A moment ``hours`` before the demo's now."""
         return self.now - timedelta(hours=hours)
+
+    def weekday_hours_ago(self, hours: float) -> datetime:
+        """A moment ``hours`` Monday-to-Friday hours before now, the way the timers count."""
+        at, left, step = self.now, hours, timedelta(minutes=15)
+        while left > 0:
+            at -= step
+            if at.astimezone(ET).weekday() < 5:
+                left -= 0.25
+        return at
 
     @contextmanager
     def step(self, case: BookingCase, when: datetime, *, sent: bool = True) -> Iterator[None]:
@@ -239,7 +250,7 @@ class Demo:
 
 
 def build(demo: Demo) -> int:
-    """Seventeen cases, one per situation the board has to show."""
+    """Twenty cases, one per situation the board has to show."""
     s, d = demo.session, demo
     made = 0
 
@@ -344,7 +355,7 @@ def build(demo: Demo) -> int:
     question = "Which carrier is picking this up?"
     d.reply(
         c,
-        d.at(-1, "16:10"),
+        d.ago(5),
         question,
         ReplyClassification(
             status=ReplyStatus.QUESTION, question=question, quotes=[question], confidence=0.9
@@ -525,6 +536,59 @@ def build(demo: Demo) -> int:
             requested=c.requested_local,
         )
     made += 1
+
+    # Sent the day before, no answer for 24 weekday hours: the timer raises it.
+    c = d.case(
+        18,
+        "Keystone Pretzel Co.",
+        "Lititz, PA",
+        pickup=(3, "08:00"),
+        desk="shipping@keystonepretzel.example",
+    )
+    d.send(c, d.weekday_hours_ago(30))
+    made += 1
+
+    # Sent two business days ago, still no answer: past 48 weekday hours.
+    c = d.case(
+        19,
+        "Delta Rice Mills",
+        "Stuttgart, AR",
+        pickup=(4, "09:00"),
+        desk="orders@deltarice.example",
+        tz=CT,
+        found=d.weekday_hours_ago(60),
+    )
+    d.send(c, d.weekday_hours_ago(56))
+    made += 1
+
+    # The vendor confirmed, but a day later than asked: raised with the confirmation.
+    c = d.case(
+        20,
+        "Harvest Moon Oats",
+        "Cedar Rapids, IA",
+        pickup=(2, "08:00"),
+        desk="loading@harvestmoon.example",
+        tz=CT,
+    )
+    d.send(c, d.at(-1, "11:00"))
+    text = f"We can load you {d.mmdd(d.day(3))} @ 1300. PU# 66210"
+    d.reply(
+        c,
+        d.ago(3),
+        text,
+        ReplyClassification(
+            status=ReplyStatus.CONFIRMED,
+            pickup_date=f"{d.day(3)}",
+            pickup_time="13:00",
+            pickup_number="66210",
+            quotes=[text],
+            confidence=0.9,
+        ),
+    )
+    made += 1
+
+    # The timers run as they would on the server: what went silent, what slipped.
+    sweep(s, now=d.now)
 
     # Each case's last change is when its last step happened, not when the demo was built.
     for case_id, when in demo.last_step.items():

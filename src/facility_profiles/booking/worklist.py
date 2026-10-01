@@ -3,7 +3,9 @@
 A case's status says where the appointment stands; this module records what a person has to do
 about it. The agent raises an exception wherever it would otherwise park the case for a person,
 and resolves it when the situation clears (an answered question, an accepted offer, a pickup
-asked for again). A person resolves one with a note (``booking resolve``).
+asked for again). Its timers (``booking/timers.py``) raise what time alone brings: a vendor's
+silence, a pickup time that passed unbooked. A person resolves one with a note (``booking
+resolve``).
 
 Stores written before the split kept those attention states in the status column
 (``needs_profile``, ``needs_human``, ``proposed`` ...). :func:`migrate_legacy_statuses` moves such
@@ -32,23 +34,86 @@ from facility_profiles.logging import get_logger
 
 log = get_logger(__name__)
 
-# A reply about the slot (a confirmation, an offer, a deferral, a decline) replaces whatever an
-# earlier reply left open about it, and an open question with it: the vendor has moved on.
-SLOT_REPLY_SUPERSEDES: frozenset[ExceptionType] = frozenset(
-    {
-        ExceptionType.CONFIRMATION_REVIEW,
-        ExceptionType.PROPOSED_TIME_REVIEW,
-        ExceptionType.FACILITY_DECLINED,
-        ExceptionType.STALE_CONFIRMATION,
-        ExceptionType.FACILITY_QUESTION,
-        ExceptionType.HANDOFF,
-    }
+# What each exception means to the person who has to act on it, and what to do about it. The
+# board and the daily summary both use these words.
+KINDS: dict[str, tuple[str, str]] = {
+    "missing_method": (
+        "No booking desk",
+        "Find the vendor's appointment desk, or book by phone and mark it booked.",
+    ),
+    "method_not_supported": (
+        "Books by portal or phone",
+        "Book it on the vendor's portal or by phone, then mark it booked.",
+    ),
+    "slot_unworkable": (
+        "Slot will not work",
+        "Pick a new pickup slot with the vendor, or ask the customer to move the delivery.",
+    ),
+    "confirmation_review": (
+        "Approve confirmation",
+        "Check the vendor's reply below, then approve the slot.",
+    ),
+    "proposed_time_review": (
+        "Vendor offered another time",
+        "Reply to the vendor to accept or ask for another time; mark it booked once agreed.",
+    ),
+    "facility_question": ("Vendor question", "Answer the vendor, then resolve this."),
+    "facility_declined": (
+        "Vendor cannot book",
+        "Ask the customer to move the delivery or find the vendor another day.",
+    ),
+    "stale_confirmation": (
+        "Late confirmation",
+        "The slot had passed when the vendor wrote; read it as a work-in note and rebook.",
+    ),
+    "delivery_moved": (
+        "Delivery moved",
+        "Ask the vendor for a pickup that makes the new delivery.",
+    ),
+    "handoff": ("Handed to a person", "Read the thread and decide the next step."),
+    "unanswered_24h": (
+        "No reply in 24 h",
+        "Chase the vendor: send the follow-up or call the desk. This clears when they answer.",
+    ),
+    "unanswered_48h": (
+        "No reply in 48 h",
+        "Call the vendor's desk; if they book by phone, mark it booked with the slot.",
+    ),
+    "pickup_expired": (
+        "Pickup time passed",
+        "If the truck picked up, mark it booked; if it still has to move, agree a new day "
+        "with the vendor; if it is no longer needed, cancel it.",
+    ),
+    "confirmed_outside_window": (
+        "Confirmed a different time",
+        "The vendor confirmed a time we did not ask for. Check it still makes the delivery "
+        "before you approve it.",
+    ),
+}
+# The vendor's silence: raised by the no-reply timers, cleared by any answer from the vendor.
+UNANSWERED: frozenset[ExceptionType] = frozenset(
+    {ExceptionType.UNANSWERED_24H, ExceptionType.UNANSWERED_48H}
 )
+# Everything the timers raise. Booking the pickup settles all of them.
+TIMER_KINDS: frozenset[ExceptionType] = UNANSWERED | {ExceptionType.PICKUP_EXPIRED}
+# A reply about the slot (a confirmation, an offer, a deferral, a decline) replaces whatever an
+# earlier reply left open about it, and an open question with it: the vendor has moved on. Any
+# answer also ends the vendor's silence.
+SLOT_REPLY_SUPERSEDES: frozenset[ExceptionType] = UNANSWERED | {
+    ExceptionType.CONFIRMATION_REVIEW,
+    ExceptionType.CONFIRMED_OUTSIDE_WINDOW,
+    ExceptionType.PROPOSED_TIME_REVIEW,
+    ExceptionType.FACILITY_DECLINED,
+    ExceptionType.STALE_CONFIRMATION,
+    ExceptionType.FACILITY_QUESTION,
+    ExceptionType.HANDOFF,
+}
 # A question replaces an earlier open question only. "Which carrier?" after a confirmation
 # leaves the confirmation waiting for approval; after a decline, the decline stays open.
-QUESTION_SUPERSEDES: frozenset[ExceptionType] = frozenset(
-    {ExceptionType.FACILITY_QUESTION, ExceptionType.HANDOFF}
-)
+QUESTION_SUPERSEDES: frozenset[ExceptionType] = UNANSWERED | {
+    ExceptionType.FACILITY_QUESTION,
+    ExceptionType.HANDOFF,
+}
 # Booking methods a profile can name that the agent cannot use: it only books by email.
 MANUAL_METHODS = {
     "web_portal": "books on a web portal",
@@ -76,9 +141,13 @@ def flag(
     description: str,
     *,
     actor: str = "agent",
+    at: datetime | None = None,
     **detail: Any,
 ) -> CaseException:
-    """Raise an exception on the case; an open one of the same kind is refreshed instead."""
+    """Raise an exception on the case; an open one of the same kind is refreshed instead.
+
+    ``at`` dates a new exception (the timers pass their clock); the default is now.
+    """
     current = open_exceptions(case, kind)
     if current:
         exc = current[0]
@@ -89,17 +158,24 @@ def flag(
     exc = CaseException(
         kind=kind.value, description=description[:255], detail=detail, raised_by=actor
     )
+    if at is not None:
+        exc.raised_at = at
     case.exceptions.append(exc)
     session.flush()
     return exc
 
 
 def _close(
-    session: Session, exceptions: list[CaseException], *, resolution: str, by: str
+    session: Session,
+    exceptions: list[CaseException],
+    *,
+    resolution: str,
+    by: str,
+    at: datetime | None = None,
 ) -> list[str]:
-    now = datetime.now(tz=UTC)
+    when = at or datetime.now(tz=UTC)
     for exc in exceptions:
-        exc.resolved_at = now
+        exc.resolved_at = when
         exc.resolved_by = by
         exc.resolution = resolution[:255]
     if exceptions:
@@ -114,16 +190,22 @@ def resolve(
     *,
     resolution: str,
     by: str = "agent",
+    at: datetime | None = None,
 ) -> list[str]:
     """Resolve the open exceptions of those kinds; return the kinds resolved."""
-    return _close(session, open_exceptions(case, *kinds), resolution=resolution, by=by)
+    return _close(session, open_exceptions(case, *kinds), resolution=resolution, by=by, at=at)
 
 
 def resolve_all(
-    session: Session, case: BookingCase, *, resolution: str, by: str = "agent"
+    session: Session,
+    case: BookingCase,
+    *,
+    resolution: str,
+    by: str = "agent",
+    at: datetime | None = None,
 ) -> list[str]:
     """Resolve every open exception on the case; return the kinds resolved."""
-    return _close(session, case.open_exceptions, resolution=resolution, by=by)
+    return _close(session, case.open_exceptions, resolution=resolution, by=by, at=at)
 
 
 def annotate(session: Session, case: BookingCase, note: str) -> CaseException | None:

@@ -198,6 +198,7 @@ const state = {
   weekStart: mondayOf(startOfToday()),
   kinds: [],
   refocus: null,
+  summaryOpen: false,
 };
 
 function parseHash() {
@@ -291,7 +292,11 @@ function caseRow(row) {
 // ------------------------------------------------------------------ overview
 
 async function renderOverview() {
-  const data = await api(`/overview${query({ customer: state.customer })}`);
+  const scope = query({ customer: state.customer });
+  const [data, summary] = await Promise.all([
+    api(`/overview${scope}`),
+    state.summaryOpen ? api(`/today${scope}`) : null,
+  ]);
   const c = data.counts;
   const tile = (key, label, sub, filter, tone) =>
     h(
@@ -302,7 +307,17 @@ async function renderOverview() {
       h("div", { class: "sub" }, sub),
     );
   view.replaceChildren(
-    h("h1", {}, "Overview"),
+    h(
+      "div",
+      { class: "page-head" },
+      h("h1", {}, "Overview"),
+      h(
+        "button",
+        { class: "btn", type: "button", "aria-expanded": String(state.summaryOpen), onclick: toggleSummary },
+        state.summaryOpen ? "Hide daily summary" : "Daily summary",
+      ),
+    ),
+    ...(summary ? [summaryPanel(summary)] : []), // replaceChildren would print a null
     h(
       "section",
       { class: "tiles", "aria-label": "Totals" },
@@ -349,6 +364,34 @@ async function renderOverview() {
       panel("To-dos by type", "", data.todos_by_kind.length ? bars(data.todos_by_kind) : empty("No open to-dos.")),
     ),
   );
+}
+
+// The morning summary as text, ready to paste into an email or a chat.
+function summaryPanel(summary) {
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(summary.text);
+      toast("Summary copied");
+    } catch {
+      toast("Could not copy here; select the text instead.", true);
+    }
+  };
+  return h(
+    "section",
+    { class: "panel summary", "aria-label": "Daily summary" },
+    h(
+      "header",
+      {},
+      h("h2", {}, `Daily summary · ${summary.local_time}`),
+      h("div", { class: "acts" }, h("button", { class: "btn small", type: "button", onclick: copy }, "Copy")),
+    ),
+    h("pre", {}, summary.text),
+  );
+}
+
+function toggleSummary() {
+  state.summaryOpen = !state.summaryOpen;
+  renderTab();
 }
 
 function todoRow(todo) {

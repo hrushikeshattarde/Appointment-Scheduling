@@ -39,7 +39,7 @@ from facility_profiles.booking.models import (
 )
 from facility_profiles.booking.outbox import dispatch
 from facility_profiles.booking.schema import ReplyClassification, ReplyStatus
-from facility_profiles.booking.worklist import annotate, flag, resolve
+from facility_profiles.booking.worklist import UNANSWERED, annotate, flag, resolve
 from facility_profiles.config import Settings
 from facility_profiles.extraction.llm import ExtractionError
 from facility_profiles.extraction.openrouter import (
@@ -503,7 +503,8 @@ class Responder:
         )
         case.messages.append(message)
         session.flush()
-        ref = dispatch(session, case, message, self.mailer, draft).ref
+        delivery = dispatch(session, case, message, self.mailer, draft)
+        ref = delivery.ref
         if plan.intent == ResponseIntent.ACCEPT_OFFER and plan.proposed_local:
             day, _, clock = plan.proposed_local.partition(" ")
             start = local_dt(day, clock or None, case.vendor_timezone).astimezone(UTC)
@@ -546,6 +547,8 @@ class Responder:
             )
         elif plan.intent == ResponseIntent.FOLLOW_UP:
             case.status = CaseStatus.PENDING.value
+            if delivery.sent:  # a draft has not chased anyone yet; a sent follow-up has
+                resolve(session, case, [ExceptionType.UNANSWERED_24H], resolution="follow-up sent")
         elif plan.intent == ResponseIntent.ACKNOWLEDGE:
             pass  # the case already moved on the confirmation itself
         else:  # escalation: a person sends it; the decline stays open until the delivery moves
@@ -574,10 +577,14 @@ class Responder:
     def follow_up(self, session: Session, case: BookingCase) -> BookingMessage | None:
         """Nudge once when a sent request has had no reply for the configured time.
 
-        Only a pending case with nothing open is nudged: a confirmation waiting for approval or
-        a question waiting for a person is not the vendor's silence.
+        Only a pending case with nothing open but the vendor's silence itself is nudged: a
+        confirmation waiting for approval or a question waiting for a person is not the
+        vendor's silence.
         """
-        if case.status != CaseStatus.PENDING.value or case.open_exceptions:
+        silence = {k.value for k in UNANSWERED}
+        if case.status != CaseStatus.PENDING.value or any(
+            e.kind not in silence for e in case.open_exceptions
+        ):
             return None
         outbound = [m for m in case.messages if m.direction == "out"]
         if not outbound or any(m.kind == ResponseIntent.FOLLOW_UP.value for m in outbound):

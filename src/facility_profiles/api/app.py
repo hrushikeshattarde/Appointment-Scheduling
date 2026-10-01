@@ -1,35 +1,42 @@
 """FastAPI lookup page and review endpoints (FR-10, FR-11), and the appointments board.
 
 Run with ``facility-profiles serve`` (or ``uvicorn facility_profiles.api.app:create_app
---factory``); the board is at ``/app/`` and its API under ``/api/booking``. Authentication is
-left to the reverse proxy / single sign-on in front of this service (see the NFR section of the
-PRD).
+--factory``); the board is at ``/app/`` and its API under ``/api/booking``. ``serve`` also runs
+the booking timers every few minutes, so the board shows a vendor's silence or a pickup that
+slipped without anyone running a command. Authentication is left to the reverse proxy / single
+sign-on in front of this service (see the NFR section of the PRD).
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import asyncio
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from facility_profiles import __version__
 from facility_profiles.api import booking as booking_api
+from facility_profiles.booking.timers import sweep
 from facility_profiles.config import Settings, get_settings
+from facility_profiles.logging import get_logger
 from facility_profiles.pipeline.collect import identity_from_record
 from facility_profiles.pipeline.digest import render_digest
 from facility_profiles.pipeline.profile import profile_from_records
 from facility_profiles.review.queue import ReviewError, ReviewService
-from facility_profiles.storage.db import init_db, make_engine, session_factory
+from facility_profiles.storage.db import init_db, make_engine, session_factory, session_scope
 from facility_profiles.storage.repository import Repository, unwrap
 
 BOARD = Path(__file__).parent / "static"
+log = get_logger(__name__)
 
 
 class Decision(BaseModel):
@@ -40,12 +47,37 @@ class Decision(BaseModel):
     by: str
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
-    """Build the application."""
+def run_timers(sessions: sessionmaker[Session]) -> None:
+    """One pass of the booking timers, in its own transaction."""
+    with session_scope(sessions) as session:
+        sweep(session, now=datetime.now(tz=UTC))
+
+
+async def _timer_loop(sessions: sessionmaker[Session], minutes: float) -> None:
+    """Run the timers now and then every ``minutes``; a failed pass is logged, not fatal."""
+    while True:
+        try:
+            await run_in_threadpool(run_timers, sessions)
+        except Exception:  # keep the board serving; the next pass retries
+            log.exception("booking.timers_failed")
+        await asyncio.sleep(minutes * 60)
+
+
+def create_app(settings: Settings | None = None, *, timers_every: float | None = None) -> FastAPI:
+    """Build the application; with ``timers_every`` (minutes) it also runs the booking timers."""
     settings = settings or get_settings()
     engine = make_engine(settings.database_url)
     init_db(engine)
     sessions = session_factory(engine)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        task = asyncio.create_task(_timer_loop(sessions, timers_every)) if timers_every else None
+        yield
+        if task is not None:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
     def get_session() -> Iterator[Session]:
         session = sessions()
@@ -58,8 +90,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             session.close()
 
-    app = FastAPI(title="Facility scheduling profiles", version=__version__)
+    app = FastAPI(title="Facility scheduling profiles", version=__version__, lifespan=lifespan)
     app.state.sessions = sessions
+    app.state.settings = settings
     app.include_router(booking_api.router)
     app.mount("/app", StaticFiles(directory=BOARD, html=True), name="board")
 

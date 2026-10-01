@@ -116,6 +116,8 @@ class Settings(BaseSettings):
     booking_po_date_floor_desks: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["shipping.appointments@morganfoods.com"]
     )
+    # The pod's own time zone: what "today" means in the daily summary (Fort Wayne for Lidl).
+    booking_timezone: str = "America/Indiana/Indianapolis"
 
     # --- Group-mail archive in S3 (Pick Up Appointment threads) ---------------------------
     mail_archive_bucket: str | None = None

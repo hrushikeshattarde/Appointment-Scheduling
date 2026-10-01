@@ -116,6 +116,13 @@ def serve(
     db: Annotated[
         str | None, typer.Option(help="Store to serve, e.g. sqlite:///./data/<pod>.db")
     ] = None,
+    timers_every: Annotated[
+        float,
+        typer.Option(
+            help="Run the booking timers every this many minutes (no reply, pickup passed); "
+            "0 turns them off"
+        ),
+    ] = 15,
 ) -> None:
     """Run the appointments board (/app/) and the HTTP API. Needs the api extra."""
     try:
@@ -129,7 +136,10 @@ def serve(
     if db:
         settings = settings.model_copy(update={"database_url": db})
     typer.echo(f"appointments board: http://{host}:{port}/app/  (store {settings.database_url})")
-    uvicorn.run(create_app(settings), host=host, port=port, log_level="warning")
+    if timers_every > 0:
+        typer.echo(f"booking timers run every {timers_every:g} min")
+    app_ = create_app(settings, timers_every=timers_every if timers_every > 0 else None)
+    uvicorn.run(app_, host=host, port=port, log_level="warning")
 
 
 @app.command("check-tpro")
@@ -883,6 +893,58 @@ def booking_resolve(
             typer.echo(f"#{case_id} has no open {kind.value}")
             raise typer.Exit(code=1)
     typer.echo(f"#{case_id} {kind.value} resolved")
+
+
+@booking_app.command("timers")
+def booking_timers() -> None:
+    """Raise what time alone brings: no reply in 24 h or 48 h, a pickup that passed unbooked.
+
+    Writes to-dos on the store only; nothing is sent and nothing goes to Transport Pro. Each
+    one clears itself when the vendor answers, the pickup moves later or the case is booked.
+    """
+    from facility_profiles.booking.timers import sweep
+
+    settings = _settings()
+    with session_scope(_sessions(settings)) as session:
+        result = sweep(session, now=datetime.now(tz=UTC))
+    for case_id, kind, description in result.raised:
+        typer.echo(f"#{case_id:<4} raised   {kind:<16} {description}")
+    for case_id, kind, why in result.resolved:
+        typer.echo(f"#{case_id:<4} resolved {kind:<16} {why}")
+    typer.echo(
+        f"{result.cases} case(s) checked: {len(result.raised)} raised, "
+        f"{len(result.resolved)} resolved"
+    )
+
+
+@booking_app.command("today")
+def booking_today(
+    customer: Annotated[
+        str | None, typer.Option(help="Only this customer, e.g. 'Lidl - Inbound'")
+    ] = None,
+    out: Annotated[Path | None, typer.Option(help="Also write the summary to this file")] = None,
+    timers: Annotated[
+        bool, typer.Option("--timers/--no-timers", help="Run the timers first, so it is current")
+    ] = True,
+) -> None:
+    """The daily summary: what needs a person, today's pickups, drafts waiting to be sent."""
+    from facility_profiles.booking.service import list_cases
+    from facility_profiles.booking.timers import sweep
+    from facility_profiles.booking.today import render_today, today_summary
+
+    settings = _settings()
+    now = datetime.now(tz=UTC)
+    with session_scope(_sessions(settings)) as session:
+        if timers:
+            sweep(session, now=now)
+        data = today_summary(
+            list_cases(session), now=now, timezone=settings.booking_timezone, customer=customer
+        )
+    text = render_today(data)
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text, encoding="utf-8")
+    typer.echo(text)
 
 
 @mail_app.command("collect")

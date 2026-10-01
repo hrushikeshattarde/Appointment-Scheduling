@@ -279,6 +279,9 @@ def test_stage_says_who_the_case_is_waiting_on():
     deferred = case(CaseStatus.PENDING.value, reason="vendor asked to check back on 2026-10-05")
     assert stage(deferred) == "Vendor asked to check back on 2026-10-05"
     assert stage(case(CaseStatus.PENDING.value)) == "Waiting on the vendor"
+    silent = case(CaseStatus.PENDING.value)
+    silent.exceptions.append(_exception(ExceptionType.UNANSWERED_48H, "no reply"))
+    assert stage(silent) == "Waiting on the vendor: no reply in 48 h"  # not something on us
     blocked = case(CaseStatus.UNSCHEDULED.value)
     blocked.exceptions.append(_exception(ExceptionType.MISSING_METHOD, "no desk"))
     assert stage(blocked) == "Not requested: no booking desk"
@@ -329,24 +332,29 @@ def test_the_demo_seeder_builds_every_situation_and_refuses_a_used_store(
     db = f"sqlite:///{(tmp_path / 'demo.db').as_posix()}"
     monkeypatch.setattr(sys, "argv", ["seed", "--db", db])
     assert module.main() == 0
-    assert "17 demo cases" in capsys.readouterr().out
+    assert "20 demo cases" in capsys.readouterr().out
     engine = make_engine(db)
     with session_scope(session_factory(engine)) as s:
         statuses = sorted(c.status for c in s.query(BookingCase))
         kinds = sorted(e.kind for c in s.query(BookingCase) for e in c.open_exceptions)
     engine.dispose()
     assert statuses.count("scheduled") == 2 and statuses.count("declined") == 1
-    assert statuses.count("canceled") == 1 and len(statuses) == 17
+    assert statuses.count("canceled") == 1 and len(statuses) == 20
     assert kinds == sorted(
         [
             "confirmation_review",
             "confirmation_review",
+            "confirmation_review",
+            "confirmed_outside_window",
             "facility_question",
             "facility_declined",
             "missing_method",
             "method_not_supported",
             "stale_confirmation",
-            "slot_unworkable",
+            "pickup_expired",  # asked days ago, never answered, pickup passed
+            "pickup_expired",  # the slot had passed when found; the expiry replaced it
+            "unanswered_24h",
+            "unanswered_48h",
         ]
     )
     assert module.main() == 1  # never mixed into a store that already has cases

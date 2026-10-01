@@ -1,9 +1,9 @@
 """Booking cases over HTTP, for the appointments board (``/app``) and anything else that reads them.
 
 Read: an overview (what needs a person, what is past due, what is coming up), a filtered list,
-and one case in full (open and resolved exceptions, messages, one timeline). Write: the same
-decisions the CLI offers (approve, resolve, booked, cancel), each recorded with who made it.
-Nothing here sends mail or writes to Transport Pro.
+one case in full (open and resolved exceptions, messages, one timeline), and the daily summary.
+Write: the same decisions the CLI offers (approve, resolve, booked, cancel), each recorded with
+who made it. Nothing here sends mail or writes to Transport Pro.
 """
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ from collections import Counter
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
-from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, StringConstraints
@@ -28,46 +27,12 @@ from facility_profiles.booking.models import (
     ExceptionType,
 )
 from facility_profiles.booking.service import approve, close_case, has_request, mark_booked
-from facility_profiles.booking.worklist import resolve
+from facility_profiles.booking.timers import pickup_passed
+from facility_profiles.booking.today import pickup_slot, render_today, stage, today_summary
+from facility_profiles.booking.worklist import KINDS, resolve
+from facility_profiles.config import Settings, get_settings
 from facility_profiles.storage.repository import as_utc
 
-# What each exception means to the person who has to act on it, and what to do about it.
-KINDS: dict[str, tuple[str, str]] = {
-    "missing_method": (
-        "No booking desk",
-        "Find the vendor's appointment desk, or book by phone and mark it booked.",
-    ),
-    "method_not_supported": (
-        "Books by portal or phone",
-        "Book it on the vendor's portal or by phone, then mark it booked.",
-    ),
-    "slot_unworkable": (
-        "Slot will not work",
-        "Pick a new pickup slot with the vendor, or ask the customer to move the delivery.",
-    ),
-    "confirmation_review": (
-        "Approve confirmation",
-        "Check the vendor's reply below, then approve the slot.",
-    ),
-    "proposed_time_review": (
-        "Vendor offered another time",
-        "Reply to the vendor to accept or ask for another time; mark it booked once agreed.",
-    ),
-    "facility_question": ("Vendor question", "Answer the vendor, then resolve this."),
-    "facility_declined": (
-        "Vendor cannot book",
-        "Ask the customer to move the delivery or find the vendor another day.",
-    ),
-    "stale_confirmation": (
-        "Late confirmation",
-        "The slot had passed when the vendor wrote; read it as a work-in note and rebook.",
-    ),
-    "delivery_moved": (
-        "Delivery moved",
-        "Ask the vendor for a pickup that makes the new delivery.",
-    ),
-    "handoff": ("Handed to a person", "Read the thread and decide the next step."),
-}
 EVENTS: dict[str, str] = {
     "scanned": "Found on a load",
     "po_date_floor": "Moved up to the PO date",
@@ -99,7 +64,6 @@ EVENTS: dict[str, str] = {
     "escalate_to_customer": "Note to the customer desk",
     "status_migrated": "Moved to the new statuses",
 }
-UNBOOKED = (CaseStatus.UNSCHEDULED.value, CaseStatus.PENDING.value, CaseStatus.DECLINED.value)
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -107,57 +71,8 @@ def _iso(value: datetime | None) -> str | None:
     return aware.isoformat() if aware else None
 
 
-def pickup_slot(case: BookingCase) -> tuple[str | None, str]:
-    """The pickup to show: the confirmed slot when there is one, else the requested one."""
-    if case.confirmed_local:
-        return case.confirmed_local, "confirmed"
-    return case.requested_local, "requested"
-
-
-def pickup_at(case: BookingCase) -> datetime | None:
-    """The shown pickup as an aware datetime; a date-only slot counts until the end of its day."""
-    local, _ = pickup_slot(case)
-    if not local:
-        return None
-    day, _, clock = local.partition(" ")
-    try:
-        naive = datetime.strptime(f"{day} {clock or '23:59'}", "%Y-%m-%d %H:%M")
-    except ValueError:
-        return None
-    return naive.replace(tzinfo=ZoneInfo(case.vendor_timezone or "America/New_York"))
-
-
 def _draft_ready(case: BookingCase) -> bool:
     return case.status == CaseStatus.UNSCHEDULED.value and has_request(case)
-
-
-def _sentence(text: str) -> str:
-    return text[:1].upper() + text[1:]
-
-
-def stage(case: BookingCase) -> str:
-    """Where the case stands, in a few words for the person reading the board.
-
-    A case with something open says who it is waiting on: a pending case whose vendor asked a
-    question is waiting on us, not on the vendor.
-    """
-    open_now = case.open_exceptions
-    first = KINDS.get(open_now[0].kind, (open_now[0].kind, ""))[0].lower() if open_now else ""
-    if case.status == CaseStatus.UNSCHEDULED.value:
-        if open_now:
-            return f"Not requested: {first}"
-        return "Draft waiting to be sent" if has_request(case) else "Not requested yet"
-    if case.status == CaseStatus.PENDING.value:
-        if any(e.kind == ExceptionType.CONFIRMATION_REVIEW for e in open_now):
-            return "Confirmed by the vendor, needs approval"
-        if open_now:
-            return f"Waiting on us: {first}"
-        return _sentence(case.reason or "waiting on the vendor")
-    if case.status == CaseStatus.SCHEDULED.value:
-        return _sentence(case.reason or "booked")
-    if case.status == CaseStatus.DECLINED.value:
-        return _sentence(case.reason or "vendor cannot book")
-    return _sentence(case.reason or "canceled")
 
 
 def exception_view(exc: CaseException) -> dict[str, Any]:
@@ -182,7 +97,6 @@ def exception_view(exc: CaseException) -> dict[str, Any]:
 def case_summary(case: BookingCase, *, now: datetime) -> dict[str, Any]:
     """What a row of the board shows."""
     local, source = pickup_slot(case)
-    at = pickup_at(case)
     events = case.events
     last = max(
         [t for t in [as_utc(case.updated_at), *(as_utc(e.created_at) for e in events)] if t],
@@ -201,7 +115,7 @@ def case_summary(case: BookingCase, *, now: datetime) -> dict[str, Any]:
         "pickup_local": local,
         "pickup_source": source,
         "pickup_date": local.partition(" ")[0] if local else None,
-        "past_due": case.status in UNBOOKED and at is not None and at < now,
+        "past_due": pickup_passed(case, now),
         "pickup_number": case.pickup_number,
         "desk": case.contact_email,
         "method": case.booking_method,
@@ -442,8 +356,14 @@ def _now(request: Request) -> datetime:
     return clock() if clock is not None else datetime.now(tz=UTC)
 
 
+def _settings(request: Request) -> Settings:
+    settings: Settings | None = getattr(request.app.state, "settings", None)
+    return settings if settings is not None else get_settings()
+
+
 SessionDep = Annotated[Session, Depends(_session)]
 NowDep = Annotated[datetime, Depends(_now)]
+SettingsDep = Annotated[Settings, Depends(_settings)]
 router = APIRouter(prefix="/api/booking", tags=["booking"])
 
 
@@ -478,6 +398,20 @@ def get_overview(
     """Counts, open to-dos, past-due pickups and the next days' pickups."""
     cases = [c for c in _load_all(session) if not customer or c.customer_name == customer]
     return overview(cases, now=now, days=days)
+
+
+@router.get("/today")
+def get_today(
+    session: SessionDep, now: NowDep, settings: SettingsDep, customer: str | None = None
+) -> dict[str, Any]:
+    """The daily summary: what needs a person, today's pickups, drafts to send.
+
+    ``text`` is the same summary as plain text, ready to paste into an email or a chat.
+    """
+    data = today_summary(
+        _load_all(session), now=now, timezone=settings.booking_timezone, customer=customer
+    )
+    return {**data, "text": render_today(data)}
 
 
 @router.get("/kinds")

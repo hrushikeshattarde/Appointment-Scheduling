@@ -42,6 +42,12 @@ class ExceptionType(StrEnum):
     STALE_CONFIRMATION = "stale_confirmation"  # "confirmed" a slot already past when written
     DELIVERY_MOVED = "delivery_moved"  # the customer moved the delivery; re-request the pickup
     HANDOFF = "handoff"  # the agent stopped and no more specific exception was open
+    # Raised as time passes (booking/timers.py), not by a reply.
+    UNANSWERED_24H = "unanswered_24h"  # no reply for 24 weekday hours after we wrote
+    UNANSWERED_48H = "unanswered_48h"  # still no reply after 48 weekday hours
+    PICKUP_EXPIRED = "pickup_expired"  # the pickup time passed and the case is not booked
+    # The vendor confirmed a different day, or a time more than two hours from the one asked for.
+    CONFIRMED_OUTSIDE_WINDOW = "confirmed_outside_window"
 
 
 class BookingCase(Base):
@@ -150,8 +156,9 @@ class BookingEvent(Base):
 class CaseException(Base):
     """Something on a case that needs a person: an operational exception, not a Python one.
 
-    Raised by the agent (or a migration) with a one-line description for the worklist and
-    structured detail; resolved by the agent when the situation clears, or by a person.
+    Raised by the agent, its timers (or a migration) with a one-line description for the
+    worklist and structured detail; resolved by the agent when the situation clears, or by a
+    person.
     """
 
     __tablename__ = "booking_exceptions"

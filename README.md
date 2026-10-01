@@ -65,7 +65,7 @@ MCP server, so the existing file can be reused. Never commit `.env`.
 | `facility-profiles export-xlsx [--out file.xlsx] [--facility F ...]` | Reviewer workbook: a Review Queue sheet with Decision (accept/edit/reject), Corrected value and Reviewer columns, plus Profile Fields, Scheduling Summaries, Facilities, Audit Log and Runs sheets. `--facility` (repeatable) restricts every sheet to those facilities, for a focused hand-off. |
 | `facility-profiles review import file.xlsx [--by NAME] [--dry-run]` | Reads the filled-in Review Queue sheet and applies each decision as a human-set value; rows with a blank Decision are skipped and problems are listed per row. |
 | `facility-profiles digest [--out file.md]` | Markdown digest for the pod lead: what the run did, what needs a decision (FR-13). |
-| `facility-profiles serve [--db URL] [--port 8000]` | The appointments board at `/app/` (see below) plus the lookup and review HTTP API (`/facilities/{id}`, `/facilities?name=`, `/review`, `/digest`) and the board's API under `/api/booking`. Needs the `api` extra. `uvicorn facility_profiles.api.app:create_app --factory` serves the same app. |
+| `facility-profiles serve [--db URL] [--port 8000] [--timers-every 15]` | The appointments board at `/app/` (see below) plus the lookup and review HTTP API (`/facilities/{id}`, `/facilities?name=`, `/review`, `/digest`) and the board's API under `/api/booking`. Needs the `api` extra. `uvicorn facility_profiles.api.app:create_app --factory` serves the same app. |
 
 Run modes: `FP_MODE=recommend` (default; qualifying fields are stored as recommendations and
 audited as `recommend`) or `FP_MODE=write`. Switching back to `recommend` is the kill switch
@@ -136,6 +136,8 @@ facility-profiles booking show 12
 facility-profiles booking approve 12 --by megan
 facility-profiles booking resolve 12 facility_question --by megan --note "answered by phone"
 facility-profiles booking booked 12 --by megan --via phone --date 2026-10-05 --time 09:00
+facility-profiles booking timers            # no reply in 24 h / 48 h, pickup passed unbooked
+facility-profiles booking today --out exports/today.txt  # the daily summary (runs the timers)
 ```
 
 ### Appointments board
@@ -161,7 +163,7 @@ The board never sends mail and never writes to Transport Pro; approving records 
 company's single sign-on before anyone else can reach it. One server shows one store, so run one
 per pod (`--db`) until the stores move to Postgres. To show it without real data,
 `python scripts/seed_booking_demo.py --db sqlite:///./data/booking-demo.db` fills a new store with
-17 invented cases, one per situation, built through the agent's own code.
+20 invented cases, one per situation, built through the agent's own code and the timers.
 
 ### Status and exceptions
 
@@ -184,6 +186,10 @@ agent when the situation clears or by a person with a note (`booking resolve`):
 | `stale_confirmation` | a "confirmation" of a slot already past when the vendor wrote | a person |
 | `delivery_moved` | the customer moved the delivery and nothing re-requested the pickup | a person, or the pickup asked for again |
 | `handoff` | the agent stopped and nothing more specific was open | a person |
+| `confirmed_outside_window` | the vendor confirmed another day, or a time more than 2 h from the one asked | `approve`, a later reply |
+| `unanswered_24h` | timer: no answer 24 weekday hours after we wrote | any answer from the vendor, a sent follow-up, 48 h replacing it |
+| `unanswered_48h` | timer: still no answer after 48 weekday hours | any answer from the vendor, a person |
+| `pickup_expired` | timer: the pickup passed and the case is not booked | `booked`, `approve`, `reschedule`, a later pickup (an offer, a moved delivery), `close` |
 
 When the agent hands a reply to a person (money, the round cap, no safe answer) the exception
 the reply raised stays open with the agent's reason added to it. A later reply about the slot (a
@@ -194,6 +200,42 @@ confirmation waiting for approval. `close` cancels a case and resolves everythin
 schedules the case. Stores written before this split are moved onto the new statuses the next
 time any command opens them, each parked case getting the exception its old status implied and a
 `status_migrated` event.
+
+### Timers and the daily summary
+
+Some to-dos come from time passing, not from a reply (`booking/timers.py`). `booking timers`
+runs them once; `booking today` runs them and prints the summary; `serve` runs them every 15
+minutes (`--timers-every`, 0 turns them off). They only write to-dos on the store: they never
+send mail and never write to Transport Pro.
+
+- **No reply.** Once a request (or any later message) has gone to the vendor and nothing came
+  back, `unanswered_24h` is raised after 24 hours and `unanswered_48h` replaces it after 48. Only
+  Monday-to-Friday hours in the vendor's time zone count, so a Friday-afternoon request is not
+  overdue on Monday morning. The clock starts at the first unanswered message; a follow-up does
+  not restart it, an out-of-office or unrelated reply does not stop it, and a case waiting on us
+  (a confirmation to approve, a question) is not the vendor's silence. `booking follow-up` still
+  drafts the nudge at `FP_BOOKING_FOLLOW_UP_HOURS`; a follow-up actually sent settles the 24 h.
+- **Pickup passed.** `pickup_expired` is raised when the pickup the case is working towards
+  (the confirmed slot, else a time the vendor offered that still waits for a person, else the
+  slot asked for) has passed and the case is not booked. It replaces the no-reply and
+  `slot_unworkable` to-dos, and is not raised on top of a decline, a late confirmation or a moved
+  delivery, which already say what to do. Its description says what happened: never requested,
+  drafted but never sent, no booking from the vendor, or a confirmation still waiting for approval.
+- **Confirmed another time.** When a vendor confirms another day, or a time more than two hours
+  from the one asked for, `confirmed_outside_window` is raised next to the confirmation review
+  (date-only desks are compared by day). Approving settles both.
+
+Each raise remembers what started its clock (the unanswered message, the slot), so a person's
+resolution sticks; when the situation clears the timers resolve their own to-dos, recorded as
+`timer`.
+
+`booking today [--customer NAME] [--out FILE]` (also `GET /api/booking/today`, and "Daily
+summary" on the board's overview, with a Copy button) is one plain-text page for the morning, to
+read or paste into an email or a chat: every
+case with something open, listed once under its most urgent to-do (pickup passed, 48 h silence,
+confirmations to approve first; a missing desk last) with how long it has been open; the pickups
+today and on the next business day and where each stands; the drafts nobody has sent; and what
+changed in the last 24 hours. "Today" is in `FP_BOOKING_TIMEZONE` (Fort Wayne by default).
 
 How a case moves: `scan` opens a case for every pickup stop whose appointment is not
 confirmed, keyed to the vendor profile (`missing_method` or `method_not_supported` when the
@@ -246,6 +288,7 @@ Circle books directly; the desk only helps when no slot is free.
 Tables: `booking_cases`, `booking_messages`, `booking_events`, `booking_exceptions` (created by
 `init-db`, which also adds new columns to older stores and moves old statuses over).
 Code: `booking/service.py` (cases), `booking/worklist.py` (exceptions and the status migration),
+`booking/timers.py` (no-reply and expiry timers), `booking/today.py` (the daily summary),
 `booking/classify.py` (reply reading and validation), `booking/mail.py` (JSONL or Gmail in,
 `.eml` or Gmail drafts out).
 Real-text regression: `tests/fixtures/lidl_morgan_foods_thread.jsonl` is the pod's September 2026

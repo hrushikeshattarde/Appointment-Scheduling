@@ -57,9 +57,11 @@ from facility_profiles.booking.respond import (
     offer_is_feasible,
 )
 from facility_profiles.booking.schema import ReplyClassification, ReplyStatus
+from facility_profiles.booking.timers import fmt_slot
 from facility_profiles.booking.worklist import (
     QUESTION_SUPERSEDES,
     SLOT_REPLY_SUPERSEDES,
+    TIMER_KINDS,
     flag,
     method_exception,
     open_exceptions,
@@ -112,6 +114,9 @@ DECIDED_STATUSES = (CaseStatus.SCHEDULED.value, CaseStatus.CANCELED.value)
 # late-arrival note ("latest is 9pm tonight"), not a booking. Same-day replies a few minutes
 # after the slot still count.
 STALE_CONFIRMATION_GRACE = timedelta(minutes=30)
+# A confirmation on another day, or more than this far from the time asked for, is raised for the
+# person approving it. Requests ask for one exact time; desks round it to their dock schedule.
+CONFIRM_WINDOW = timedelta(hours=2)
 
 
 @dataclass(frozen=True)
@@ -355,6 +360,32 @@ def parse_delivery_slot(
     except ValueError:
         return None
     return local.astimezone(UTC), match.group("ref").upper()
+
+
+def outside_request(
+    case: BookingCase, day: str, clock: str | None, *, date_only: bool = False
+) -> str | None:
+    """Why a confirmed slot is not what was asked for, or None when it is close enough.
+
+    Another day is always outside. On the same day, a time more than :data:`CONFIRM_WINDOW`
+    from the one asked for is outside, unless the desk is asked for a date only.
+    """
+    if not case.requested_local:
+        return None
+    asked_day, _, asked_clock = case.requested_local.partition(" ")
+    confirmed = f"{day} {clock or ''}".strip()
+    said = f"vendor confirmed {fmt_slot(confirmed)}; we asked for {fmt_slot(case.requested_local)}"
+    if day != asked_day:
+        return said
+    if date_only or not clock or not asked_clock:
+        return None
+    gap = local_dt(day, clock, case.vendor_timezone) - local_dt(
+        asked_day, asked_clock, case.vendor_timezone
+    )
+    if abs(gap) <= CONFIRM_WINDOW:
+        return None
+    hours = abs(gap).total_seconds() / 3600
+    return f"{said} ({hours:g} h {'later' if gap > timedelta(0) else 'earlier'})"
 
 
 def _event(
@@ -950,6 +981,19 @@ def apply_reply(
             pickup_number=case.pickup_number,
             conditions=result.conditions,
         )
+        profile = (
+            vendor_profile(Repository(session), case.facility_key) if case.facility_key else None
+        )
+        outside = outside_request(case, day, clock, date_only=bool(profile and profile.date_only))
+        if outside:
+            flag(
+                session,
+                case,
+                ExceptionType.CONFIRMED_OUTSIDE_WINDOW,
+                outside,
+                requested=case.requested_local,
+                confirmed=case.confirmed_local,
+            )
         _event(
             session,
             case,
@@ -958,6 +1002,7 @@ def apply_reply(
             local=case.confirmed_local,
             pickup_number=case.pickup_number,
             conditions=result.conditions,
+            outside_window=outside,
             issues=[i.__dict__ for i in issues],
         )
         return "vendor_confirmed"
@@ -1384,7 +1429,11 @@ def _apply_customer_desk_message(
         resolve(
             session,
             case,
-            [ExceptionType.SLOT_UNWORKABLE, ExceptionType.DELIVERY_MOVED],
+            [
+                ExceptionType.SLOT_UNWORKABLE,
+                ExceptionType.DELIVERY_MOVED,
+                ExceptionType.PICKUP_EXPIRED,
+            ],
             resolution=f"delivery moved to {ref}; pickup request now {new_request}",
         )
     return True
@@ -1489,8 +1538,9 @@ def approve(
 ) -> tuple[dict[str, Any], bool]:
     """A person approves the vendor's confirmation; write it only when the client allows writes.
 
-    The case becomes scheduled and its confirmation review is resolved. Anything else still
-    open (a later question, say) stays open.
+    The case becomes scheduled. Its confirmation review is resolved, with what approving settles
+    too: a confirmation outside the window asked for, and the timers (the pickup is booked).
+    Anything else still open (a later question, say) stays open.
     """
     if case.status != CaseStatus.PENDING.value or not open_exceptions(
         case, ExceptionType.CONFIRMATION_REVIEW
@@ -1504,7 +1554,13 @@ def approve(
         written = True
     case.status = CaseStatus.SCHEDULED.value
     case.reason = None
-    resolve(session, case, [ExceptionType.CONFIRMATION_REVIEW], resolution="approved", by=by)
+    resolve(
+        session,
+        case,
+        [ExceptionType.CONFIRMATION_REVIEW, ExceptionType.CONFIRMED_OUTSIDE_WINDOW, *TIMER_KINDS],
+        resolution="approved",
+        by=by,
+    )
     _event(session, case, "approved", actor=by, payload=payload, written_to_tpro=written)
     return payload, written
 

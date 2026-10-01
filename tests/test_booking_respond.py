@@ -387,10 +387,14 @@ def test_bare_set_and_time_only_confirmations_use_the_requested_slot(settings, s
             responder=responder,
         )
         # A time-only answer means the requested date at that time. The newer confirmation
-        # replaces the one still waiting for approval; there is one review, for 14:30.
+        # replaces the one still waiting for approval; there is one review, for 14:30, and
+        # 14:30 is five and a half hours from the 09:00 asked for, so that is raised with it.
         assert case.status == CaseStatus.PENDING.value
-        assert open_kinds(case) == ["confirmation_review"]
+        assert open_kinds(case) == ["confirmation_review", "confirmed_outside_window"]
         assert "2026-10-01 14:30" in case.open_exceptions[0].description
+        assert case.open_exceptions[1].description == (
+            "vendor confirmed Thu 10/01 14:30; we asked for Thu 10/01 09:00 (5.5 h later)"
+        )
         assert case.exceptions[0].resolution == "superseded by a later reply (vendor_confirmed)"
         assert case.confirmed_local == "2026-10-01 14:30"
         assert as_utc(case.confirmed_start_utc) == datetime(2026, 10, 1, 18, 30, tzinfo=UTC)

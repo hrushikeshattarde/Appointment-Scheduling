@@ -215,8 +215,16 @@ td.nowrap { white-space: nowrap; }
 .late-text { color: var(--red); font-weight: 600; }
 
 /* ---------------------------------------------------------------- week */
-.week-head { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
-.week-head h1 { margin: 0 8px 0 0; }
+.week-head, .page-head { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+.week-head h1, .page-head h1 { margin: 0 8px 0 0; }
+
+/* ---------------------------------------------------------------- daily summary */
+.summary { margin-bottom: 16px; }
+.summary .acts { display: flex; gap: 8px; }
+.summary pre {
+  white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.5 var(--font); margin: 0;
+  padding: 10px 14px 14px; max-height: 60vh; overflow: auto;
+}
 .week { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 10px; }
 .day {
   background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
