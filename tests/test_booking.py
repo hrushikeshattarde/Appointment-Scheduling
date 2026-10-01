@@ -17,7 +17,7 @@ from facility_profiles.booking.classify import (
     validate_classification,
 )
 from facility_profiles.booking.mail import InboundMessage, LocalDraftMailer, RecordingMailer
-from facility_profiles.booking.models import BookingCase, CaseStatus
+from facility_profiles.booking.models import BookingCase, CaseStatus, ExceptionType
 from facility_profiles.booking.service import (
     approve,
     close_case,
@@ -30,6 +30,7 @@ from facility_profiles.booking.service import (
     reschedule_case,
     scan,
 )
+from facility_profiles.booking.worklist import flag, open_kinds, resolve
 from facility_profiles.cli import app
 from facility_profiles.config import get_settings
 from facility_profiles.domain.resolution import StopIdentity
@@ -59,6 +60,11 @@ PYE = dict(
     lat=39.583542,
     lon=-76.026726,
 )
+
+
+def awaiting_approval(case: BookingCase) -> bool:
+    """Pending, with the vendor's confirmation open for a person's approval and nothing else."""
+    return case.status == CaseStatus.PENDING.value and open_kinds(case) == ["confirmation_review"]
 
 
 def lidl_load(load_id: int, *, po: str, pickup_status: str = "Not Required") -> dict[str, Any]:
@@ -219,7 +225,7 @@ def test_scan_draft_reply_and_approve_round_trip(settings, sessions):
     mailer = RecordingMailer()
     with session_scope(sessions) as session:
         case = list_cases(session)[0]
-        assert case.status == CaseStatus.NEW.value
+        assert case.status == CaseStatus.UNSCHEDULED.value and open_kinds(case) == []
         assert case.contact_email == "cci@udfinc.com"
         assert case.po_numbers == ["226321092660"]
         assert case.delivery_ref == "PYE_021026123"
@@ -233,9 +239,10 @@ def test_scan_draft_reply_and_approve_round_trip(settings, sessions):
         assert draft.body.startswith("Hello,\n\nCan I please schedule")
         assert draft.cc_addr == "lidl@circledelivers.com"
         message = draft_case(session, case, mailer, settings, now=NOW)
-        assert message.draft_ref == "memory:1" and case.status == CaseStatus.DRAFTED.value
+        # Drafted but not sent: nothing has been asked of the vendor yet.
+        assert message.draft_ref == "memory:1" and case.status == CaseStatus.UNSCHEDULED.value
         mark_sent(session, case, by="megan", thread_id="t1")
-        assert case.status == CaseStatus.SENT.value
+        assert case.status == CaseStatus.PENDING.value
         case_id = case.id
 
     # Second scan does not duplicate the case.
@@ -263,7 +270,12 @@ def test_scan_draft_reply_and_approve_round_trip(settings, sessions):
         stats2 = ingest(session, inbound, classifier, internal_domains=["circledelivers.com"])
         assert stats2.skipped_internal == 1 and stats2.duplicates == 1 and stats2.proposed == 1
         case = session.get(BookingCase, case_id)
-        assert case is not None and case.status == CaseStatus.PROPOSED.value
+        # Confirmed by the vendor, still pending until a person approves what the agent read.
+        assert case is not None and case.status == CaseStatus.PENDING.value
+        assert open_kinds(case) == ["confirmation_review"]
+        assert case.open_exceptions[0].description == (
+            "vendor confirmed 2026-10-01 11:00, pickup# CCI-9389; approve to accept"
+        )
         assert case.confirmed_local == "2026-10-01 11:00"
         assert as_utc(case.confirmed_start_utc) == datetime(2026, 10, 1, 15, 0, tzinfo=UTC)
         assert case.pickup_number == "CCI-9389"
@@ -275,9 +287,14 @@ def test_scan_draft_reply_and_approve_round_trip(settings, sessions):
             "end_utc": "2026-10-01T15:00:00Z",
             "status": "Confirmed",
         }
-        assert written is False and case.status == CaseStatus.APPROVED.value
+        assert written is False and case.status == CaseStatus.SCHEDULED.value
+        assert open_kinds(case) == []
+        review = case.exceptions[0]
+        assert (review.resolution, review.resolved_by) == ("approved", "megan")
         actions = [e.action for e in case.events]
         assert actions == ["scanned", "drafted", "sent", "vendor_confirmed", "approved"]
+        with pytest.raises(ValueError, match="nothing to approve"):
+            approve(session, case, by="megan", client=None)
 
 
 def test_questions_counter_offers_and_unbacked_values_go_to_a_person(settings, sessions):
@@ -324,8 +341,9 @@ def test_questions_counter_offers_and_unbacked_values_go_to_a_person(settings, s
             classifier,
             internal_domains=["circledelivers.com"],
         )
-        assert stats.needs_human == 1 and case.status == CaseStatus.NEEDS_HUMAN.value
-        assert case.reason is not None and "Which carrier" in case.reason
+        assert stats.needs_human == 1 and case.status == CaseStatus.PENDING.value
+        assert open_kinds(case) == ["facility_question"]
+        assert "Which carrier" in case.open_exceptions[0].description
 
         ingest(
             session,
@@ -340,10 +358,13 @@ def test_questions_counter_offers_and_unbacked_values_go_to_a_person(settings, s
             classifier,
             internal_domains=["circledelivers.com"],
         )
-        assert (
-            case.status == CaseStatus.NEEDS_HUMAN.value
-            and "vendor offered 2026-10-03 16:00" in (case.reason or "")
-        )
+        # The offer is about the slot, so it supersedes the open question: one thing to decide.
+        assert case.status == CaseStatus.PENDING.value
+        assert open_kinds(case) == ["proposed_time_review"]
+        offer = case.open_exceptions[0]
+        assert offer.description == "vendor offered 2026-10-03 16:00"
+        assert (offer.detail["date"], offer.detail["time"]) == ("2026-10-03", "16:00")
+        assert case.exceptions[0].resolution == "superseded by a later reply (counter_offer)"
 
         stats3 = ingest(
             session,
@@ -355,14 +376,16 @@ def test_questions_counter_offers_and_unbacked_values_go_to_a_person(settings, s
             classifier,
             internal_domains=["circledelivers.com"],
         )
-        # The unbacked confirmation was downgraded to unrelated; the case did not move to proposed.
-        assert stats3.unrelated == 1 and case.status == CaseStatus.NEEDS_HUMAN.value
+        # The unbacked confirmation was downgraded to unrelated; the offer is still the open item.
+        assert stats3.unrelated == 1 and open_kinds(case) == ["proposed_time_review"]
+        assert case.confirmed_local is None
         last = case.messages[-1]
         assert last.classification["status"] == "unrelated"
         assert any(i["reason"] == "quote not found in reply" for i in last.classification["issues"])
 
-        close_case(session, case, by="megan", reason="booked by phone")
-        assert case.status == CaseStatus.CLOSED.value
+        close_case(session, case, by="megan", reason="load canceled by Lidl")
+        assert case.status == CaseStatus.CANCELED.value and open_kinds(case) == []
+        assert case.exceptions[-1].resolution == "case canceled: load canceled by Lidl"
 
 
 def test_scan_skips_loads_that_already_carry_a_pickup_number(settings, sessions):
@@ -375,9 +398,11 @@ def test_scan_skips_loads_that_already_carry_a_pickup_number(settings, sessions)
     assert stats.created == 1 and stats.already_booked == 1
     with session_scope(sessions) as session:
         case = list_cases(session)[0]
-        assert case.status == CaseStatus.ALREADY_BOOKED.value
+        # Booked outside the agent before the scan: scheduled, and nothing for a person to do.
+        assert case.status == CaseStatus.SCHEDULED.value and open_kinds(case) == []
+        assert case.reason == "load already carries vendor pickup number 20463798"
         assert case.pickup_number == "20463798" and case.po_numbers == ["115802102660"]
-        with pytest.raises(ValueError, match="only new cases"):
+        with pytest.raises(ValueError, match="only unscheduled cases"):
             draft_case(session, case, RecordingMailer(), settings, now=NOW)
 
 
@@ -417,11 +442,15 @@ def test_scan_without_a_verified_desk_needs_profile_and_local_drafts_are_files(
     assert stats.needs_profile == 1
     with session_scope(sessions) as session:
         case = list_cases(session)[0]
-        assert case.status == CaseStatus.NEEDS_PROFILE.value
-        with pytest.raises(ValueError, match="only new cases"):
+        assert case.status == CaseStatus.UNSCHEDULED.value
+        assert open_kinds(case) == ["missing_method"]
+        assert case.open_exceptions[0].description == (
+            "no verified email booking desk on the profile"
+        )
+        with pytest.raises(ValueError, match=r"open exceptions \(missing_method\)"):
             draft_case(session, case, RecordingMailer(), settings, now=NOW)
-        case.status = CaseStatus.NEW.value
         case.contact_email = "desk@example.com"
+        resolve(session, case, [ExceptionType.MISSING_METHOD], resolution="desk found", by="megan")
         mailer = LocalDraftMailer(tmp_path / "drafts", sender="lidl@circledelivers.com")
         message = draft_case(session, case, mailer, settings, now=NOW)
         path = Path(message.draft_ref or "")
@@ -447,8 +476,10 @@ def test_booking_cli_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         assert result.exit_code == 1 and "not found" in result.output
         result = runner.invoke(app, ["booking", "inbox"])
         assert result.exit_code == 2
-        for command in ("scan", "draft", "sent", "approve", "close"):
+        for command in ("scan", "draft", "sent", "approve", "close", "booked", "resolve"):
             assert runner.invoke(app, ["booking", command, "--help"]).exit_code == 0
+        result = runner.invoke(app, ["booking", "list", "--exception", "nonsense"])
+        assert result.exit_code == 2
     finally:
         get_settings.cache_clear()
 
@@ -489,7 +520,7 @@ def test_reschedule_drafts_in_thread_and_resets_the_slot(settings, sessions):
             )
         draft_case(session, case, mailer, settings, now=NOW)
         mark_sent(session, case, by="megan", thread_id="t9")
-        case.status = CaseStatus.APPROVED.value
+        case.status = CaseStatus.SCHEDULED.value
         case.confirmed_local = "2026-10-01 09:00"
         message = reschedule_case(
             session,
@@ -500,7 +531,8 @@ def test_reschedule_drafts_in_thread_and_resets_the_slot(settings, sessions):
             by="megan",
             note="Our driver fell off this morning, my apologies.",
         )
-        assert message.kind == "reschedule" and case.status == CaseStatus.SENT.value
+        assert message.kind == "reschedule" and case.status == CaseStatus.PENDING.value
+        assert case.reschedule_count == 1
         assert case.requested_local == "2026-10-02 14:30" and case.confirmed_local is None
         sent = mailer.drafts[-1]
         assert sent.subject == "Re: Pick Up Appointment: 104427082660" and sent.thread_id == "t9"
@@ -550,7 +582,9 @@ def test_customer_desk_slot_moves_the_pickup_and_redrafts_in_thread(settings, se
         case = list_cases(session)[0]
         draft_case(session, case, mailer, settings, now=NOW)
         mark_sent(session, case, by="megan", thread_id="tv")
-        case.status = CaseStatus.NEEDS_HUMAN.value
+        # The vendor could not ship as planned and Lidl was asked to move the delivery.
+        case.status = CaseStatus.DECLINED.value
+        flag(session, case, ExceptionType.FACILITY_DECLINED, "vendor cannot book: no coverage")
         lidl = InboundMessage(
             message_id="z1",
             thread_id="tz",
@@ -572,8 +606,10 @@ def test_customer_desk_slot_moves_the_pickup_and_redrafts_in_thread(settings, se
         assert stats.delivery_updates == 1 and stats.classified == 0
         assert case.delivery_ref == "GRM_061026926"
         assert as_utc(case.delivery_at_utc) == datetime(2026, 10, 6, 11, 0, tzinfo=UTC)
-        # The pickup was re-requested in the vendor thread, backed off the new delivery.
-        assert case.status == CaseStatus.SENT.value
+        # The pickup was re-requested in the vendor thread, backed off the new delivery; asking
+        # again answers the decline.
+        assert case.status == CaseStatus.PENDING.value and open_kinds(case) == []
+        assert case.exceptions[0].resolution == "pickup asked for again: 2026-10-02 09:00"
         assert case.requested_local == "2026-10-02 09:00"
         assert mailer.drafts[-1].to_addr == "cci@udfinc.com" and mailer.drafts[-1].thread_id == "tv"
         assert (
@@ -601,7 +637,7 @@ def test_customer_desk_slot_moves_the_pickup_and_redrafts_in_thread(settings, se
             internal_domains=["circledelivers.com"],
             customer_desk="inbound@lidl.us",
         )
-        assert stats.delivery_updates == 0 and case.status == CaseStatus.SENT.value
+        assert stats.delivery_updates == 0 and case.status == CaseStatus.PENDING.value
 
 
 def test_draft_batch_writes_one_email_per_desk(settings, sessions):
@@ -615,13 +651,13 @@ def test_draft_batch_writes_one_email_per_desk(settings, sessions):
     scan(client, sessions, settings, days_ahead=7, now=NOW)  # type: ignore[arg-type]
     mailer = RecordingMailer()
     with session_scope(sessions) as session:
-        cases = list_cases(session, CaseStatus.NEW.value)
+        cases = list_cases(session, CaseStatus.UNSCHEDULED.value)
         messages = draft_batch(session, cases, mailer, settings, now=NOW)
         assert len(messages) == 2 and len(mailer.drafts) == 1
         draft = mailer.drafts[0]
         assert draft.subject == "Pick Up Appointments: 104419082630 & 104421082660"
         assert "PO# 104419082630 on 10/01 @ 0900\nPO# 104421082660 on 10/03 @ 1100" in draft.body
         assert "ALL IN ONE TRUCK" not in draft.body
-        assert all(c.status == CaseStatus.DRAFTED.value for c in cases)
+        assert all(c.status == CaseStatus.UNSCHEDULED.value for c in cases)
         assert messages[0].draft_ref == messages[1].draft_ref
         assert cases[0].events[-1].detail["batched_with"] == [cases[1].id]

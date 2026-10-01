@@ -37,7 +37,7 @@ from facility_profiles.domain.schema import FacilityIdentity, FieldState, Role
 from facility_profiles.storage.db import session_scope
 from facility_profiles.storage.repository import Repository, as_utc
 from tests.conftest import FakeTPro, make_load, stop
-from tests.test_booking import PYE
+from tests.test_booking import PYE, awaiting_approval
 
 FIXTURE = Path(__file__).parent / "fixtures" / "lidl_morgan_foods_thread.jsonl"
 THREAD = "1a0e9fc7679c2963"
@@ -257,7 +257,7 @@ def test_replay_of_the_morgan_foods_thread(settings, sessions):
         assert stats.skipped_internal == 2 and stats.classified == 1
         assert stats.needs_human == 1 and stats.responded == 1
         # 10/02 09:00 still makes the 10/06 delivery, so the agent accepts, pickup number kept.
-        assert case.status == CaseStatus.PROPOSED.value
+        assert awaiting_approval(case)
         assert case.confirmed_local == "2026-10-02 09:00" and case.pickup_number == "20463798"
         assert mailer.drafts[-1].body.startswith("Yes, 10/02 @ 0900 works. Thank you!")
 
@@ -271,7 +271,7 @@ def test_replay_of_the_morgan_foods_thread(settings, sessions):
             by="megan",
             note="Due to the receiver's availability, we need to pick this up on Monday 10/05.",
         )
-        assert case.status == CaseStatus.SENT.value and case.confirmed_local is None
+        assert case.status == CaseStatus.PENDING.value and case.confirmed_local is None
         assert (
             "Can we please reschedule PO# 115802102660 & 115802102661 (ALL IN ONE TRUCK) on 10/05 @ 0900?"
             in (mailer.drafts[-1].body)
@@ -289,7 +289,7 @@ def test_replay_of_the_morgan_foods_thread(settings, sessions):
             "Yes, both orders: PO# 115802102660 & PO# 115802102661."
         )
         # The confirmation with Outlook cruft books the slot and gets the pod's "Thank you!".
-        assert stats.proposed == 1 and case.status == CaseStatus.PROPOSED.value
+        assert stats.proposed == 1 and awaiting_approval(case)
         assert case.confirmed_local == "2026-10-05 09:00" and case.pickup_number == "20463798"
         assert as_utc(case.confirmed_start_utc) == datetime(2026, 10, 5, 13, 0, tzinfo=UTC)
         last_in = [m for m in case.messages if m.direction == "in"][-1]
@@ -309,7 +309,7 @@ def test_replay_of_the_morgan_foods_thread(settings, sessions):
         )
         assert stats.skipped_internal == 6 and stats.after_decision == 4 and stats.classified == 0
         assert len(classifier.calls) == calls_so_far
-        assert case.status == CaseStatus.APPROVED.value
+        assert case.status == CaseStatus.SCHEDULED.value
         assert case.confirmed_local == "2026-10-05 09:00"
         assert [m.kind for m in case.messages if m.direction == "out"].count("acknowledge") == 1
         assert [e.action for e in case.events].count("reply_after_decision") == 4
@@ -354,8 +354,9 @@ def test_a_slot_already_past_when_the_vendor_wrote_is_not_a_confirmation(setting
             responder=responder,
         )
         assert stats.classified == 1 and stats.needs_human == 1 and stats.proposed == 0
-        assert case.status == CaseStatus.NEEDS_HUMAN.value
-        assert case.reason is not None and "already past" in case.reason
+        assert case.status == CaseStatus.PENDING.value
+        assert [e.kind for e in case.open_exceptions] == ["stale_confirmation"]
+        assert "already past" in case.open_exceptions[0].description
         assert case.confirmed_local is None
         assert case.events[-1].action == "stale_confirmation"
         # The quote lifted from the quoted request under the reply was rejected as evidence.

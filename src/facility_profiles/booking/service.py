@@ -1,8 +1,12 @@
 """Booking cases: find loads to book, compose the request, read the reply, propose the slot.
 
-Draft mode: the agent never sends and never writes to Transport Pro. A person sends the draft,
-tells the agent it went out (``booking sent``), and approves the proposed appointment
+Draft mode: the agent never sends and never writes to Transport Pro. A person sends the draft
+(the archive links it to the case, or ``booking sent``) and approves the vendor's confirmation
 (``booking approve``). Every step is recorded on the case.
+
+A case's status says where the appointment stands (unscheduled, pending, scheduled, declined,
+canceled). Whatever needs a person is an exception on the case (``booking/worklist.py``), raised
+here where the agent stops and resolved where the situation clears.
 """
 
 from __future__ import annotations
@@ -32,7 +36,14 @@ from facility_profiles.booking.mail import (
     Sender,
     deliver,
 )
-from facility_profiles.booking.models import BookingCase, BookingEvent, BookingMessage, CaseStatus
+from facility_profiles.booking.models import (
+    BookingCase,
+    BookingEvent,
+    BookingMessage,
+    CaseException,
+    CaseStatus,
+    ExceptionType,
+)
 from facility_profiles.booking.outbox import (
     check_send_gate,
     dispatch,
@@ -46,6 +57,16 @@ from facility_profiles.booking.respond import (
     offer_is_feasible,
 )
 from facility_profiles.booking.schema import ReplyClassification, ReplyStatus
+from facility_profiles.booking.worklist import (
+    QUESTION_SUPERSEDES,
+    SLOT_REPLY_SUPERSEDES,
+    flag,
+    method_exception,
+    open_exceptions,
+    open_kinds,
+    resolve,
+    resolve_all,
+)
 from facility_profiles.config import Settings
 from facility_profiles.domain.resolution import FacilityResolver
 from facility_profiles.domain.schema import Role
@@ -80,15 +101,13 @@ DELIVERY_SLOT_REF_FIRST_RE = re.compile(
 )
 TRUSTED_STATES = frozenset({"human_set", "verified", "written"})
 OPEN_STATUSES = (
-    CaseStatus.NEW.value,
-    CaseStatus.DRAFTED.value,
-    CaseStatus.SENT.value,
-    CaseStatus.PROPOSED.value,
-    CaseStatus.NEEDS_HUMAN.value,
+    CaseStatus.UNSCHEDULED.value,
+    CaseStatus.PENDING.value,
+    CaseStatus.DECLINED.value,
 )
-# A person has decided; later mail in the thread (ETAs, securement, "did this get resolved?")
-# is kept on the case but never read as a new answer to the request.
-DECIDED_STATUSES = (CaseStatus.APPROVED.value, CaseStatus.CLOSED.value)
+# Booked or no longer needed; later mail in the thread (ETAs, securement, "did this get
+# resolved?") is kept on the case but never read as a new answer to the request.
+DECIDED_STATUSES = (CaseStatus.SCHEDULED.value, CaseStatus.CANCELED.value)
 # A "confirmation" of a slot that had already passed when the vendor wrote is a work-in or a
 # late-arrival note ("latest is 9pm tonight"), not a booking. Same-day replies a few minutes
 # after the slot still count.
@@ -147,7 +166,7 @@ class IngestStats:
     responded: int = 0
     deferred: int = 0
     delivery_updates: int = 0
-    after_decision: int = 0  # mail on approved or closed cases, recorded but not classified
+    after_decision: int = 0  # mail on scheduled or canceled cases, recorded but not classified
     linked_outbound: int = 0  # a person's own send of a drafted request, recognised and linked
     not_about_case: int = 0  # a reply that named other POs than this case's
     own_outbound: int = 0  # the agent's own sent mail seen again in the archive
@@ -396,18 +415,16 @@ def scan(
             loc = wp.location
             miles = (load.reference or {}).get("miles")
             pickup_no = str((load.reference or {}).get("pickupNumber") or "").strip()
+            blocker: tuple[ExceptionType, str] | None = None
             if pickup_no:
                 status, reason = (
-                    CaseStatus.ALREADY_BOOKED.value,
+                    CaseStatus.SCHEDULED.value,
                     f"load already carries vendor pickup number {pickup_no}",
                 )
-            elif profile.can_email:
-                status, reason = CaseStatus.NEW.value, None
             else:
-                status, reason = (
-                    CaseStatus.NEEDS_PROFILE.value,
-                    "no verified email booking desk on the profile",
-                )
+                status, reason = CaseStatus.UNSCHEDULED.value, None
+                if not profile.can_email:
+                    blocker = method_exception(profile.booking_method)
             case = BookingCase(
                 load_id=load.id,
                 waypoint_index=index,
@@ -443,13 +460,21 @@ def scan(
             )
             session.add(case)
             session.flush()
-            _event(session, case, "scanned", status=case.status, reason=case.reason)
+            if blocker is not None:
+                flag(session, case, blocker[0], blocker[1], method=profile.booking_method)
+            _event(
+                session,
+                case,
+                "scanned",
+                status=case.status,
+                reason=case.reason or (blocker[1] if blocker else None),
+            )
             _check_requested_slot(session, case, settings, now=now)
             stats.created += 1
             stats.case_ids.append(case.id)
-            if status == CaseStatus.ALREADY_BOOKED.value:
+            if pickup_no:
                 stats.already_booked += 1
-            elif status == CaseStatus.NEEDS_PROFILE.value:
+            elif blocker is not None:
                 stats.needs_profile += 1
     return stats
 
@@ -460,23 +485,21 @@ def _check_requested_slot(
     """Apply the PO-date floor and the notice window to a freshly scanned case.
 
     Only a case the agent could email is affected. A floor that still makes the delivery just
-    moves the ask; one that does not, or a slot already inside the notice window, hands the
-    case to a person before any email is written.
+    moves the ask; one that does not, or a slot already inside the notice window, is raised
+    for a person before any email is written.
     """
-    if case.status != CaseStatus.NEW.value:
+    if case.status != CaseStatus.UNSCHEDULED.value or case.open_exceptions:
         return
     moved, why, feasible = floor_requested(case, case.requested_local, settings, now=now)
     if why:
         case.requested_local = moved
         _event(session, case, "po_date_floor", reason=why, feasible=feasible)
         if not feasible:
-            case.status = CaseStatus.NEEDS_HUMAN.value
-            case.reason = why[:255]
+            flag(session, case, ExceptionType.SLOT_UNWORKABLE, why, requested=moved)
             return
     stale = slot_is_stale(case.requested_local, case.vendor_timezone, settings, now=now)
     if stale:
-        case.status = CaseStatus.NEEDS_HUMAN.value
-        case.reason = stale[:255]
+        flag(session, case, ExceptionType.SLOT_UNWORKABLE, stale, requested=case.requested_local)
         _event(session, case, "stale_slot", reason=stale)
 
 
@@ -563,21 +586,11 @@ def draft_case(
 
     With a :class:`Sender` the request goes out only when the send gate passes (send mode on,
     the recipient is the profile's trusted desk, the daily cap not reached) and the case moves
-    straight to ``sent`` with the ids a reply will point back at. A slot that has gone stale
-    since the scan is refused either way: a same-day ask needs a person.
+    straight to ``pending`` with the ids a reply will point back at; a draft leaves it
+    ``unscheduled`` until a person sends it. A slot that has gone stale since the scan is
+    refused either way: a same-day ask needs a person.
     """
-    if case.status not in (CaseStatus.NEW.value, CaseStatus.DRAFTED.value):
-        msg = f"case {case.id} is {case.status}; only new cases can be drafted"
-        raise ValueError(msg)
-    if not case.contact_email:
-        msg = f"case {case.id} has no booking email"
-        raise ValueError(msg)
-    stale = slot_is_stale(
-        case.requested_local, case.vendor_timezone, settings, now=now or datetime.now(tz=UTC)
-    )
-    if stale:
-        msg = f"case {case.id}: {stale}; reschedule it first"
-        raise ValueError(msg)
+    _check_draftable(case, settings, now=now or datetime.now(tz=UTC))
     profile = vendor_profile(Repository(session), case.facility_key) if case.facility_key else None
     draft = compose_request(case, settings, profile)
     if is_sender(mailer):
@@ -595,11 +608,50 @@ def draft_case(
     case.messages.append(message)
     session.flush()
     result = dispatch(session, case, message, mailer, draft, actor=by)
-    case.status = CaseStatus.SENT.value if result.sent else CaseStatus.DRAFTED.value
+    case.status = CaseStatus.PENDING.value if result.sent else CaseStatus.UNSCHEDULED.value
     case.reason = None
     session.flush()
     _event(session, case, "drafted", draft_ref=result.ref, to=draft.to_addr, subject=draft.subject)
     return message
+
+
+def _check_draftable(case: BookingCase, settings: Settings, *, now: datetime) -> None:
+    """Refuse a request the agent must not write.
+
+    That is: a case that is not unscheduled, has open exceptions or no desk, or whose slot has
+    passed or is inside the notice window.
+    """
+    if case.status != CaseStatus.UNSCHEDULED.value:
+        msg = f"case {case.id} is {case.status}; only unscheduled cases can be drafted"
+        raise ValueError(msg)
+    blocking = open_kinds(case)
+    if blocking:
+        msg = f"case {case.id} has open exceptions ({', '.join(blocking)}); resolve them first"
+        raise ValueError(msg)
+    if not case.contact_email:
+        msg = f"case {case.id} has no booking email"
+        raise ValueError(msg)
+    stale = slot_is_stale(case.requested_local, case.vendor_timezone, settings, now=now)
+    if stale:
+        msg = f"case {case.id}: {stale}; not drafted"
+        raise ValueError(msg)
+
+
+def has_request(case: BookingCase) -> bool:
+    """True once a request for the case has been drafted or sent."""
+    return any(m.direction == "out" and m.kind == "request" for m in case.messages)
+
+
+def ready_to_draft(session: Session) -> list[BookingCase]:
+    """Unscheduled cases with a desk, nothing open and no request yet.
+
+    This is what ``booking draft`` and ``booking send`` pick up when no case is named.
+    """
+    return [
+        c
+        for c in list_cases(session, CaseStatus.UNSCHEDULED.value)
+        if c.contact_email and not c.open_exceptions and not has_request(c)
+    ]
 
 
 def reschedule_case(
@@ -612,9 +664,16 @@ def reschedule_case(
     by: str,
     note: str | None = None,
 ) -> BookingMessage:
-    """Ask the vendor for a new slot in the same thread (a Circle-side miss, most often)."""
-    if case.status in (CaseStatus.NEW.value, CaseStatus.DRAFTED.value, CaseStatus.CLOSED.value):
-        msg = f"case {case.id} is {case.status}; nothing to reschedule yet"
+    """Ask the vendor for a new slot in the same thread (a Circle-side miss, most often).
+
+    Works from pending, scheduled or declined. The case goes back to pending with the count of
+    reschedules raised, and whatever was open on it is resolved: asking again is the answer.
+    """
+    if case.status == CaseStatus.UNSCHEDULED.value:
+        msg = f"case {case.id} is unscheduled; nothing to reschedule yet"
+        raise ValueError(msg)
+    if case.status == CaseStatus.CANCELED.value:
+        msg = f"case {case.id} is canceled; nothing to reschedule"
         raise ValueError(msg)
     if not case.contact_email:
         msg = f"case {case.id} has no booking email"
@@ -664,8 +723,10 @@ def reschedule_case(
     case.messages.append(message)
     session.flush()
     result = dispatch(session, case, message, mailer, draft, actor=by)
-    case.status = CaseStatus.SENT.value
+    case.status = CaseStatus.PENDING.value
     case.reason = None
+    case.reschedule_count = (case.reschedule_count or 0) + 1
+    resolve_all(session, case, resolution=f"pickup asked for again: {requested_local}", by=by)
     session.flush()
     _event(
         session,
@@ -692,11 +753,11 @@ def mark_sent(
 ) -> None:
     """A person sent the draft; remember the thread and Message-ID so replies can be matched.
 
-    Also accepted for a case already marked sent but without a thread, which is how a manual
-    ``booking sent`` gets its ids once the archive shows the message.
+    Also accepted for a pending case without a thread, which is how a manual ``booking sent``
+    gets its ids once the archive shows the message.
     """
-    unlinked = case.status == CaseStatus.SENT.value and not case.thread_id
-    if case.status not in (CaseStatus.DRAFTED.value, CaseStatus.NEW.value) and not unlinked:
+    unlinked = case.status == CaseStatus.PENDING.value and not case.thread_id
+    if case.status != CaseStatus.UNSCHEDULED.value and not unlinked:
         msg = f"case {case.id} is {case.status}; nothing to mark as sent"
         raise ValueError(msg)
     request = next((m for m in reversed(case.messages) if m.direction == "out"), None)
@@ -706,7 +767,7 @@ def mark_sent(
         request.message_id = message_id or request.message_id
         request.rfc_message_id = rfc_message_id or request.rfc_message_id
     case.thread_id = thread_id or case.thread_id
-    case.status = CaseStatus.SENT.value
+    case.status = CaseStatus.PENDING.value
     _event(
         session,
         case,
@@ -721,11 +782,18 @@ def mark_sent(
 # ------------------------------------------------------------------ replies
 
 
-def list_cases(session: Session, status: str | None = None) -> list[BookingCase]:
-    """Cases, newest first, optionally by status."""
+def list_cases(
+    session: Session, status: str | None = None, *, exception: str | None = None
+) -> list[BookingCase]:
+    """Cases, newest first, optionally by status and by open exception (a kind, or ``any``)."""
     stmt = select(BookingCase).order_by(BookingCase.id.desc())
     if status:
         stmt = stmt.where(BookingCase.status == status)
+    if exception:
+        flagged = select(CaseException.case_id).where(CaseException.resolved_at.is_(None))
+        if exception != "any":
+            flagged = flagged.where(CaseException.kind == exception)
+        stmt = stmt.where(BookingCase.id.in_(flagged))
     return list(session.scalars(stmt))
 
 
@@ -795,6 +863,26 @@ def _local_to_utc(day: str, clock: str | None, timezone: str | None) -> datetime
     return parsed.replace(tzinfo=tz).astimezone(UTC)
 
 
+def _new_reading(
+    session: Session, case: BookingCase, outcome: str, *, about_slot: bool = True
+) -> None:
+    """A new reply supersedes what earlier ones left open about the same thing.
+
+    A reply about the slot replaces the slot's state: the case is pending again and an
+    unreviewed confirmation goes, its slot no longer the vendor's last word. A question only
+    replaces an earlier question; the slot stays where it was.
+    """
+    superseded = SLOT_REPLY_SUPERSEDES if about_slot else QUESTION_SUPERSEDES
+    if about_slot and open_exceptions(case, ExceptionType.CONFIRMATION_REVIEW):
+        case.confirmed_local = None
+        case.confirmed_start_utc = None
+        case.confirmed_end_utc = None
+    resolve(session, case, superseded, resolution=f"superseded by a later reply ({outcome})")
+    if about_slot or case.status == CaseStatus.UNSCHEDULED.value:
+        case.status = CaseStatus.PENDING.value
+        case.reason = None
+
+
 def apply_reply(
     session: Session,
     case: BookingCase,
@@ -804,7 +892,13 @@ def apply_reply(
     actor: str = "agent",
     reply_sent_at: datetime | None = None,
 ) -> str:
-    """Move the case according to the classified reply; return the event recorded."""
+    """Move the case according to the classified reply; return the event recorded.
+
+    The case is pending afterwards (declined when the vendor cannot book), and what a person
+    has to look at is raised: the confirmation to approve, the offer, the question, the
+    decline, a "confirmation" of a slot already past. A reply that says nothing about the
+    request leaves the case as it was.
+    """
     if case.status in DECIDED_STATUSES:
         _event(session, case, "reply_ignored", actor=actor, reason=f"case is {case.status}")
         return "reply_ignored"
@@ -821,11 +915,16 @@ def apply_reply(
         written_at = as_utc(reply_sent_at)
         if written_at is not None and start < written_at - STALE_CONFIRMATION_GRACE:
             local = f"{day} {clock or ''}".strip()
-            case.status = CaseStatus.NEEDS_HUMAN.value
-            case.reason = (
+            _new_reading(session, case, "stale_confirmation")
+            flag(
+                session,
+                case,
+                ExceptionType.STALE_CONFIRMATION,
                 f"vendor 'confirmed' {local}, already past when they wrote; "
-                "read it as a work-in or late-arrival note"
-            )[:255]
+                "read it as a work-in or late-arrival note",
+                local=local,
+                reply_sent_at=written_at.isoformat(),
+            )
             _event(
                 session,
                 case,
@@ -836,12 +935,21 @@ def apply_reply(
                 issues=[i.__dict__ for i in issues],
             )
             return "stale_confirmation"
+        _new_reading(session, case, "vendor_confirmed")
         case.confirmed_local = f"{day} {clock or ''}".strip()
         case.confirmed_start_utc = start
         case.confirmed_end_utc = end
         case.pickup_number = result.pickup_number or case.pickup_number
-        case.status = CaseStatus.PROPOSED.value
-        case.reason = None
+        pickup = f", pickup# {case.pickup_number}" if case.pickup_number else ""
+        flag(
+            session,
+            case,
+            ExceptionType.CONFIRMATION_REVIEW,
+            f"vendor confirmed {case.confirmed_local}{pickup}; approve to accept",
+            local=case.confirmed_local,
+            pickup_number=case.pickup_number,
+            conditions=result.conditions,
+        )
         _event(
             session,
             case,
@@ -854,22 +962,31 @@ def apply_reply(
         )
         return "vendor_confirmed"
     if result.status == ReplyStatus.COUNTER_OFFER:
+        _new_reading(session, case, "counter_offer")
         # Morgan Foods assigns the pickup number with the counter ("10/2 @ 9am pickup# 20463798").
         case.pickup_number = result.pickup_number or case.pickup_number
-        case.status = CaseStatus.NEEDS_HUMAN.value
-        case.reason = (
-            f"vendor offered {result.pickup_date or '?'} {result.pickup_time or ''}".strip()
-            + (f" to {result.pickup_time_end}" if result.pickup_time_end else "")
+        offered = f"vendor offered {result.pickup_date or '?'} {result.pickup_time or ''}".strip()
+        offered += f" to {result.pickup_time_end}" if result.pickup_time_end else ""
+        flag(
+            session,
+            case,
+            ExceptionType.PROPOSED_TIME_REVIEW,
+            offered,
+            date=result.pickup_date,
+            time=result.pickup_time,
+            time_end=result.pickup_time_end,
+            pickup_number=result.pickup_number,
         )
-        _event(session, case, "counter_offer", actor=actor, reason=case.reason)
+        _event(session, case, "counter_offer", actor=actor, reason=offered)
         return "counter_offer"
     if result.status == ReplyStatus.QUESTION:
-        case.status = CaseStatus.NEEDS_HUMAN.value
-        case.reason = f"vendor asked: {result.question or 'see reply'}"[:255]
-        _event(session, case, "question", actor=actor, reason=case.reason)
+        _new_reading(session, case, "question", about_slot=False)
+        asked = f"vendor asked: {result.question or 'see reply'}"[:255]
+        flag(session, case, ExceptionType.FACILITY_QUESTION, asked, question=result.question)
+        _event(session, case, "question", actor=actor, reason=asked)
         return "question"
     if result.status == ReplyStatus.DEFERRED:
-        case.status = CaseStatus.SENT.value
+        _new_reading(session, case, "deferred")
         case.reason = (
             f"vendor asked to check back on {result.pickup_date}"
             if result.pickup_date
@@ -885,13 +1002,20 @@ def apply_reply(
         )
         return "deferred"
     if result.status == ReplyStatus.REJECTED:
-        case.status = CaseStatus.NEEDS_HUMAN.value
-        case.reason = (
-            f"vendor cannot book: {result.question or '; '.join(result.conditions) or 'see reply'}"[
-                :255
-            ]
+        _new_reading(session, case, "rejected_by_vendor")
+        said = result.question or "; ".join(result.conditions) or "see reply"
+        why = f"vendor cannot book: {said}"[:255]
+        case.status = CaseStatus.DECLINED.value
+        case.reason = why
+        flag(
+            session,
+            case,
+            ExceptionType.FACILITY_DECLINED,
+            why,
+            question=result.question,
+            conditions=result.conditions,
         )
-        _event(session, case, "rejected_by_vendor", actor=actor, reason=case.reason)
+        _event(session, case, "rejected_by_vendor", actor=actor, reason=why)
         return "rejected_by_vendor"
     _event(session, case, "reply_unrelated", actor=actor, issues=[i.__dict__ for i in issues])
     return "reply_unrelated"
@@ -1050,7 +1174,9 @@ def _answer_once(
     if drafted_any:
         return
     for case, inbound, reading in answered:
-        if reading.status == ReplyStatus.CONFIRMED and case.status == CaseStatus.PROPOSED.value:
+        if reading.status == ReplyStatus.CONFIRMED and open_exceptions(
+            case, ExceptionType.CONFIRMATION_REVIEW
+        ):
             if responder.acknowledge(session, case, inbound) is not None:
                 stats.responded += 1
             return
@@ -1125,7 +1251,7 @@ def link_outbound(session: Session, message: InboundMessage) -> str:
     candidates = list(
         session.scalars(
             select(BookingCase).where(
-                BookingCase.status.in_((CaseStatus.DRAFTED.value, CaseStatus.SENT.value)),
+                BookingCase.status.in_((CaseStatus.UNSCHEDULED.value, CaseStatus.PENDING.value)),
                 func.lower(BookingCase.contact_email).in_(sorted(recipients)),
             )
         )
@@ -1134,8 +1260,10 @@ def link_outbound(session: Session, message: InboundMessage) -> str:
     numbers = set(PO_RE.findall(f"{message.subject} {message.body}"))
     linked = 0
     for case in candidates:
-        if case.status == CaseStatus.SENT.value and case.thread_id:
+        if case.status == CaseStatus.PENDING.value and case.thread_id:
             continue
+        if case.status == CaseStatus.UNSCHEDULED.value and not has_request(case):
+            continue  # only a drafted request is linked to a person's send
         same_subject = any(
             normalize_subject(m.subject).lower() == subject
             for m in case.messages
@@ -1200,12 +1328,18 @@ def _apply_customer_desk_message(
         delivery_ref=ref,
         delivery_at=start.isoformat(),
     )
-    if case.status in (CaseStatus.APPROVED.value, CaseStatus.CLOSED.value):
+    if case.status in DECIDED_STATUSES:
         return True
     settings = responder.settings if responder is not None else None
     if settings is None:
-        case.status = CaseStatus.NEEDS_HUMAN.value
-        case.reason = f"delivery moved to {ref}; re-request the pickup"[:255]
+        flag(
+            session,
+            case,
+            ExceptionType.DELIVERY_MOVED,
+            f"delivery moved to {ref}; re-request the pickup",
+            delivery_ref=ref,
+            delivery_at=start.isoformat(),
+        )
         return True
     new_request = requested_local(
         tendered_pickup_utc=None,
@@ -1223,10 +1357,16 @@ def _apply_customer_desk_message(
         _event(session, case, "po_date_floor", reason=why, feasible=feasible)
     if not feasible:
         case.requested_local = new_request
-        case.status = CaseStatus.NEEDS_HUMAN.value
-        case.reason = (why or f"delivery moved to {ref}; the pickup cannot be re-requested")[:255]
+        flag(
+            session,
+            case,
+            ExceptionType.SLOT_UNWORKABLE,
+            why or f"delivery moved to {ref}; the pickup cannot be re-requested",
+            requested=new_request,
+            delivery_ref=ref,
+        )
         return True
-    if any(m.direction == "out" for m in case.messages) and responder is not None:
+    if case.status != CaseStatus.UNSCHEDULED.value and responder is not None:
         reschedule_case(
             session,
             case,
@@ -1237,9 +1377,16 @@ def _apply_customer_desk_message(
             note="Due to the receiver's availability, we will need to move this pickup.",
         )
     else:
+        # Nothing has gone out yet: the next request simply asks for the new day. A missing
+        # desk stays open; only what the old delivery made unworkable is cleared.
         case.requested_local = new_request
-        case.status = CaseStatus.NEW.value
         case.reason = None
+        resolve(
+            session,
+            case,
+            [ExceptionType.SLOT_UNWORKABLE, ExceptionType.DELIVERY_MOVED],
+            resolution=f"delivery moved to {ref}; pickup request now {new_request}",
+        )
     return True
 
 
@@ -1265,10 +1412,7 @@ def draft_batch(
                 messages.append(draft_case(session, case, mailer, settings, by=by, now=now))
             continue
         for case in group:
-            stale = slot_is_stale(case.requested_local, case.vendor_timezone, settings, now=now)
-            if stale:
-                msg = f"case {case.id}: {stale}; reschedule it first"
-                raise ValueError(msg)
+            _check_draftable(case, settings, now=now)
         group.sort(key=lambda c: c.requested_local or "")
         profile = vendor_profile(repo, group[0].facility_key) if group[0].facility_key else None
         date_only = bool(profile and profile.date_only)
@@ -1304,7 +1448,7 @@ def draft_batch(
             case.messages.append(message)
             session.flush()
             record_delivery(session, case, message, draft, result, actor=by)
-            case.status = CaseStatus.SENT.value if result.sent else CaseStatus.DRAFTED.value
+            case.status = CaseStatus.PENDING.value if result.sent else CaseStatus.UNSCHEDULED.value
             case.reason = None
             session.flush()
             _event(
@@ -1343,25 +1487,92 @@ def appointment_payload(case: BookingCase) -> dict[str, Any]:
 def approve(
     session: Session, case: BookingCase, *, by: str, client: TransportProClient | None = None
 ) -> tuple[dict[str, Any], bool]:
-    """A person approves the proposed slot; write it only when the client allows writes."""
-    if case.status != CaseStatus.PROPOSED.value:
-        msg = f"case {case.id} is {case.status}; only proposed cases can be approved"
+    """A person approves the vendor's confirmation; write it only when the client allows writes.
+
+    The case becomes scheduled and its confirmation review is resolved. Anything else still
+    open (a later question, say) stays open.
+    """
+    if case.status != CaseStatus.PENDING.value or not open_exceptions(
+        case, ExceptionType.CONFIRMATION_REVIEW
+    ):
+        msg = f"case {case.id} is {case.status} with no confirmation to review; nothing to approve"
         raise ValueError(msg)
     payload = appointment_payload(case)
     written = False
     if client is not None and client.allow_writes:
         client.set_appointment(**payload)
         written = True
-    case.status = CaseStatus.APPROVED.value
+    case.status = CaseStatus.SCHEDULED.value
+    case.reason = None
+    resolve(session, case, [ExceptionType.CONFIRMATION_REVIEW], resolution="approved", by=by)
     _event(session, case, "approved", actor=by, payload=payload, written_to_tpro=written)
     return payload, written
 
 
+def mark_booked(
+    session: Session,
+    case: BookingCase,
+    *,
+    by: str,
+    via: str,
+    local: str | None = None,
+    pickup_number: str | None = None,
+    note: str | None = None,
+) -> None:
+    """A person booked the pickup outside the agent: by phone, on a portal, by their own email.
+
+    The case becomes scheduled (with the slot, when given, as ``YYYY-MM-DD`` or
+    ``YYYY-MM-DD HH:MM`` vendor-local) and everything open on it is resolved as booked.
+    """
+    if case.status == CaseStatus.CANCELED.value:
+        msg = f"case {case.id} is canceled; nothing to mark as booked"
+        raise ValueError(msg)
+    if local:
+        day, _, clock = local.partition(" ")
+        start = _local_to_utc(day, clock or None, case.vendor_timezone)
+        case.confirmed_local = local
+        case.confirmed_start_utc = start
+        case.confirmed_end_utc = start
+    case.pickup_number = pickup_number or case.pickup_number
+    case.status = CaseStatus.SCHEDULED.value
+    case.reason = (f"booked by {via}" + (f": {note}" if note else ""))[:255]
+    resolve_all(session, case, resolution=f"booked by {via}", by=by)
+    _event(
+        session,
+        case,
+        "marked_booked",
+        actor=by,
+        via=via,
+        local=local,
+        pickup_number=case.pickup_number,
+        note=note,
+    )
+
+
 def close_case(session: Session, case: BookingCase, *, by: str, reason: str) -> None:
-    """Close a case without booking."""
-    case.status = CaseStatus.CLOSED.value
+    """Cancel a case that is no longer needed; everything open on it is resolved with it.
+
+    A pickup booked some other way is not canceled: use :func:`mark_booked`.
+    """
+    case.status = CaseStatus.CANCELED.value
     case.reason = reason[:255]
+    resolve_all(session, case, resolution=f"case canceled: {reason}", by=by)
     _event(session, case, "closed", actor=by, reason=reason)
+
+
+def summary_line(case: BookingCase) -> str:
+    """One line per case for ``booking list``: status, what is open, vendor, PO, slot."""
+    kinds = open_kinds(case)
+    flags = " ".join(f"!{k}" for k in kinds)
+    if not flags and case.status == CaseStatus.UNSCHEDULED.value and has_request(case):
+        flags = "draft ready"
+    note = case.open_exceptions[0].description if kinds else case.reason
+    return (
+        f"#{case.id:<4} load {case.load_id:<9} {case.status:<11} {flags:<22} "
+        f"{(case.vendor_name or '?')[:32]:<32} "
+        f"PO {', '.join(str(p) for p in case.po_numbers) or '-'} "
+        f"req {case.requested_local or '?'}" + (f"  ({note})" if note else "")
+    )
 
 
 def describe(case: BookingCase) -> str:
@@ -1369,6 +1580,13 @@ def describe(case: BookingCase) -> str:
     lines = [
         f"case #{case.id}  load {case.load_id}  status {case.status}"
         + (f"  ({case.reason})" if case.reason else ""),
+    ]
+    for exc in case.open_exceptions:
+        lines.append(
+            f"  OPEN      {exc.kind}: {exc.description}  "
+            f"[{exc.raised_by} {exc.raised_at:%m/%d %H:%M}]"
+        )
+    lines += [
         f"  vendor    {case.vendor_name or '?'} {case.vendor_city or ''}  [{case.facility_key}]",
         f"  desk      {case.contact_email or 'none'}  ({case.booking_method or 'unknown method'})",
         f"  PO        {', '.join(str(p) for p in case.po_numbers) or 'none'}",
@@ -1382,6 +1600,8 @@ def describe(case: BookingCase) -> str:
             f"  confirmed {case.confirmed_local} local"
             + (f", pickup# {case.pickup_number}" if case.pickup_number else "")
         )
+    if case.reschedule_count:
+        lines.append(f"  rescheduled {case.reschedule_count} time(s)")
     for m in case.messages:
         head = f"  {'->' if m.direction == 'out' else '<-'} {m.kind:<8} {m.subject or ''}"
         if m.direction == "in" and m.classification:
@@ -1390,4 +1610,10 @@ def describe(case: BookingCase) -> str:
                 f"  => {c.get('status')} {c.get('pickup_date') or ''} {c.get('pickup_time') or ''}"
             )
         lines.append(head)
+    for exc in case.exceptions:
+        if exc.resolved_at is not None:
+            lines.append(
+                f"  resolved  {exc.kind}: {exc.resolution}  "
+                f"[{exc.resolved_by} {exc.resolved_at:%m/%d %H:%M}]"
+            )
     return "\n".join(lines)

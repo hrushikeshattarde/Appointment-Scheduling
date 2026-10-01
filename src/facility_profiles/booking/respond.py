@@ -8,7 +8,9 @@ The policy is deliberately narrow. The agent only ever does five things in a thr
 4. nudge once when a request goes unanswered,
 5. draft a note to the customer's inbound desk when the vendor cannot ship as planned.
 
-Everything else, and anything that mentions money, is handed to a person. Every message is a
+Everything else, and anything that mentions money, is handed to a person: the exception the
+reply raised stays open with the agent's reason added to it. A move that settles the reply
+resolves its exception (an answered question, an offer accepted or declined). Every message is a
 draft in draft mode.
 """
 
@@ -28,9 +30,16 @@ from sqlalchemy.orm import Session
 
 from facility_profiles import __version__
 from facility_profiles.booking.mail import Mailer, OutboundDraft, Sender
-from facility_profiles.booking.models import BookingCase, BookingEvent, BookingMessage, CaseStatus
+from facility_profiles.booking.models import (
+    BookingCase,
+    BookingEvent,
+    BookingMessage,
+    CaseStatus,
+    ExceptionType,
+)
 from facility_profiles.booking.outbox import dispatch
 from facility_profiles.booking.schema import ReplyClassification, ReplyStatus
+from facility_profiles.booking.worklist import annotate, flag, resolve
 from facility_profiles.config import Settings
 from facility_profiles.extraction.llm import ExtractionError
 from facility_profiles.extraction.openrouter import (
@@ -463,12 +472,10 @@ class Responder:
     def act(
         self, session: Session, case: BookingCase, reply: BookingMessage | None, plan: ResponsePlan
     ) -> BookingMessage | None:
-        """Draft the planned message, record it and move the case."""
+        """Draft the planned message, record it, move the case and settle what the reply raised."""
         if plan.intent == ResponseIntent.HANDOFF or not plan.body or not plan.to_addr:
-            case.status = CaseStatus.NEEDS_HUMAN.value
-            case.reason = (f"{case.reason} | agent: {plan.reason}" if case.reason else plan.reason)[
-                :255
-            ]
+            if annotate(session, case, plan.reason) is None:
+                flag(session, case, ExceptionType.HANDOFF, plan.reason)
             self._event(session, case, "handoff", reason=plan.reason)
             return None
         subject = self._subject(case, reply, plan)
@@ -503,18 +510,50 @@ class Responder:
             case.confirmed_local = plan.proposed_local
             case.confirmed_start_utc = start
             case.confirmed_end_utc = start
-            case.status = CaseStatus.PROPOSED.value
+            case.status = CaseStatus.PENDING.value
             case.reason = None
-        elif plan.intent in (ResponseIntent.ASK_ALTERNATIVE, ResponseIntent.ANSWER_QUESTION):
-            case.status = CaseStatus.SENT.value
+            # The offer is settled; what it books still waits for a person's approval.
+            resolve(
+                session,
+                case,
+                [ExceptionType.PROPOSED_TIME_REVIEW],
+                resolution=f"agent accepted: {plan.reason}",
+            )
+            pickup = f", pickup# {case.pickup_number}" if case.pickup_number else ""
+            flag(
+                session,
+                case,
+                ExceptionType.CONFIRMATION_REVIEW,
+                f"vendor offered {plan.proposed_local}{pickup}; the agent accepted it, approve "
+                "to accept",
+                local=plan.proposed_local,
+                pickup_number=case.pickup_number,
+                accepted_by_agent=True,
+            )
+        elif plan.intent == ResponseIntent.ASK_ALTERNATIVE:
+            case.status = CaseStatus.PENDING.value
             case.reason = None
+            resolve(
+                session,
+                case,
+                [ExceptionType.PROPOSED_TIME_REVIEW],
+                resolution=f"agent asked for other days: {plan.reason}",
+            )
+        elif plan.intent == ResponseIntent.ANSWER_QUESTION:
+            # A question never moved the slot, so the status stays; only the question is settled.
+            resolve(
+                session, case, [ExceptionType.FACILITY_QUESTION], resolution=f"agent {plan.reason}"
+            )
         elif plan.intent == ResponseIntent.FOLLOW_UP:
-            case.status = CaseStatus.SENT.value
+            case.status = CaseStatus.PENDING.value
         elif plan.intent == ResponseIntent.ACKNOWLEDGE:
             pass  # the case already moved on the confirmation itself
-        else:  # escalation: a person sends it and decides what happens to the pickup
-            case.status = CaseStatus.NEEDS_HUMAN.value
-            case.reason = plan.reason[:255]
+        else:  # escalation: a person sends it; the decline stays open until the delivery moves
+            annotate(
+                session,
+                case,
+                "note to the customer desk drafted; the customer must move the delivery",
+            )
         session.flush()
         self._event(
             session, case, plan.intent.value, reason=plan.reason, to=draft.to_addr, draft_ref=ref
@@ -533,8 +572,12 @@ class Responder:
         return plan, self.act(session, case, reply, plan)
 
     def follow_up(self, session: Session, case: BookingCase) -> BookingMessage | None:
-        """Nudge once when a sent request has had no reply for the configured time."""
-        if case.status != CaseStatus.SENT.value:
+        """Nudge once when a sent request has had no reply for the configured time.
+
+        Only a pending case with nothing open is nudged: a confirmation waiting for approval or
+        a question waiting for a person is not the vendor's silence.
+        """
+        if case.status != CaseStatus.PENDING.value or case.open_exceptions:
             return None
         outbound = [m for m in case.messages if m.direction == "out"]
         if not outbound or any(m.kind == ResponseIntent.FOLLOW_UP.value for m in outbound):

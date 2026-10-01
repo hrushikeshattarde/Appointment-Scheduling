@@ -35,7 +35,7 @@ from facility_profiles.booking.service import (
 from facility_profiles.cli import app
 from facility_profiles.storage.db import ensure_columns, init_db, make_engine
 from tests.conftest import FakeTPro
-from tests.test_booking import NOW, lidl_load, reply, seed_vendor
+from tests.test_booking import NOW, awaiting_approval, lidl_load, reply, seed_vendor
 
 DESK = "cci@udfinc.com"
 INTERNAL = ["circledelivers.com"]
@@ -93,7 +93,7 @@ def test_send_moves_the_case_to_sent_with_the_ids_a_reply_will_carry(settings, s
         case = list_cases(session)[0]
         message = draft_case(session, case, sender, settings, by="megan", now=NOW)
         session.commit()
-        assert case.status == CaseStatus.SENT.value
+        assert case.status == CaseStatus.PENDING.value
         assert message.sent_at is not None and message.message_id == "sent-1"
         assert message.rfc_message_id == sender.deliveries[0].rfc_message_id
         assert message.thread_id == "thread-1" and case.thread_id == "thread-1"
@@ -113,7 +113,7 @@ def test_send_gate_refuses_draft_mode_untrusted_desks_and_the_daily_cap(settings
         first, second, third = sorted(list_cases(session), key=lambda c: c.id)
         with pytest.raises(SendRefusedError, match="not 'send'"):
             draft_case(session, first, sender, draft_only, now=NOW)
-        assert first.status == CaseStatus.NEW.value and not sender.drafts
+        assert first.status == CaseStatus.UNSCHEDULED.value and not sender.drafts
 
     send = _send_settings(settings).model_copy(update={"booking_send_daily_cap": 1})
     with sessions() as session:
@@ -125,7 +125,7 @@ def test_send_gate_refuses_draft_mode_untrusted_desks_and_the_daily_cap(settings
         session.commit()
         with pytest.raises(SendRefusedError, match="daily send cap"):
             draft_case(session, third, sender, send, now=NOW)
-        assert len(sender.drafts) == 1 and third.status == CaseStatus.NEW.value
+        assert len(sender.drafts) == 1 and third.status == CaseStatus.UNSCHEDULED.value
 
 
 def test_batched_send_records_the_same_message_on_every_case(settings, sessions):
@@ -133,12 +133,14 @@ def test_batched_send_records_the_same_message_on_every_case(settings, sessions)
     _scanned(settings, sessions, "226321092660", "226321092661")
     sender = RecordingSender()
     with sessions() as session:
-        cases = list_cases(session, CaseStatus.NEW.value)
+        cases = list_cases(session, CaseStatus.UNSCHEDULED.value)
         messages = draft_batch(session, cases, sender, settings, now=NOW)
         session.commit()
         assert len(sender.drafts) == 1 and len(messages) == 2
         assert {m.rfc_message_id for m in messages} == {sender.deliveries[0].rfc_message_id}
-        assert all(c.status == CaseStatus.SENT.value and c.thread_id == "thread-1" for c in cases)
+        assert all(
+            c.status == CaseStatus.PENDING.value and c.thread_id == "thread-1" for c in cases
+        )
 
 
 # ------------------------------------------------------------------------------- matching ----
@@ -179,7 +181,7 @@ def test_reply_is_matched_by_in_reply_to_without_thread_or_po(settings, sessions
         session.commit()
         case = session.get(BookingCase, case_id)
         assert stats.proposed == 1 and case is not None
-        assert case.status == CaseStatus.PROPOSED.value
+        assert awaiting_approval(case)
         inbound = next(m for m in case.messages if m.direction == "in")
         assert inbound.rfc_message_id == "<conf-9@udfinc.com>"
         assert inbound.in_reply_to == sent_id.upper() and inbound.references_header == sent_id
@@ -213,7 +215,7 @@ def test_a_persons_send_seen_in_the_archive_links_the_drafted_case(settings, ses
         draft_case(session, case, RecordingMailer(), settings, now=NOW)
         session.commit()
         case_id = case.id
-        assert case.status == CaseStatus.DRAFTED.value and case.thread_id is None
+        assert case.status == CaseStatus.UNSCHEDULED.value and case.thread_id is None
 
     megan_sent = InboundMessage(
         message_id="archive-key-3",
@@ -244,7 +246,7 @@ def test_a_persons_send_seen_in_the_archive_links_the_drafted_case(settings, ses
         request = next(m for m in case.messages if m.direction == "out")
         assert request.rfc_message_id == "<megan-1@mail.gmail.com>"
         assert request.thread_id == "mailbox-thread-7" and request.sent_at is not None
-        assert case.thread_id == "mailbox-thread-7" and case.status == CaseStatus.PROPOSED.value
+        assert case.thread_id == "mailbox-thread-7" and awaiting_approval(case)
         assert any(e.action == "sent" and e.actor == "archive" for e in case.events)
 
 
@@ -335,7 +337,7 @@ def test_agent_replies_answer_the_vendors_message_id_and_are_sent_when_the_outbo
         )
         session.commit()
         case = session.get(BookingCase, case_id)
-        assert case is not None and case.status == CaseStatus.PROPOSED.value
+        assert case is not None and awaiting_approval(case)
         thanks = sender.drafts[-1]
         assert thanks.body.startswith("Thank you!")
         assert thanks.in_reply_to == "<conf-77@udfinc.com>" and thanks.references == sent_id
@@ -351,7 +353,7 @@ def test_agent_replies_answer_the_vendors_message_id_and_are_sent_when_the_outbo
             session, case, sender, settings, requested_local="2026-10-02 09:00", by="megan"
         )
         assert sender.drafts[-1].in_reply_to == "<conf-77@udfinc.com>"
-        assert message.sent_at is not None and case.status == CaseStatus.SENT.value
+        assert message.sent_at is not None and case.status == CaseStatus.PENDING.value
 
 
 # ------------------------------------------------------------------------------ bootstrap ----

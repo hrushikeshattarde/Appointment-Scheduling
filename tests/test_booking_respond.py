@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 from facility_profiles.booking.classify import FakeReplyClassifier, ReplyContext
 from facility_profiles.booking.mail import InboundMessage, RecordingMailer
-from facility_profiles.booking.models import BookingCase, CaseStatus
+from facility_profiles.booking.models import BookingCase, CaseStatus, ExceptionType
 from facility_profiles.booking.respond import (
     AnswerDraft,
     FakeAnswerComposer,
@@ -19,6 +19,7 @@ from facility_profiles.booking.respond import (
 )
 from facility_profiles.booking.schema import ReplyClassification, ReplyStatus
 from facility_profiles.booking.service import draft_case, ingest, list_cases, mark_sent, scan
+from facility_profiles.booking.worklist import open_kinds, resolve
 from facility_profiles.storage.db import session_scope
 from facility_profiles.storage.repository import as_utc
 from tests.conftest import FakeTPro
@@ -85,7 +86,12 @@ def test_counter_offer_is_accepted_when_it_makes_the_delivery(settings, sessions
         )
         assert stats.needs_human == 1 and stats.responded == 1
         case = session.get(BookingCase, case_id)
-        assert case is not None and case.status == CaseStatus.PROPOSED.value
+        # The agent settled the offer; the slot it accepted still waits for a person's approval.
+        assert case is not None and case.status == CaseStatus.PENDING.value
+        assert open_kinds(case) == ["confirmation_review"]
+        offer = case.exceptions[0]
+        assert offer.kind == "proposed_time_review"
+        assert offer.resolution == "agent accepted: offer 10/01 @ 1100 makes the delivery slot"
         assert case.confirmed_local == "2026-10-01 11:00"
         assert as_utc(case.confirmed_start_utc) == datetime(2026, 10, 1, 15, 0, tzinfo=UTC)
         sent = mailer.drafts[-1]
@@ -124,8 +130,15 @@ def test_counter_offer_that_misses_delivery_asks_for_alternatives_then_caps(sett
             "would not make our delivery appointment on 10/02 (PYE_021026123)" in outbound[1].body
         )
         assert "10/01 or 09/30 or 09/29" in outbound[1].body
-        # Third reply hits the round cap: handed to a person, no draft.
-        assert case.status == CaseStatus.NEEDS_HUMAN.value
+        # The two offers the agent answered are settled; the third hits the round cap and stays
+        # open for a person, with the agent's reason on it. No draft.
+        assert case.status == CaseStatus.PENDING.value
+        assert open_kinds(case) == ["proposed_time_review"]
+        assert all(
+            (e.resolution or "").startswith("agent asked for other days: offer would arrive")
+            for e in case.exceptions[:2]
+        )
+        assert case.open_exceptions[0].detail["agent"] == "2 rounds reached"
         assert (
             case.events[-1].action == "handoff"
             and "rounds reached" in case.events[-1].detail["reason"]
@@ -169,7 +182,8 @@ def test_questions_are_answered_from_facts_or_handed_off(settings, sessions):
             )
 
         ask("Which carrier is picking up?", "q1")
-        assert case.status == CaseStatus.SENT.value
+        assert case.status == CaseStatus.PENDING.value and open_kinds(case) == []
+        assert case.exceptions[0].resolution == "agent answered from carrier"
         assert mailer.drafts[-1].body.startswith("The carrier is Circle Logistics, Inc. Thank you!")
         ask("Both orders?", "q2")
         assert mailer.drafts[-1].body.startswith("Just PO# 226321092660.")
@@ -183,13 +197,17 @@ def test_questions_are_answered_from_facts_or_handed_off(settings, sessions):
         assert composer.calls[-1] == "Is this a reefer or a dry van?"
         assert mailer.drafts[-1].body.startswith("This is a Reefer load.")
         ask("Please send the driver name and truck number.", "q5")
-        assert case.status == CaseStatus.NEEDS_HUMAN.value and "driver details" in (
-            case.reason or ""
+        assert case.status == CaseStatus.PENDING.value and open_kinds(case) == ["facility_question"]
+        assert "driver details" in case.open_exceptions[0].description
+        resolve(
+            session,
+            case,
+            [ExceptionType.FACILITY_QUESTION],
+            resolution="sent the driver details",
+            by="megan",
         )
-        case.status = CaseStatus.SENT.value
-        case.reason = None
         ask("Confirm PO 999999999 please?", "q6")
-        assert case.status == CaseStatus.NEEDS_HUMAN.value
+        assert open_kinds(case) == ["facility_question"]
         assert "number not on the case: 999999999" in case.events[-1].detail["reason"]
 
 
@@ -221,7 +239,11 @@ def test_rejection_drafts_a_note_to_the_customer_desk_and_money_talk_is_handed_o
             internal_domains=["circledelivers.com"],
             responder=responder,
         )
-        assert case.status == CaseStatus.NEEDS_HUMAN.value
+        # Declined, and the decline stays open: a person sends the note and Lidl moves the delivery.
+        assert case.status == CaseStatus.DECLINED.value
+        assert case.reason == "vendor cannot book: PO will not be ready until 10/07"
+        assert open_kinds(case) == ["facility_declined"]
+        assert "note to the customer desk drafted" in case.open_exceptions[0].description
         note = mailer.drafts[-1]
         assert note.to_addr == "inbound@lidl.us" and note.thread_id is None
         assert note.subject == "RESCHEDULE 226321092660"
@@ -231,7 +253,6 @@ def test_rejection_drafts_a_note_to_the_customer_desk_and_money_talk_is_handed_o
         )
         assert case.messages[-1].kind == "escalate_to_customer"
 
-        case.status = CaseStatus.SENT.value
         ingest(
             session,
             [reply("Will you pay detention if the driver waits?", mid="d1")],
@@ -239,7 +260,11 @@ def test_rejection_drafts_a_note_to_the_customer_desk_and_money_talk_is_handed_o
             internal_domains=["circledelivers.com"],
             responder=responder,
         )
-        assert case.status == CaseStatus.NEEDS_HUMAN.value
+        # A question does not move the slot: still declined, the decline still open, and the
+        # money question handed to a person beside it.
+        assert case.status == CaseStatus.DECLINED.value
+        assert open_kinds(case) == ["facility_declined", "facility_question"]
+        assert case.open_exceptions[1].detail["agent"] == "reply mentions money or a claim"
         assert case.events[-1].detail["reason"] == "reply mentions money or a claim"
         assert len(mailer.drafts) == 2  # nothing drafted for the money question
 
@@ -261,7 +286,7 @@ def test_follow_up_once_after_the_configured_silence(settings, sessions):
         message = later.follow_up(session, case)
         assert message is not None and message.kind == "follow_up"
         assert "Hello,\n\nFollowing up on this." in mailer.drafts[-1].body
-        assert case.status == CaseStatus.SENT.value
+        assert case.status == CaseStatus.PENDING.value
         assert later.follow_up(session, case) is None  # only once
 
 
@@ -346,15 +371,14 @@ def test_bare_set_and_time_only_confirmations_use_the_requested_slot(settings, s
         )
         # Bare "SET!" books the slot we asked for; the pod's "Thank you!" is drafted in the thread.
         assert stats.proposed == 1 and stats.responded == 1
-        assert case.status == CaseStatus.PROPOSED.value
+        assert case.status == CaseStatus.PENDING.value
+        assert open_kinds(case) == ["confirmation_review"]
         assert case.confirmed_local == "2026-10-01 09:00" and case.pickup_number == "4119085"
         assert (
             mailer.drafts[-1].body.startswith("Thank you!")
             and case.messages[-1].kind == "acknowledge"
         )
 
-        case.status = CaseStatus.SENT.value
-        case.confirmed_local = None
         ingest(
             session,
             [reply("This is good for 1430", mid="t1")],
@@ -362,8 +386,12 @@ def test_bare_set_and_time_only_confirmations_use_the_requested_slot(settings, s
             internal_domains=["circledelivers.com"],
             responder=responder,
         )
-        # A time-only answer means the requested date at that time.
-        assert case.status == CaseStatus.PROPOSED.value
+        # A time-only answer means the requested date at that time. The newer confirmation
+        # replaces the one still waiting for approval; there is one review, for 14:30.
+        assert case.status == CaseStatus.PENDING.value
+        assert open_kinds(case) == ["confirmation_review"]
+        assert "2026-10-01 14:30" in case.open_exceptions[0].description
+        assert case.exceptions[0].resolution == "superseded by a later reply (vendor_confirmed)"
         assert case.confirmed_local == "2026-10-01 14:30"
         assert as_utc(case.confirmed_start_utc) == datetime(2026, 10, 1, 18, 30, tzinfo=UTC)
 
@@ -395,8 +423,8 @@ def test_deferred_replies_keep_waiting_and_unbacked_confirmations_are_not_truste
             internal_domains=["circledelivers.com"],
             responder=Responder(settings, mailer, now=NOW),
         )
-        assert stats.deferred == 1 and case.status == CaseStatus.SENT.value
-        assert case.reason == "vendor asked to check back on 2026-10-05"
+        assert stats.deferred == 1 and case.status == CaseStatus.PENDING.value
+        assert case.reason == "vendor asked to check back on 2026-10-05" and open_kinds(case) == []
         assert len(mailer.drafts) == 1  # nothing drafted back
 
         stats = ingest(
@@ -407,7 +435,7 @@ def test_deferred_replies_keep_waiting_and_unbacked_confirmations_are_not_truste
             responder=Responder(settings, mailer, now=NOW),
         )
         # "confirmed" with no quote found in the text is not a confirmation.
-        assert stats.unrelated == 1 and case.status == CaseStatus.SENT.value
+        assert stats.unrelated == 1 and case.status == CaseStatus.PENDING.value
         assert case.messages[-1].classification["status"] == "unrelated"
 
 
@@ -433,7 +461,7 @@ def test_follow_up_waits_for_the_vendor_check_back_day(settings, sessions):
             classifier,
             internal_domains=["circledelivers.com"],
         )
-        assert case.status == CaseStatus.SENT.value
+        assert case.status == CaseStatus.PENDING.value
         # Two days later would normally trigger a nudge, but the vendor named a day.
         assert (
             Responder(settings, mailer, now=NOW + timedelta(days=2)).follow_up(session, case)
@@ -508,6 +536,7 @@ def test_edited_times_in_the_quoted_text_count_as_a_counter_offer(settings, sess
         )
         # 14:30 on 10/01 still makes the delivery, so the agent accepts it.
         assert (
-            case.status == CaseStatus.PROPOSED.value and case.confirmed_local == "2026-10-01 14:30"
+            case.status == CaseStatus.PENDING.value and case.confirmed_local == "2026-10-01 14:30"
         )
+        assert open_kinds(case) == ["confirmation_review"]
         assert mailer.drafts[-1].body.startswith("Yes, 10/01 @ 1430 works.")

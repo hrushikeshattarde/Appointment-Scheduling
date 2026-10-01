@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Engine, create_engine, event, inspect, text
+from sqlalchemy import Column, DefaultClause, Engine, create_engine, event, inspect, text
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -46,19 +46,23 @@ def make_engine(database_url: str, *, echo: bool = False) -> Engine:
 
 
 def init_db(engine: Engine) -> None:
-    """Create all tables that do not exist yet (including the booking agent's), add new columns."""
+    """Create missing tables (the booking agent's too), add new columns, upgrade old rows."""
     from facility_profiles.booking import models as _booking_models  # noqa: F401, PLC0415
+    from facility_profiles.booking.worklist import migrate_legacy_statuses  # noqa: PLC0415
 
     Base.metadata.create_all(engine)
     ensure_columns(engine)
+    with Session(engine) as session, session.begin():
+        migrate_legacy_statuses(session)
 
 
 def ensure_columns(engine: Engine) -> list[str]:
     """Add columns the models gained since a store was created; return what was added.
 
     ``create_all`` never alters an existing table, and the pilot stores are SQLite files that
-    predate some columns. Adding a nullable column is the one schema change SQLite does in
-    place, so it is done here; anything else waits for Alembic.
+    predate some columns. Adding a nullable column (with the model's server default, so older
+    rows read as that value) is the one schema change SQLite does in place, so it is done here;
+    anything else waits for Alembic.
     """
     inspector = inspect(engine)
     existing_tables = set(inspector.get_table_names())
@@ -71,7 +75,7 @@ def ensure_columns(engine: Engine) -> list[str]:
             for column in table.columns:
                 if column.name in present:
                     continue
-                ddl = column.type.compile(dialect=engine.dialect)
+                ddl = column.type.compile(dialect=engine.dialect) + _literal_default(column)
                 conn.execute(text(f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {ddl}'))
                 added.append(f"{table.name}.{column.name}")
                 present.add(column.name)
@@ -84,6 +88,14 @@ def ensure_columns(engine: Engine) -> list[str]:
                 index.create(bind=conn)
                 added.append(f"{table.name}.{index.name}")
     return added
+
+
+def _literal_default(column: Column[Any]) -> str:
+    """The DEFAULT clause for a column added in place: its string server default, quoted."""
+    default = column.server_default
+    if isinstance(default, DefaultClause) and isinstance(default.arg, str):
+        return " DEFAULT '" + default.arg.replace("'", "''") + "'"
+    return ""
 
 
 def session_factory(engine: Engine) -> sessionmaker[Session]:

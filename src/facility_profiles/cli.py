@@ -22,6 +22,7 @@ from typing import Annotated
 import typer
 
 from facility_profiles import __version__
+from facility_profiles.booking.models import CaseStatus, ExceptionType
 from facility_profiles.config import Settings, get_settings
 from facility_profiles.domain.schema import PROFILE_FIELDS, FieldState, Role
 from facility_profiles.logging import configure_logging, get_logger
@@ -408,24 +409,26 @@ def booking_scan(
 
 @booking_app.command("list")
 def booking_list(
-    status: Annotated[str | None, typer.Option(help="Only this status")] = None,
+    status: Annotated[CaseStatus | None, typer.Option(help="Only this status")] = None,
+    exception: Annotated[
+        str | None,
+        typer.Option(help="Only cases with this open exception, or 'any' for every open one"),
+    ] = None,
 ) -> None:
-    """List booking cases."""
-    from facility_profiles.booking.service import list_cases
+    """List booking cases: status, open exceptions (!kind), vendor, PO, requested slot."""
+    from facility_profiles.booking.service import list_cases, summary_line
 
+    kinds = [k.value for k in ExceptionType]
+    if exception is not None and exception != "any" and exception not in kinds:
+        raise typer.BadParameter(f"exception must be 'any' or one of {', '.join(kinds)}")
     settings = _settings()
     with session_scope(_sessions(settings)) as session:
-        cases = list_cases(session, status)
+        cases = list_cases(session, status.value if status else None, exception=exception)
         if not cases:
             typer.echo("no cases")
             return
         for c in cases:
-            typer.echo(
-                f"#{c.id:<4} load {c.load_id:<9} {c.status:<13} "
-                f"{(c.vendor_name or '?')[:32]:<32} "
-                f"PO {', '.join(str(p) for p in c.po_numbers) or '-'} "
-                f"req {c.requested_local or '?'}" + (f"  ({c.reason})" if c.reason else "")
-            )
+            typer.echo(summary_line(c))
 
 
 @booking_app.command("show")
@@ -452,8 +455,7 @@ def booking_draft(
 ) -> None:
     """Compose the request emails as drafts, one per vendor desk (.eml in the drafts folder)."""
     from facility_profiles.booking.mail import LocalDraftMailer
-    from facility_profiles.booking.models import CaseStatus
-    from facility_profiles.booking.service import draft_batch, draft_case, list_cases
+    from facility_profiles.booking.service import draft_batch, draft_case, ready_to_draft
 
     settings = _settings()
     mailer = LocalDraftMailer(Path(settings.booking_drafts_dir), sender=settings.booking_sender)
@@ -465,8 +467,7 @@ def booking_draft(
                 typer.echo(f"#{case_id}: {exc}")
                 raise typer.Exit(code=1) from exc
         else:
-            cases = [c for c in list_cases(session, CaseStatus.NEW.value) if c.contact_email]
-            messages = draft_batch(session, cases, mailer, settings)
+            messages = draft_batch(session, ready_to_draft(session), mailer, settings)
         for message in messages:
             typer.echo(
                 f"#{message.case_id} drafted -> {message.to_addr}: {message.subject}  "
@@ -483,9 +484,8 @@ def booking_send(
 ) -> None:
     """Send the request through Gmail as the agent's mailbox (FP_BOOKING_MODE=send)."""
     from facility_profiles.booking.mail import GmailSender
-    from facility_profiles.booking.models import CaseStatus
     from facility_profiles.booking.outbox import SendRefusedError
-    from facility_profiles.booking.service import draft_batch, draft_case, list_cases
+    from facility_profiles.booking.service import draft_batch, draft_case, ready_to_draft
 
     settings = _settings()
     if settings.booking_mode != "send":
@@ -504,8 +504,7 @@ def booking_send(
                     draft_case(session, _booking_case(session, case_id), sender, settings, by=by)
                 ]
             else:
-                cases = [c for c in list_cases(session, CaseStatus.NEW.value) if c.contact_email]
-                messages = draft_batch(session, cases, sender, settings, by=by)
+                messages = draft_batch(session, ready_to_draft(session), sender, settings, by=by)
         except (SendRefusedError, ValueError) as exc:
             typer.echo(f"refused: {exc}")
             raise typer.Exit(code=1) from exc
@@ -749,7 +748,6 @@ def booking_inbox(
 def booking_follow_up() -> None:
     """Draft one nudge for every sent request with no reply for the configured time."""
     from facility_profiles.booking.mail import LocalDraftMailer
-    from facility_profiles.booking.models import CaseStatus
     from facility_profiles.booking.respond import Responder
     from facility_profiles.booking.service import list_cases
 
@@ -760,7 +758,7 @@ def booking_follow_up() -> None:
     )
     count = 0
     with session_scope(_sessions(settings)) as session:
-        for case in list_cases(session, CaseStatus.SENT.value):
+        for case in list_cases(session, CaseStatus.PENDING.value):
             message = responder.follow_up(session, case)
             if message is not None:
                 count += 1
@@ -775,7 +773,10 @@ def booking_approve(
     case_id: int,
     by: Annotated[str, typer.Option(help="Who approved")],
 ) -> None:
-    """Approve the vendor-confirmed slot. Written to Transport Pro only when writes are enabled."""
+    """Approve the vendor's confirmation: the case becomes scheduled.
+
+    Written to Transport Pro only when writes are enabled.
+    """
     from facility_profiles.booking.service import approve
 
     settings = _settings()
@@ -798,13 +799,67 @@ def booking_close(
     by: Annotated[str, typer.Option(help="Who closed it")],
     reason: Annotated[str, typer.Option(help="Why")],
 ) -> None:
-    """Close a case without booking."""
+    """Cancel a case that is no longer needed. For a pickup booked another way, use `booked`."""
     from facility_profiles.booking.service import close_case
 
     settings = _settings()
     with session_scope(_sessions(settings)) as session:
         close_case(session, _booking_case(session, case_id), by=by, reason=reason)
-    typer.echo(f"#{case_id} closed")
+    typer.echo(f"#{case_id} canceled")
+
+
+@booking_app.command("booked")
+def booking_booked(
+    case_id: int,
+    by: Annotated[str, typer.Option(help="Who booked it")],
+    via: Annotated[str, typer.Option(help="How: phone, portal, email")],
+    date: Annotated[str | None, typer.Option(help="Pickup date, YYYY-MM-DD")] = None,
+    time: Annotated[str | None, typer.Option(help="Pickup time, HH:MM local")] = None,
+    pickup_number: Annotated[str | None, typer.Option(help="Vendor pickup number")] = None,
+    note: Annotated[str | None, typer.Option(help="Anything worth keeping")] = None,
+) -> None:
+    """Record a pickup booked outside the agent: the case becomes scheduled."""
+    from facility_profiles.booking.service import mark_booked
+
+    if time and not date:
+        raise typer.BadParameter("--time needs --date")
+    local = f"{date} {time}" if date and time else date
+    settings = _settings()
+    with session_scope(_sessions(settings)) as session:
+        case = _booking_case(session, case_id)
+        try:
+            mark_booked(
+                session,
+                case,
+                by=by,
+                via=via,
+                local=local,
+                pickup_number=pickup_number,
+                note=note,
+            )
+        except ValueError as exc:
+            typer.echo(str(exc))
+            raise typer.Exit(code=1) from exc
+    typer.echo(f"#{case_id} scheduled (booked by {via})")
+
+
+@booking_app.command("resolve")
+def booking_resolve(
+    case_id: int,
+    kind: Annotated[ExceptionType, typer.Argument(help="The open exception to resolve")],
+    by: Annotated[str, typer.Option(help="Who resolved it")],
+    note: Annotated[str, typer.Option(help="How it was resolved")],
+) -> None:
+    """Resolve an open exception on a case by hand, with a note."""
+    from facility_profiles.booking.worklist import resolve
+
+    settings = _settings()
+    with session_scope(_sessions(settings)) as session:
+        case = _booking_case(session, case_id)
+        if not resolve(session, case, [kind], resolution=note, by=by):
+            typer.echo(f"#{case_id} has no open {kind.value}")
+            raise typer.Exit(code=1)
+    typer.echo(f"#{case_id} {kind.value} resolved")
 
 
 @mail_app.command("collect")

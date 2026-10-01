@@ -122,37 +122,74 @@ Lidl store deliveries are tours planned by Lidl (nothing to book), so the bookab
 
 `facility-profiles booking ...` books vendor pickup appointments by email for customer-tendered
 inbound loads (built for the Lidl inbound pod). It never sends mail and never writes to
-Transport Pro: a person sends each draft and approves each slot.
+Transport Pro: a person sends each draft and approves each confirmation.
 
 ```powershell
 $env:FP_DATABASE_URL = 'sqlite:///./data/facility_profiles_pod-1089-lidl.db'
 facility-profiles booking scan --terminal 1089 --customer 7211 --days-ahead 7
-facility-profiles booking list
-facility-profiles booking draft            # one .eml per new case in exports/drafts
+facility-profiles booking list                     # status, !open exceptions, vendor, PO, slot
+facility-profiles booking list --exception any     # only what needs a person
+facility-profiles booking draft            # one .eml per desk in exports/drafts
 facility-profiles booking sent 12 --by megan --thread <gmail thread id>
 facility-profiles booking inbox --file data/lidl-mail/messages.jsonl   # or --key/--subject
 facility-profiles booking show 12
 facility-profiles booking approve 12 --by megan
+facility-profiles booking resolve 12 facility_question --by megan --note "answered by phone"
+facility-profiles booking booked 12 --by megan --via phone --date 2026-10-05 --time 09:00
 ```
 
+### Status and exceptions
+
+A case's status says only where the pickup appointment stands: `unscheduled` (nothing asked of
+the vendor yet; a draft may be waiting to be sent), `pending` (a request went out), `scheduled`
+(approved by a person, booked another way, or already carrying a vendor pickup number),
+`declined` (the vendor cannot book as asked) or `canceled`. Whatever a person has to do or
+decide is an exception on the case, raised with a one-line description and resolved by the
+agent when the situation clears or by a person with a note (`booking resolve`):
+
+| Exception | Raised when | Cleared by |
+|---|---|---|
+| `missing_method` | the profile has no verified email booking desk | a person (`resolve`, `booked`, `close`) |
+| `method_not_supported` | the vendor books on a portal, by phone, first come first served | a person |
+| `slot_unworkable` | the slot passed, is inside the notice window, or cannot make the delivery | a moved delivery that fixes it, `reschedule`, a person |
+| `confirmation_review` | the vendor confirmed a slot (or the agent accepted its offer) | `approve` (the case becomes scheduled) |
+| `proposed_time_review` | the vendor offered a different time | the agent accepting it or asking for other days, a person |
+| `facility_question` | the vendor asked something | the agent answering it from the case, a person |
+| `facility_declined` | the vendor cannot book as asked | the pickup asked for again (`reschedule`, a new delivery slot from the customer desk) |
+| `stale_confirmation` | a "confirmation" of a slot already past when the vendor wrote | a person |
+| `delivery_moved` | the customer moved the delivery and nothing re-requested the pickup | a person, or the pickup asked for again |
+| `handoff` | the agent stopped and nothing more specific was open | a person |
+
+When the agent hands a reply to a person (money, the round cap, no safe answer) the exception
+the reply raised stays open with the agent's reason added to it. A later reply about the slot (a
+confirmation, an offer, a deferral, a decline) supersedes what earlier replies left open; a
+question only supersedes an earlier question, so "Which door?" after a confirmation leaves the
+confirmation waiting for approval. `close` cancels a case and resolves everything on it;
+`booked` records a pickup booked outside the agent (phone, portal, a person's own email) and
+schedules the case. Stores written before this split are moved onto the new statuses the next
+time any command opens them, each parked case getting the exception its old status implied and a
+`status_migrated` event.
+
 How a case moves: `scan` opens a case for every pickup stop whose appointment is not
-confirmed, keyed to the vendor profile (`needs_profile` when the profile has no verified
-email desk, `already_booked` when the load already carries a vendor pickup number). `draft` composes the request in the pod's own wording (`PO# X on MM/DD @ HHMM`, the
+confirmed, keyed to the vendor profile (`missing_method` or `method_not_supported` when the
+profile has no verified email desk, `scheduled` when the load already carries a vendor pickup
+number). `draft` composes the request in the pod's own wording (`PO# X on MM/DD @ HHMM`, the
 requested time from the tender or backed off the Lidl delivery slot, and nothing else, exactly
 as the pod writes it) and saves it as a draft. `sent` records that a person sent it. `inbox`
 matches replies to cases by thread, PO number or sender, classifies each reply with a
 strict-schema model call (confirmed, counter-offer, question, rejected, unrelated), drops any
 date, time or pickup number the reply's own words do not back (link cruft such as
 `115802102660<tel:(580)%20210-2660>` is stripped first, and a quote from the quoted history
-under the reply only ever backs a counter-offer), and moves the case: confirmed becomes
-`proposed` with the slot in UTC (a bare "SET" or a pickup number alone means the requested slot;
-a time alone means the requested date), deferred ("check back Monday") keeps waiting, everything
-else becomes `needs_human` with the reason. A "confirmation" of a slot that had already passed
-when the vendor wrote ("latest is 9pm tonight" after a missed pickup) goes to a person as a
-work-in note. A confirmation is answered once with the pod's "Thank you!". `approve` records the
-decision and prints the exact Transport Pro `set_appointment` payload; the write itself stays
-behind the client's write flag. Mail that arrives on an approved or closed case (driver ETAs,
-securement, "did this get resolved?") is kept on the case and never read as a new answer.
+under the reply only ever backs a counter-offer), and moves the case: a confirmation sets the
+slot in UTC and raises `confirmation_review` (a bare "SET" or a pickup number alone means the
+requested slot; a time alone means the requested date), deferred ("check back Monday") keeps
+waiting, a counter-offer, a question or a decline raises its exception. A "confirmation" of a
+slot that had already passed when the vendor wrote ("latest is 9pm tonight" after a missed
+pickup) is raised as `stale_confirmation`, a work-in note for a person. A confirmation is
+answered once with the pod's "Thank you!". `approve` records the decision and prints the exact
+Transport Pro `set_appointment` payload; the write itself stays behind the client's write flag.
+Mail that arrives on a scheduled or canceled case (driver ETAs, securement, "did this get
+resolved?") is kept on the case and never read as a new answer.
 
 The conversation policy (`booking/respond.py`) handles what comes back, still as drafts:
 a counter-offer is accepted when the offered pickup still makes the customer's delivery
@@ -173,7 +210,7 @@ this!"; and `booking reschedule ID --date --time --by [--note]` drafts the in-th
 for a new slot after a Circle-side miss, the most common event in the archive.
 
 Third pass through the archive added: the quoted history under a reply is shown to the classifier
-and can back a counter-offer (vendors edit times inside it); `booking draft` batches new cases into
+and can back a counter-offer (vendors edit times inside it); `booking draft` batches the cases ready to draft into
 one email per desk with one line per PO, like the pod; mail from the customer's inbound desk is
 never treated as a vendor reply but is read for a new delivery slot ("8/20 7AM - GRM_200826926"
 or "FRG_200526615 05/20 @ 1100"), which moves the pickup request in the vendor thread; and
@@ -181,9 +218,11 @@ or "FRG_200526615 05/20 @ 1100"), which moves the pickup request in the vendor t
 desk. Lidl delivery slots themselves live in Lidl's DCT dock portal (AMB, CHL and FRZ tabs), which
 Circle books directly; the desk only helps when no slot is free.
 
-Tables: `booking_cases`, `booking_messages`, `booking_events` (created by `init-db`).
-Code: `booking/service.py` (cases), `booking/classify.py` (reply reading and validation),
-`booking/mail.py` (JSONL or Gmail in, `.eml` or Gmail drafts out).
+Tables: `booking_cases`, `booking_messages`, `booking_events`, `booking_exceptions` (created by
+`init-db`, which also adds new columns to older stores and moves old statuses over).
+Code: `booking/service.py` (cases), `booking/worklist.py` (exceptions and the status migration),
+`booking/classify.py` (reply reading and validation), `booking/mail.py` (JSONL or Gmail in,
+`.eml` or Gmail drafts out).
 Real-text regression: `tests/fixtures/lidl_morgan_foods_thread.jsonl` is the pod's September 2026
 Morgan Foods thread in the mail pull's format, Outlook cruft included, and
 `tests/test_booking_real_thread.py` replays it with the model's recorded readings.
@@ -223,7 +262,7 @@ case's POs) and links the case automatically, so `booking sent` is rarely needed
 cannot send; the agent writes from a member mailbox and copies the group). A send passes a
 deterministic gate first: send mode on, the recipient equal to the profile's trusted desk, and
 fewer than `FP_BOOKING_SEND_DAILY_CAP` sends in the last 24 hours. The case moves straight to
-`sent` with the Gmail id, thread and Message-ID recorded. Replies drafted by the conversation
+`pending` with the Gmail id, thread and Message-ID recorded. Replies drafted by the conversation
 policy answer the vendor's Message-ID and go through the same outbox, so with a sending outbox
 they are sent too; the CLI keeps them as drafts until the policy gate for unattended replies
 lands. The service-account key needs `gmail.send` under domain-wide delegation.

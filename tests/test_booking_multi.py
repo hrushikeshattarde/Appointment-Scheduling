@@ -24,6 +24,7 @@ from facility_profiles.booking.service import (
 )
 from facility_profiles.storage.db import session_scope
 from tests.conftest import FakeTPro
+from tests.test_booking import awaiting_approval
 from tests.test_booking_real_thread import morgan_load, seed_morgan
 
 EARLY = datetime(2026, 9, 23, 12, 0, tzinfo=UTC)
@@ -86,7 +87,7 @@ def _batched(settings, sessions):  # type: ignore[no-untyped-def]
     scan(FakeTPro(loads, {}), sessions, settings, days_ahead=14, now=EARLY)  # type: ignore[arg-type]
     sender = RecordingSender()
     with session_scope(sessions) as session:
-        cases = sorted(list_cases(session, CaseStatus.NEW.value), key=lambda c: c.id)
+        cases = sorted(list_cases(session, CaseStatus.UNSCHEDULED.value), key=lambda c: c.id)
         messages = draft_batch(session, cases, sender, settings, now=EARLY)
         ids = [c.id for c in cases]
         sent_id = messages[0].rfc_message_id
@@ -131,10 +132,10 @@ def test_a_reply_answering_two_po_lines_moves_each_case_on_its_own_line(settings
         assert len(ctx.requests) == 2 and ctx.po_numbers == A + B
         assert stats.classified == 1 and stats.proposed == 1 and stats.needs_human == 1
         # Line one books A as asked, with its own pickup number.
-        assert a.status == CaseStatus.PROPOSED.value
+        assert awaiting_approval(a)
         assert a.confirmed_local == "2026-09-28 09:00" and a.pickup_number == "20463264"
         # Line two pushes B to 10/02; it still makes the 10/06 delivery, so the agent accepts.
-        assert b.status == CaseStatus.PROPOSED.value
+        assert awaiting_approval(b)
         assert b.confirmed_local == "2026-10-02 09:00" and b.pickup_number == "20463798"
         # One reply in, one message out: the acceptance carries the thanks, no separate ack.
         assert len(sender.drafts) == 2 and stats.responded == 1
@@ -195,8 +196,8 @@ def test_a_reply_naming_only_one_cases_pos_leaves_the_other_alone(settings, sess
         a, b = session.get(BookingCase, a_id), session.get(BookingCase, b_id)
         assert a is not None and b is not None
         assert stats.proposed == 1 and stats.not_about_case == 1
-        assert a.status == CaseStatus.PROPOSED.value and a.pickup_number == "20463264"
-        assert b.status == CaseStatus.SENT.value and b.confirmed_local is None
+        assert awaiting_approval(a) and a.pickup_number == "20463264"
+        assert b.status == CaseStatus.PENDING.value and b.confirmed_local is None
         assert b.events[-1].action == "reply_not_about_this_po"
         skipped = next(m for m in b.messages if m.direction == "in")
         assert skipped.classification["skipped"] == "reply names other POs"

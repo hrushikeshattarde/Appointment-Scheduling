@@ -15,6 +15,7 @@ from facility_profiles.booking.service import (
     po_embedded_date,
     scan,
 )
+from facility_profiles.booking.worklist import open_kinds
 from facility_profiles.storage.db import session_scope
 from tests.conftest import FakeTPro
 from tests.test_booking import NOW, lidl_load, seed_vendor
@@ -73,7 +74,7 @@ def test_morgan_foods_request_is_never_earlier_than_the_po_date(settings, sessio
     assert stats.created == 1
     with session_scope(sessions) as session:
         case = list_cases(session)[0]
-        assert case.status == CaseStatus.NEW.value
+        assert case.status == CaseStatus.UNSCHEDULED.value and open_kinds(case) == []
         assert case.requested_local == "2026-10-02 09:00"
         floor = next(e for e in case.events if e.action == "po_date_floor")
         assert "PO date 10/02" in floor.detail["reason"] and floor.detail["feasible"] is True
@@ -96,13 +97,13 @@ def test_po_date_after_the_delivery_hands_the_case_to_a_person(settings, session
     scan(FakeTPro([load], {}), sessions, settings, days_ahead=14, now=EARLY)  # type: ignore[arg-type]
     with session_scope(sessions) as session:
         case = list_cases(session)[0]
-        assert case.status == CaseStatus.NEEDS_HUMAN.value
+        assert case.status == CaseStatus.UNSCHEDULED.value
+        assert open_kinds(case) == ["slot_unworkable"]
         assert case.requested_local == "2026-10-07 09:00"
-        assert (
-            case.reason is not None
-            and "PO date 10/07" in case.reason
-            and "delivery slot" in case.reason
-        )
+        unworkable = case.open_exceptions[0]
+        assert "PO date 10/07" in unworkable.description
+        assert "delivery slot" in unworkable.description
+        assert unworkable.detail["requested"] == "2026-10-07 09:00"
 
 
 def test_other_desks_keep_the_tendered_day(settings, sessions):
@@ -117,7 +118,10 @@ def test_other_desks_keep_the_tendered_day(settings, sessions):
     )  # type: ignore[arg-type]
     with session_scope(sessions) as session:
         case = list_cases(session)[0]
-        assert case.requested_local == "2026-10-01 09:00" and case.status == CaseStatus.NEW.value
+        assert (
+            case.requested_local == "2026-10-01 09:00"
+            and case.status == CaseStatus.UNSCHEDULED.value
+        )
         assert not any(e.action == "po_date_floor" for e in case.events)
 
 
@@ -142,12 +146,11 @@ def test_a_slot_inside_the_notice_window_or_already_past_goes_to_a_person(settin
     )  # type: ignore[arg-type]
     with session_scope(sessions) as session:
         soon, past = sorted(list_cases(session), key=lambda c: c.load_id)
-        assert soon.status == CaseStatus.NEEDS_HUMAN.value and "notice window" in (
-            soon.reason or ""
-        )
-        assert past.status == CaseStatus.NEEDS_HUMAN.value and "already passed" in (
-            past.reason or ""
-        )
+        for case in (soon, past):
+            assert case.status == CaseStatus.UNSCHEDULED.value
+            assert open_kinds(case) == ["slot_unworkable"]
+        assert "notice window" in soon.open_exceptions[0].description
+        assert "already passed" in past.open_exceptions[0].description
         assert [e.action for e in soon.events] == ["scanned", "stale_slot"]
 
 
@@ -163,14 +166,14 @@ def test_a_case_that_went_stale_since_the_scan_is_refused_at_draft_time(settings
     )  # type: ignore[arg-type]
     with session_scope(sessions) as session:
         case = list_cases(session)[0]
-        assert case.status == CaseStatus.NEW.value
+        assert case.status == CaseStatus.UNSCHEDULED.value
         mailer = RecordingMailer()
         with pytest.raises(ValueError, match="notice window"):
             draft_case(
                 session, case, mailer, settings, now=datetime(2026, 10, 1, 11, 0, tzinfo=UTC)
             )
-        assert not mailer.drafts and case.status == CaseStatus.NEW.value
+        assert not mailer.drafts and case.status == CaseStatus.UNSCHEDULED.value
         # Drafted in time, it goes out as before.
         draft_case(session, case, mailer, settings, now=NOW)
-        assert len(mailer.drafts) == 1 and case.status == CaseStatus.DRAFTED.value
+        assert len(mailer.drafts) == 1 and case.status == CaseStatus.UNSCHEDULED.value
         assert isinstance(session.get(BookingCase, case.id), BookingCase)
