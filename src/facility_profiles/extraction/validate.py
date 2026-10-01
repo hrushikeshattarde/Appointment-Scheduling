@@ -9,6 +9,7 @@ recorded as a :class:`ValidationIssue` for the run report.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,6 +32,7 @@ from facility_profiles.domain.schema import (
     HoursCandidate,
     PortalVendor,
     Quote,
+    ReferenceType,
     TimeGranularity,
 )
 from facility_profiles.domain.scoring import FACILITY_SOURCE_LOAD_ID, Mention
@@ -38,6 +40,9 @@ from facility_profiles.extraction.bundle import SourceBundle, SourceDoc
 
 _TRUE = {"true", "yes", "1"}
 _FALSE = {"false", "no", "0"}
+# Wall-clock times as people write them: 14:00, 1400, 2 PM, 2:30pm or 14h.
+_CLOCK_RE = re.compile(r"^(\d{1,2})(?::?(\d{2}))?\s*(am|pm|a\.m\.|p\.m\.|h)?$", re.IGNORECASE)
+MAX_DAYS_AHEAD_LIMIT = 60
 
 
 @dataclass(frozen=True)
@@ -70,6 +75,14 @@ def coerce(field_name: str, raw: str) -> Any | None:
     if field_name == "notice_period_hours":
         digits = "".join(ch for ch in text if ch.isdigit())
         return int(digits) if digits else None
+    if field_name == "cutoff_time":
+        return coerce_clock(text)
+    if field_name == "max_days_ahead":
+        digits = "".join(ch for ch in text if ch.isdigit())
+        days = int(digits) if digits else None
+        return days if days is not None and 0 < days <= MAX_DAYS_AHEAD_LIMIT else None
+    if field_name == "required_refs":
+        return coerce_refs(text)
     if field_name == "contact_phone":
         return normalize_phone(text)
     if field_name == "contact_email":
@@ -77,6 +90,56 @@ def coerce(field_name: str, raw: str) -> Any | None:
     if field_name == "portal_url":
         return normalize_url(text)
     return text
+
+
+def coerce_clock(text: str) -> str | None:
+    """A wall-clock time as "HH:MM" (24-hour), or None: "2 PM" -> "14:00", "1400" -> "14:00"."""
+    match = _CLOCK_RE.match(text.strip())
+    if match is None:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2) or 0)
+    suffix = (match.group(3) or "").lower().replace(".", "")
+    if suffix in ("am", "pm"):
+        if not 1 <= hour <= 12:
+            return None
+        hour = hour % 12 + (12 if suffix == "pm" else 0)
+    if hour > 23 or minute > 59:
+        return None
+    return f"{hour:02d}:{minute:02d}"
+
+
+_REF_ALIASES = {
+    "po": "po_number",
+    "load": "load_number",
+    "delivery": "delivery_number",
+    "dct": "delivery_number",
+    "shipment": "shipment_number",
+    "ti": "shipment_number",
+    "ti_shipment": "shipment_number",
+    "so": "sales_order_number",
+    "sales_order": "sales_order_number",
+    "bol": "bol_number",
+}
+
+
+def coerce_refs(text: str) -> list[str] | None:
+    """Reference types from a list such as "shipment_number, SO number"; None if any is unknown.
+
+    Accepts the ReferenceType values and the words desks use ("TI shipment number", "SO#").
+    """
+    known = {r.value for r in ReferenceType}
+    found: list[str] = []
+    for part in re.split(r"[,;/]+", text.strip().strip("[]")):
+        word = re.sub(r"[^a-z_ ]", "", part.strip().lower()).strip().replace(" ", "_")
+        if not word:
+            continue
+        stem = word.removesuffix("_number").removesuffix("_no")
+        value = word if word in known else _REF_ALIASES.get(stem, f"{stem}_number")
+        if value not in known:
+            return None
+        if value not in found:
+            found.append(value)
+    return sorted(found) or None
 
 
 def grouping_key(field_name: str, value: Any) -> Any:

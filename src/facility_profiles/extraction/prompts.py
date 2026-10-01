@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from facility_profiles.extraction.bundle import SourceBundle
 
-PROMPT_VERSION = "2026-09-28.2"
+PROMPT_VERSION = "2026-10-01.1"
 
 SYSTEM_PROMPT = f"""You extract how a freight facility (a shipper or receiver) takes \
 appointments, using only Circle Logistics' own records about that facility. \
@@ -39,7 +39,9 @@ list one of those.
 - contact_email: the address exactly as written.
 - portal_url: the URL exactly as written.
 - portal_vendor: one of opendock, c3, datadocks, one_network, e2open, blue_yonder, retalix, \
-other. Infer from the URL or the name of the system, and quote that URL or name.
+costco, unfi, ahold, publix, bozzutos, other. retalix covers NCR Power Traffic; costco, unfi, \
+ahold, publix and bozzutos are those companies' own scheduling sites. Infer from the URL or the \
+name of the system, and quote that URL or name.
 - notice_period_hours: whole hours of advance notice. "72 HOUR NOTICE" -> "72"; "24 hr" -> "24"; \
 "2 days" -> "48"; "same day" -> "0".
 - time_granularity: exact when the site gives a single time, window when it gives a range, \

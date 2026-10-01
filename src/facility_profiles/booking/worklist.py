@@ -45,6 +45,11 @@ KINDS: dict[str, tuple[str, str]] = {
         "Books by portal or phone",
         "Book it on the vendor's portal or by phone, then mark it booked.",
     ),
+    "missing_reference": (
+        "Reference needed",
+        "The desk will not book without this number. Get it from the customer and add it to "
+        "the case; the request is drafted with it.",
+    ),
     "slot_unworkable": (
         "Slot will not work",
         "Pick a new pickup slot with the vendor, or ask the customer to move the delivery.",
@@ -220,9 +225,17 @@ def annotate(session: Session, case: BookingCase, note: str) -> CaseException | 
     return exc
 
 
-def method_exception(booking_method: str | None) -> tuple[ExceptionType, str]:
-    """Why the agent cannot email this vendor: a method it cannot use, or no desk at all."""
+def method_exception(
+    booking_method: str | None, *, portal_vendor: str | None = None, portal_url: str | None = None
+) -> tuple[ExceptionType, str]:
+    """Why the agent cannot email this vendor: a method it cannot use, or no desk at all.
+
+    A portal desk is named with its system and address, so the person knows where to book.
+    """
     phrase = MANUAL_METHODS.get(booking_method or "")
+    if phrase and booking_method == "web_portal" and (portal_vendor or portal_url):
+        system = portal_vendor if portal_vendor and portal_vendor != "other" else "a web portal"
+        phrase = f"books on {system.replace('_', ' ')}" + (f" ({portal_url})" if portal_url else "")
     if phrase:
         return ExceptionType.METHOD_NOT_SUPPORTED, f"{phrase}; the agent only books by email"
     return ExceptionType.MISSING_METHOD, "no verified email booking desk on the profile"

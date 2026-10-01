@@ -183,6 +183,15 @@ def to_tpro_write(profile: FacilityProfile) -> TProFacilityWrite:
     notice = _value(profile, "notice_period_hours")
     if notice:
         notes_parts.append(f"Notice period: {notice} hours")
+    cutoff = _value(profile, "cutoff_time")
+    if cutoff:
+        notes_parts.append(f"Requests by {cutoff} the business day before")
+    ahead = _value(profile, "max_days_ahead")
+    if ahead:
+        notes_parts.append(f"Books at most {ahead} days ahead")
+    refs = _value(profile, "required_refs")
+    if refs:
+        notes_parts.append("Needs " + ", ".join(str(r).replace("_", " ") for r in refs))
     granularity = _value(profile, "time_granularity")
     if granularity and granularity != "unknown":
         notes_parts.append(f"Gives {granularity} appointment times")

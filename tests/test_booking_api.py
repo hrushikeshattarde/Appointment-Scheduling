@@ -332,14 +332,14 @@ def test_the_demo_seeder_builds_every_situation_and_refuses_a_used_store(
     db = f"sqlite:///{(tmp_path / 'demo.db').as_posix()}"
     monkeypatch.setattr(sys, "argv", ["seed", "--db", db])
     assert module.main() == 0
-    assert "20 demo cases" in capsys.readouterr().out
+    assert "21 demo cases" in capsys.readouterr().out
     engine = make_engine(db)
     with session_scope(session_factory(engine)) as s:
         statuses = sorted(c.status for c in s.query(BookingCase))
         kinds = sorted(e.kind for c in s.query(BookingCase) for e in c.open_exceptions)
     engine.dispose()
     assert statuses.count("scheduled") == 2 and statuses.count("declined") == 1
-    assert statuses.count("canceled") == 1 and len(statuses) == 20
+    assert statuses.count("canceled") == 1 and len(statuses) == 21
     assert kinds == sorted(
         [
             "confirmation_review",
@@ -349,6 +349,7 @@ def test_the_demo_seeder_builds_every_situation_and_refuses_a_used_store(
             "facility_question",
             "facility_declined",
             "missing_method",
+            "missing_reference",  # the desk needs the customer's shipment number
             "method_not_supported",
             "stale_confirmation",
             "pickup_expired",  # asked days ago, never answered, pickup passed

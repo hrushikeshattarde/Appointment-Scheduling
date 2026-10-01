@@ -26,7 +26,14 @@ from facility_profiles.booking.models import (
     CaseStatus,
     ExceptionType,
 )
-from facility_profiles.booking.service import approve, close_case, has_request, mark_booked
+from facility_profiles.booking.rules import REFERENCE_LABELS, REFERENCE_NAMES
+from facility_profiles.booking.service import (
+    add_reference,
+    approve,
+    close_case,
+    has_request,
+    mark_booked,
+)
 from facility_profiles.booking.timers import pickup_passed
 from facility_profiles.booking.today import pickup_slot, render_today, stage, today_summary
 from facility_profiles.booking.worklist import KINDS, resolve
@@ -63,6 +70,7 @@ EVENTS: dict[str, str] = {
     "acknowledge": "Thanked the vendor",
     "escalate_to_customer": "Note to the customer desk",
     "status_migrated": "Moved to the new statuses",
+    "reference_added": "Reference added",
 }
 
 
@@ -220,6 +228,11 @@ def case_detail(case: BookingCase, *, now: datetime) -> dict[str, Any]:
         "miles": case.miles,
         "reason": case.reason,
         "facility_key": case.facility_key,
+        "references": [
+            {"kind": k, "label": REFERENCE_LABELS.get(k, k), "value": v}
+            for k, v in sorted((case.reference_numbers or {}).items())
+            if v
+        ],
         "exceptions": [exception_view(e) for e in case.exceptions],
         "messages": [_message_view(m) for m in case.messages],
         "timeline": timeline(case),
@@ -324,6 +337,14 @@ class Booking(BaseModel):
     time: Clock | None = None
     pickup_number: str | None = None
     note: str | None = None
+
+
+class Reference(BaseModel):
+    """A number the vendor's desk needs, added by a person."""
+
+    by: Who
+    kind: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=32)]
+    value: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)]
 
 
 class Cancellation(BaseModel):
@@ -512,6 +533,28 @@ def post_booked(case_id: int, body: Booking, session: SessionDep, now: NowDep) -
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return _decided(session, case, now)
+
+
+@router.post("/cases/{case_id}/reference")
+def post_reference(
+    case_id: int, body: Reference, session: SessionDep, now: NowDep
+) -> dict[str, Any]:
+    """Add a number the desk needs (the customer's shipment or SO number) to the case."""
+    case = _get_case(session, case_id)
+    try:
+        add_reference(session, case, body.kind, body.value, by=body.by)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return _decided(session, case, now)
+
+
+@router.get("/references")
+def get_references() -> list[dict[str, str]]:
+    """Every reference type with how a request writes it and its plain name."""
+    return [
+        {"kind": kind, "label": label, "name": REFERENCE_NAMES.get(kind, kind)}
+        for kind, label in REFERENCE_LABELS.items()
+    ]
 
 
 @router.post("/cases/{case_id}/cancel")

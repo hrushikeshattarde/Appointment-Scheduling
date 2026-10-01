@@ -77,7 +77,10 @@ FIELD_ORDER = {
     "contact_name": 6,
     "receiving_hours": 7,
     "notice_period_hours": 8,
-    "time_granularity": 9,
+    "cutoff_time": 9,
+    "max_days_ahead": 10,
+    "required_refs": 11,
+    "time_granularity": 12,
 }
 LEGEND = (
     "HOW TO USE: fill in the three yellow columns for each row you can decide. Decision = accept "

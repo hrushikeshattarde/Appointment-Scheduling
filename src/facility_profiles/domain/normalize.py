@@ -164,6 +164,45 @@ def normalize_url(value: str | None) -> str | None:
     return f"{scheme.lower()}://{host.lower()}{slash}{path}"
 
 
+# Portal hosts and the scheduling system behind them. A URL names its vendor with certainty, so
+# this beats a model's reading of the notes. Hosts seen in the pod stores, plus vendor domains.
+PORTAL_HOSTS: Final[tuple[tuple[str, str], ...]] = (
+    ("opendock.com", "opendock"),
+    ("datadocks.com", "datadocks"),
+    ("c3reservations.com", "c3"),
+    ("onenetwork.com", "one_network"),
+    ("e2open.com", "e2open"),
+    ("blueyonder.com", "blue_yonder"),
+    ("ncrpowertraffic.com", "retalix"),  # NCR Power Traffic, formerly Retalix
+    ("costcotraffic.com", "costco"),
+    ("cwtraffic.com", "costco"),  # appointments.cwtraffic.com books Costco depots
+    ("myunfi.com", "unfi"),
+    ("ahold-tlm.logistics.com", "ahold"),
+    ("publix.io", "publix"),
+    ("bozzutos.net", "bozzutos"),
+)
+
+
+def url_host(value: str | None) -> str | None:
+    """The lower-cased host of a URL (``www.`` dropped), or None."""
+    url = normalize_url(value)
+    if not url:
+        return None
+    host = url.partition("://")[2].partition("/")[0].partition(":")[0]
+    return host.removeprefix("www.") or None
+
+
+def portal_vendor_from_url(value: str | None) -> str | None:
+    """The PortalVendor value a portal URL belongs to, or None when the host is not known."""
+    host = url_host(value)
+    if not host:
+        return None
+    for suffix, vendor in PORTAL_HOSTS:
+        if host == suffix or host.endswith(f".{suffix}"):
+            return vendor
+    return None
+
+
 def extract_urls(text: str | None) -> list[str]:
     """All distinct URLs in ``text``, normalised."""
     if not text:

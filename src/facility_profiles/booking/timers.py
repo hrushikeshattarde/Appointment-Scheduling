@@ -13,6 +13,9 @@ Two clocks run over the cases still being booked (:func:`sweep`; ``booking timer
 - **Expiry.** ``pickup_expired`` is raised when the pickup the case is working towards has
   passed and the case is still not booked. That pickup is the confirmed slot, else a time the
   vendor offered that still waits for a person, else the slot asked for.
+- **The desk's rules.** With settings, a request that has not gone out yet is checked against
+  its desk's rules again (``booking/rules.py``): a cut-off or notice that passed overnight is
+  raised as ``slot_unworkable``, a number the desk now requires as ``missing_reference``.
 
 Each raise remembers what started its clock (the message that went unanswered, the slot that
 passed), so a person's resolution sticks: the same silence or the same slot is never raised
@@ -39,6 +42,7 @@ from facility_profiles.booking.models import (
     CaseStatus,
     ExceptionType,
 )
+from facility_profiles.booking.rules import check_desk_rules, vendor_profile
 from facility_profiles.booking.worklist import (
     TIMER_KINDS,
     UNANSWERED,
@@ -46,8 +50,9 @@ from facility_profiles.booking.worklist import (
     open_exceptions,
     resolve,
 )
+from facility_profiles.config import Settings
 from facility_profiles.logging import get_logger
-from facility_profiles.storage.repository import as_utc
+from facility_profiles.storage.repository import Repository, as_utc
 
 log = get_logger(__name__)
 
@@ -201,8 +206,11 @@ class SweepResult:
         }
 
 
-def sweep(session: Session, *, now: datetime) -> SweepResult:
-    """Run the timers over every case still being booked, and any with a timer still open."""
+def sweep(session: Session, *, now: datetime, settings: Settings | None = None) -> SweepResult:
+    """Run the timers over every case still being booked, and any with a timer still open.
+
+    With ``settings`` the requests not sent yet are also checked against their desks' rules.
+    """
     timed = select(CaseException.case_id).where(
         CaseException.resolved_at.is_(None),
         CaseException.kind.in_(sorted(k.value for k in TIMER_KINDS)),
@@ -215,19 +223,25 @@ def sweep(session: Session, *, now: datetime) -> SweepResult:
     )
     result = SweepResult()
     for case in session.scalars(stmt):
-        check_case(session, case, now=now, result=result)
+        check_case(session, case, now=now, result=result, settings=settings)
     if result.raised or result.resolved:
         log.info("booking.timers", **result.counts())
     return result
 
 
 def check_case(
-    session: Session, case: BookingCase, *, now: datetime, result: SweepResult | None = None
+    session: Session,
+    case: BookingCase,
+    *,
+    now: datetime,
+    result: SweepResult | None = None,
+    settings: Settings | None = None,
 ) -> SweepResult:
-    """Run both clocks on one case."""
-    run = _Pass(session, now, result if result is not None else SweepResult())
+    """Run the clocks on one case (and its desk's rules, given settings)."""
+    run = _Pass(session, now, result if result is not None else SweepResult(), settings)
     run.result.cases += 1
     _check_expiry(run, case)
+    _check_desk(run, case)
     _check_silence(run, case)
     return run.result
 
@@ -239,6 +253,7 @@ class _Pass:
     session: Session
     now: datetime
     result: SweepResult
+    settings: Settings | None = None
 
     def raise_(
         self, case: BookingCase, kind: ExceptionType, description: str, **detail: object
@@ -279,6 +294,27 @@ def _check_expiry(run: _Pass, case: BookingCase) -> None:
         [ExceptionType.UNANSWERED_24H, ExceptionType.UNANSWERED_48H, ExceptionType.SLOT_UNWORKABLE],
         "superseded: the pickup time passed",
     )
+
+
+def _check_desk(run: _Pass, case: BookingCase) -> None:
+    """A request not sent yet, against its desk's rules; a passed pickup is the expiry's."""
+    if (
+        run.settings is None
+        or case.status != CaseStatus.UNSCHEDULED.value
+        or pickup_passed(case, run.now)
+    ):
+        return
+    before = {e.id: e for e in case.open_exceptions}
+    profile = (
+        vendor_profile(Repository(run.session), case.facility_key) if case.facility_key else None
+    )
+    check_desk_rules(run.session, case, run.settings, now=run.now, profile=profile, actor=TIMER)
+    for exc in case.open_exceptions:
+        if exc.id not in before:
+            run.result.raised.append((case.id, exc.kind, exc.description))
+    for exc in before.values():
+        if exc.resolved_at is not None:
+            run.result.resolved.append((case.id, exc.kind, exc.resolution or ""))
 
 
 def _expired_text(case: BookingCase, local: str | None) -> str:

@@ -47,17 +47,17 @@ class Decision(BaseModel):
     by: str
 
 
-def run_timers(sessions: sessionmaker[Session]) -> None:
-    """One pass of the booking timers, in its own transaction."""
+def run_timers(sessions: sessionmaker[Session], settings: Settings | None = None) -> None:
+    """One pass of the booking timers, and the desks' rules given settings, in one transaction."""
     with session_scope(sessions) as session:
-        sweep(session, now=datetime.now(tz=UTC))
+        sweep(session, now=datetime.now(tz=UTC), settings=settings)
 
 
-async def _timer_loop(sessions: sessionmaker[Session], minutes: float) -> None:
+async def _timer_loop(sessions: sessionmaker[Session], minutes: float, settings: Settings) -> None:
     """Run the timers now and then every ``minutes``; a failed pass is logged, not fatal."""
     while True:
         try:
-            await run_in_threadpool(run_timers, sessions)
+            await run_in_threadpool(run_timers, sessions, settings)
         except Exception:  # keep the board serving; the next pass retries
             log.exception("booking.timers_failed")
         await asyncio.sleep(minutes * 60)
@@ -72,7 +72,11 @@ def create_app(settings: Settings | None = None, *, timers_every: float | None =
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        task = asyncio.create_task(_timer_loop(sessions, timers_every)) if timers_every else None
+        task = (
+            asyncio.create_task(_timer_loop(sessions, timers_every, settings))
+            if timers_every
+            else None
+        )
         yield
         if task is not None:
             task.cancel()

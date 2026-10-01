@@ -74,7 +74,10 @@ def stage(case: BookingCase) -> str:
     if case.status == CaseStatus.UNSCHEDULED.value:
         if open_now:
             return f"Not requested: {first}"
-        return "Draft waiting to be sent" if has_request(case) else "Not requested yet"
+        if has_request(case):
+            return "Draft waiting to be sent"
+        # A desk that does not book that far ahead yet leaves its reason here.
+        return f"Not requested yet: {case.reason}" if case.reason else "Not requested yet"
     if case.status == CaseStatus.PENDING.value:
         if any(e.kind == ExceptionType.CONFIRMATION_REVIEW for e in open_now):
             return "Confirmed by the vendor, needs approval"

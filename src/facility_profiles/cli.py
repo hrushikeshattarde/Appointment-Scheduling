@@ -388,6 +388,38 @@ def profile_summary(
     typer.echo(f"{name} [{role.value}] summary updated")
 
 
+@profile_app.command("portals")
+def profile_portals(
+    apply: Annotated[
+        bool, typer.Option(help="File the changes; without it, only list them")
+    ] = False,
+    by: Annotated[str, typer.Option(help="Who is filing them (kept in the audit log)")] = "",
+) -> None:
+    """Fix portal vendors their portal URL contradicts ("other" for a Costco or UNFI portal).
+
+    Lists what would change; --apply --by NAME files it. A vendor a person set is never changed.
+    """
+    from facility_profiles.pipeline.profile import apply_portal_fixes, portal_vendor_fixes
+
+    if apply and not by.strip():
+        raise typer.BadParameter("--apply needs --by NAME")
+    settings = _settings()
+    with session_scope(_sessions(settings)) as session:
+        repo = Repository(session)
+        fixes = portal_vendor_fixes(repo)
+        for fix in fixes:
+            record = repo.get_facility(fix.key)
+            name = record.company_name if record else fix.key
+            note = "  (kept: a person set it)" if fix.held else ""
+            typer.echo(f"{name} [{fix.role.value}] {fix.url}: {fix.before} -> {fix.after}{note}")
+        changed = apply_portal_fixes(repo, fixes, by=by.strip()) if apply else 0
+    held = sum(1 for f in fixes if f.held)
+    if apply:
+        typer.echo(f"{changed} portal vendor(s) filed, {held} kept as a person set them")
+    else:
+        typer.echo(f"{len(fixes) - held} to change, {held} kept; run again with --apply --by NAME")
+
+
 @profile_app.command("ask")
 def profile_ask(
     facility: Annotated[str, typer.Argument(help="Store key, location ID or unique name")],
@@ -486,12 +518,17 @@ def booking_draft(
         int | None, typer.Argument(help="Case to draft; omit for all new cases")
     ] = None,
 ) -> None:
-    """Compose the request emails as drafts, one per vendor desk (.eml in the drafts folder)."""
+    """Compose the request emails as drafts, one per vendor desk (.eml in the drafts folder).
+
+    Each desk's rules are checked first: a request past its cut-off or missing a number the
+    desk needs becomes a to-do, and one the desk would not book yet waits.
+    """
     from facility_profiles.booking.mail import LocalDraftMailer
-    from facility_profiles.booking.service import draft_batch, draft_case, ready_to_draft
+    from facility_profiles.booking.service import draft_batch, draft_case, prepare_drafts
 
     settings = _settings()
     mailer = LocalDraftMailer(Path(settings.booking_drafts_dir), sender=settings.booking_sender)
+    now = datetime.now(tz=UTC)
     with session_scope(_sessions(settings)) as session:
         if case_id is not None:
             try:
@@ -500,7 +537,10 @@ def booking_draft(
                 typer.echo(f"#{case_id}: {exc}")
                 raise typer.Exit(code=1) from exc
         else:
-            messages = draft_batch(session, ready_to_draft(session), mailer, settings)
+            ready, waiting = prepare_drafts(session, settings, now=now)
+            for case, why in waiting:
+                typer.echo(f"#{case.id} waits: {why}")
+            messages = draft_batch(session, ready, mailer, settings, now=now)
         for message in messages:
             typer.echo(
                 f"#{message.case_id} drafted -> {message.to_addr}: {message.subject}  "
@@ -518,7 +558,7 @@ def booking_send(
     """Send the request through Gmail as the agent's mailbox (FP_BOOKING_MODE=send)."""
     from facility_profiles.booking.mail import GmailSender
     from facility_profiles.booking.outbox import SendRefusedError
-    from facility_profiles.booking.service import draft_batch, draft_case, ready_to_draft
+    from facility_profiles.booking.service import draft_batch, draft_case, prepare_drafts
 
     settings = _settings()
     if settings.booking_mode != "send":
@@ -537,7 +577,10 @@ def booking_send(
                     draft_case(session, _booking_case(session, case_id), sender, settings, by=by)
                 ]
             else:
-                messages = draft_batch(session, ready_to_draft(session), sender, settings, by=by)
+                ready, waiting = prepare_drafts(session, settings, now=datetime.now(tz=UTC))
+                for case, why in waiting:
+                    typer.echo(f"#{case.id} waits: {why}")
+                messages = draft_batch(session, ready, sender, settings, by=by)
         except (SendRefusedError, ValueError) as exc:
             typer.echo(f"refused: {exc}")
             raise typer.Exit(code=1) from exc
@@ -895,6 +938,33 @@ def booking_resolve(
     typer.echo(f"#{case_id} {kind.value} resolved")
 
 
+@booking_app.command("ref")
+def booking_ref(
+    case_id: int,
+    kind: Annotated[
+        str,
+        typer.Argument(
+            help="shipment_number, sales_order_number, bol_number, delivery_number, ..."
+        ),
+    ],
+    value: Annotated[str, typer.Argument(help="The number, e.g. Lidl's TI shipment number")],
+    by: Annotated[str, typer.Option(help="Who added it")],
+) -> None:
+    """Add a number the vendor's desk needs to a case; the request is drafted with it."""
+    from facility_profiles.booking.rules import REFERENCE_NAMES
+    from facility_profiles.booking.service import add_reference
+
+    settings = _settings()
+    with session_scope(_sessions(settings)) as session:
+        case = _booking_case(session, case_id)
+        try:
+            missing = add_reference(session, case, kind, value, by=by)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+    still = f"; still missing: {', '.join(REFERENCE_NAMES[m] for m in missing)}" if missing else ""
+    typer.echo(f"#{case_id} {kind} = {value.strip()}{still}")
+
+
 @booking_app.command("timers")
 def booking_timers() -> None:
     """Raise what time alone brings: no reply in 24 h or 48 h, a pickup that passed unbooked.
@@ -906,7 +976,7 @@ def booking_timers() -> None:
 
     settings = _settings()
     with session_scope(_sessions(settings)) as session:
-        result = sweep(session, now=datetime.now(tz=UTC))
+        result = sweep(session, now=datetime.now(tz=UTC), settings=settings)
     for case_id, kind, description in result.raised:
         typer.echo(f"#{case_id:<4} raised   {kind:<16} {description}")
     for case_id, kind, why in result.resolved:
@@ -936,7 +1006,7 @@ def booking_today(
     now = datetime.now(tz=UTC)
     with session_scope(_sessions(settings)) as session:
         if timers:
-            sweep(session, now=now)
+            sweep(session, now=now, settings=settings)
         data = today_summary(
             list_cases(session), now=now, timezone=settings.booking_timezone, customer=customer
         )

@@ -61,6 +61,7 @@ MCP server, so the existing file can be reused. Never commit `.env`.
 | `facility-profiles profile set FACILITY ROLE FIELD --value V --by NAME [--reason TEXT]` | Files a human-set value by hand (a store key, Transport Pro location ID or unique name), closes any open queue item for that field and audits the reason. The routine never overwrites it. |
 | `facility-profiles profile summary FACILITY ROLE --text TEXT --by NAME` | Replaces the scheduling summary with a human-written one. |
 | `facility-profiles profile ask FACILITY ROLE FIELD --reason TEXT [--proposed V]` | Puts a question on the review queue outside a run, for example the booking address of a vendor. |
+| `facility-profiles profile portals [--apply --by NAME]` | Lists the profiles whose portal vendor their portal URL contradicts ("other" for a Costco, UNFI, Ahold, Publix or Bozzuto's portal, or a wrong vendor); `--apply` files the URL's vendor, keeping the field's state and auditing it. A vendor a person set is only listed. |
 | `facility-profiles export [--out file.csv]` | Trusted values in Transport Pro field names for the vendor bulk import (FR-10). |
 | `facility-profiles export-xlsx [--out file.xlsx] [--facility F ...]` | Reviewer workbook: a Review Queue sheet with Decision (accept/edit/reject), Corrected value and Reviewer columns, plus Profile Fields, Scheduling Summaries, Facilities, Audit Log and Runs sheets. `--facility` (repeatable) restricts every sheet to those facilities, for a focused hand-off. |
 | `facility-profiles review import file.xlsx [--by NAME] [--dry-run]` | Reads the filled-in Review Queue sheet and applies each decision as a human-set value; rows with a blank Decision are skipped and problems are listed per row. |
@@ -137,6 +138,7 @@ facility-profiles booking approve 12 --by megan
 facility-profiles booking resolve 12 facility_question --by megan --note "answered by phone"
 facility-profiles booking booked 12 --by megan --via phone --date 2026-10-05 --time 09:00
 facility-profiles booking timers            # no reply in 24 h / 48 h, pickup passed unbooked
+facility-profiles booking ref 12 shipment_number 7781234 --by megan   # a number the desk needs
 facility-profiles booking today --out exports/today.txt  # the daily summary (runs the timers)
 ```
 
@@ -177,8 +179,9 @@ agent when the situation clears or by a person with a note (`booking resolve`):
 | Exception | Raised when | Cleared by |
 |---|---|---|
 | `missing_method` | the profile has no verified email booking desk | a person (`resolve`, `booked`, `close`) |
+| `missing_reference` | the desk needs a number the case lacks (the customer's shipment or SO number) | `booking ref` / "Add reference" once the case has them all, a person |
 | `method_not_supported` | the vendor books on a portal, by phone, first come first served | a person |
-| `slot_unworkable` | the slot passed, is inside the notice window, or cannot make the delivery | a moved delivery that fixes it, `reschedule`, a person |
+| `slot_unworkable` | the slot passed, is inside the notice window or past the desk's cut-off or notice, or cannot make the delivery | a moved delivery that fixes it, `reschedule`, a person |
 | `confirmation_review` | the vendor confirmed a slot (or the agent accepted its offer) | `approve` (the case becomes scheduled) |
 | `proposed_time_review` | the vendor offered a different time | the agent accepting it or asking for other days, a person |
 | `facility_question` | the vendor asked something | the agent answering it from the case, a person |
@@ -306,6 +309,26 @@ a person too, at scan time and again at draft or send time, because a same-day a
 call. The inbound desk's delivery slots are read in every wording seen so far, including the
 two-line "9/30 at 1100" then "PYE_300926723".
 
+### Desk rules
+
+A vendor profile also carries the rules its booking desk stated, filed by a person (`profile
+set`, the review workbook) because the extractor does not look for them yet:
+
+| Field | Value | The agent |
+|---|---|---|
+| `notice_period_hours` | hours before the pickup the desk wants the request | goes to a person past it (`slot_unworkable`) |
+| `cutoff_time` | `HH:MM` local, on the business day before the pickup ("2 PM" is accepted) | goes to a person past it (`slot_unworkable`) |
+| `max_days_ahead` | how far ahead the desk books at all | holds the request until then; the case says from which day |
+| `required_refs` | numbers needed besides the PO: `shipment_number`, `sales_order_number`, `bol_number`, `load_number`, `delivery_number` ("TI shipment number", "SO#" are accepted) | raises `missing_reference` until a person adds them, then writes them into the request line: `PO# X / Shipment# 7781234 on 10/01 @ 0900` |
+
+They are checked when a load is scanned, by `booking draft` and `booking send` (which print the
+cases that wait, and why), and by the timers for requests not sent yet, so a cut-off that passed
+overnight becomes a to-do. A number is added with `booking ref CASE KIND VALUE --by NAME` or "Add
+reference" on the board; the to-do clears once the case has every number its desk needs.
+`scripts/seed_lidl_desk_rules.py` files the two the lidl@ threads stated: Morgan Foods wants
+Lidl's TI shipment number, RLS Lebanon wants Lidl's SO number. A portal desk's to-do names its
+system and address ("books on opendock (https://...)").
+
 ### One reply, several POs
 
 A batched request covers several cases with one email, and Morgan Foods answers it line by
@@ -379,9 +402,15 @@ SQLite is the pilot default; set `FP_DATABASE_URL=postgresql+psycopg://…` (ins
 extra) for production. Alembic migrations are to be added before the first Postgres deployment.
 
 Profile fields: `appointment_required`, `booking_method`, `contact_name`, `contact_phone`,
-`contact_email`, `portal_url`, `portal_vendor`, `notice_period_hours`, `time_granularity`,
-`receiving_hours`, plus a one-line `scheduling_summary`. Mapping to Transport Pro fields is in
-`domain/rules.py::to_tpro_write`.
+`contact_email`, `portal_url`, `portal_vendor`, `notice_period_hours`, `cutoff_time`,
+`max_days_ahead`, `required_refs`, `time_granularity`, `receiving_hours`, plus a one-line
+`scheduling_summary`. Mapping to Transport Pro fields is in `domain/rules.py::to_tpro_write`
+(the desk rules go into the appointment notes).
+
+`portal_vendor` is one of opendock, c3, datadocks, one_network, e2open, blue_yonder, retalix
+(also NCR Power Traffic), costco, unfi, ahold, publix, bozzutos or other. A portal URL names its
+system with certainty, so a profile's vendor follows its URL's host (`domain/normalize.py`,
+`PORTAL_HOSTS`; `appointments.cwtraffic.com` is Costco) over the notes' reading.
 
 ## Transport Pro client
 

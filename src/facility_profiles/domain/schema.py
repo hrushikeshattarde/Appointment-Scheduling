@@ -45,9 +45,26 @@ class PortalVendor(StrEnum):
     ONE_NETWORK = "one_network"
     E2OPEN = "e2open"
     BLUE_YONDER = "blue_yonder"
-    RETALIX = "retalix"
+    RETALIX = "retalix"  # also NCR Power Traffic, its successor
+    # Retailers' own schedulers, which pod 1160 had filed as "other".
+    COSTCO = "costco"
+    UNFI = "unfi"
+    AHOLD = "ahold"
+    PUBLIX = "publix"
+    BOZZUTOS = "bozzutos"
     OTHER = "other"
     UNKNOWN = "unknown"
+
+
+class ReferenceType(StrEnum):
+    """A number a booking desk can ask for before it gives a slot."""
+
+    PO_NUMBER = "po_number"
+    LOAD_NUMBER = "load_number"  # Circle's load number
+    DELIVERY_NUMBER = "delivery_number"  # the customer's delivery booking (Lidl's DCT reference)
+    SHIPMENT_NUMBER = "shipment_number"  # the customer's shipment number (Lidl's TI number)
+    SALES_ORDER_NUMBER = "sales_order_number"  # the customer's sales order (Lidl's SO number)
+    BOL_NUMBER = "bol_number"
 
 
 class TimeGranularity(StrEnum):
@@ -119,9 +136,20 @@ PROFILE_FIELDS: tuple[str, ...] = (
     "portal_url",
     "portal_vendor",
     "notice_period_hours",
+    "cutoff_time",
+    "max_days_ahead",
+    "required_refs",
     "time_granularity",
     "receiving_hours",
 )
+
+# The booking desk's rules. A person files them (``profile set``, the review workbook) from what
+# a desk says in mail; the extractor does not look for them yet. The booking agent obeys them:
+# - cutoff_time: "HH:MM" local; a request must reach the desk by then on the business day
+#   before the pickup ("appointments for tomorrow by 2 PM");
+# - max_days_ahead: whole days; the desk takes no request earlier than that before the pickup;
+# - required_refs: the ReferenceType values the request must carry besides the PO.
+RULE_FIELDS: frozenset[str] = frozenset({"cutoff_time", "max_days_ahead", "required_refs"})
 
 # Fields whose values must appear verbatim in a source (FR-6).
 VERBATIM_FIELDS: frozenset[str] = frozenset({"contact_phone", "contact_email", "portal_url"})

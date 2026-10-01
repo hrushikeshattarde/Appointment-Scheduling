@@ -197,6 +197,7 @@ const state = {
   filters: defaultFilters(),
   weekStart: mondayOf(startOfToday()),
   kinds: [],
+  references: [],
   refocus: null,
   summaryOpen: false,
 };
@@ -771,6 +772,11 @@ function todoCard(d, e) {
   if (e.kind === "confirmation_review" && d.can_approve) {
     acts.append(h("button", { class: "btn primary small", type: "button", onclick: () => approveCase(d) }, "Approve slot"));
   }
+  if (e.kind === "missing_reference") {
+    acts.append(
+      h("button", { class: "btn primary small", type: "button", onclick: () => toggleForm(box, referenceForm(d, e)) }, "Add reference…"),
+    );
+  }
   acts.append(h("button", { class: "btn small", type: "button", onclick: () => toggleForm(box, resolveForm(d, e)) }, "Resolve…"));
   box.append(acts);
   return box;
@@ -804,6 +810,27 @@ function resolveForm(d, e) {
   form.addEventListener("submit", (ev) => {
     ev.preventDefault();
     act(d.id, "resolve", { kind: e.kind, note: note.value }, `${e.label}: resolved`);
+  });
+  return form;
+}
+
+// A number the desk needs that the load does not carry (the customer's shipment or SO number).
+function referenceForm(d, e) {
+  const missing = (e.detail && e.detail.missing) || [];
+  const known = state.references.length ? state.references : missing.map((kind) => ({ kind, name: kind }));
+  const kinds = known.filter((r) => !missing.length || missing.includes(r.kind));
+  const kind = h("select", {}, kinds.map((r) => h("option", { value: r.kind }, cap(r.name))));
+  const value = h("input", { type: "text", required: true, placeholder: "the number, as the customer gave it" });
+  const form = h(
+    "form",
+    { class: "form" },
+    h("div", { class: "fields" }, h("label", {}, "Which number", kind), h("label", {}, "Number", value)),
+  );
+  form.dataset.kind = "reference";
+  form.append(formButtons(form, "Add to the case"));
+  form.addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    act(d.id, "reference", { kind: kind.value, value: value.value }, "Reference added");
   });
   return form;
 }
@@ -896,6 +923,7 @@ function factsSection(d) {
     ["Requested", d.requested_local ? fmtSlot(d.requested_local) : "-"],
     ["Confirmed", d.confirmed_local ? fmtSlot(d.confirmed_local) : "-"],
     ["Pickup number", d.pickup_number || "-"],
+    ["References", (d.references || []).map((r) => `${r.label} ${r.value}`).join(", ") || "-"],
     ["Vendor", [d.vendor, d.vendor_city].filter(Boolean).join(", ") || "-"],
     ["Booking desk", desk],
     ["Delivery", delivery || "-"],
@@ -1008,9 +1036,10 @@ async function loadCustomers() {
 
 async function loadKinds() {
   try {
-    state.kinds = await api("/kinds");
+    [state.kinds, state.references] = await Promise.all([api("/kinds"), api("/references")]);
   } catch {
     state.kinds = [];
+    state.references = [];
   }
 }
 

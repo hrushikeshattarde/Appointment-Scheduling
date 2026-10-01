@@ -56,6 +56,17 @@ from facility_profiles.booking.respond import (
     local_dt,
     offer_is_feasible,
 )
+from facility_profiles.booking.rules import (
+    REFERENCE_LABELS,
+    REFERENCE_NAMES,
+    VendorProfile,
+    check_desk_rules,
+    extra_references,
+    missing_references,
+    slot_is_stale,
+    too_early,
+    vendor_profile,
+)
 from facility_profiles.booking.schema import ReplyClassification, ReplyStatus
 from facility_profiles.booking.timers import fmt_slot
 from facility_profiles.booking.worklist import (
@@ -71,12 +82,11 @@ from facility_profiles.booking.worklist import (
 )
 from facility_profiles.config import Settings
 from facility_profiles.domain.resolution import FacilityResolver
-from facility_profiles.domain.schema import Role
 from facility_profiles.logging import get_logger
 from facility_profiles.mailarchive.filters import normalize_subject, participants
 from facility_profiles.pipeline.harvest import iter_terminal_loads, stop_identity
 from facility_profiles.storage.db import session_scope
-from facility_profiles.storage.repository import Repository, as_utc, unwrap
+from facility_profiles.storage.repository import Repository, as_utc
 from facility_profiles.tpro.client import TransportProClient
 from facility_profiles.tpro.models import Load, Waypoint
 
@@ -101,7 +111,6 @@ DELIVERY_SLOT_REF_FIRST_RE = re.compile(
     r"(?P<h>\d{1,2})(?::?(?P<min>\d{2}))?\s*(?P<ampm>AM|PM)?",
     re.I,
 )
-TRUSTED_STATES = frozenset({"human_set", "verified", "written"})
 OPEN_STATUSES = (
     CaseStatus.UNSCHEDULED.value,
     CaseStatus.PENDING.value,
@@ -117,29 +126,6 @@ STALE_CONFIRMATION_GRACE = timedelta(minutes=30)
 # A confirmation on another day, or more than this far from the time asked for, is raised for the
 # person approving it. Requests ask for one exact time; desks round it to their dock schedule.
 CONFIRM_WINDOW = timedelta(hours=2)
-
-
-@dataclass(frozen=True)
-class VendorProfile:
-    """The trusted booking facts for a pickup facility."""
-
-    key: str
-    booking_method: str | None
-    contact_email: str | None
-    contact_name: str | None
-    appointment_required: bool | None
-    summary: str | None
-    time_granularity: str | None = None
-
-    @property
-    def date_only(self) -> bool:
-        """First-come-first-served shippers get a date, not a time (the pod does the same)."""
-        return self.appointment_required is False or self.time_granularity == "window"
-
-    @property
-    def can_email(self) -> bool:
-        """True when the agent has a verified email desk to write to."""
-        return self.booking_method == "email" and bool(self.contact_email)
 
 
 @dataclass
@@ -178,28 +164,6 @@ class IngestStats:
 
 
 # ------------------------------------------------------------------ profile and load helpers
-
-
-def vendor_profile(repo: Repository, key: str) -> VendorProfile:
-    """Read the trusted shipper-side fields for a facility key."""
-    fields = repo.fields(key, Role.SHIPPER)
-
-    def trusted(name: str) -> Any:
-        fld = fields.get(name)
-        if fld is None or fld.state not in TRUSTED_STATES:
-            return None
-        return unwrap(fld.value)
-
-    profile = repo.profile(key, Role.SHIPPER)
-    return VendorProfile(
-        key=key,
-        booking_method=trusted("booking_method"),
-        contact_email=trusted("contact_email"),
-        contact_name=trusted("contact_name"),
-        appointment_required=trusted("appointment_required"),
-        summary=profile.scheduling_summary if profile else None,
-        time_granularity=trusted("time_granularity"),
-    )
 
 
 def pickup_waypoint(load: Load) -> tuple[int, Waypoint] | None:
@@ -305,27 +269,6 @@ def floor_requested(
     if not feasible:
         why += f"; that {verdict}"
     return moved, why, feasible
-
-
-def slot_is_stale(
-    requested: str | None, timezone: str | None, settings: Settings, *, now: datetime
-) -> str | None:
-    """Why a requested slot can no longer be asked for by email, or None when it still can."""
-    if not requested:
-        return None
-    day, _, clock = requested.partition(" ")
-    try:
-        pickup = local_dt(day, clock or None, timezone)
-    except ValueError:
-        return None
-    if pickup <= now:
-        return f"requested slot {requested} has already passed"
-    if pickup <= now + timedelta(hours=settings.booking_min_notice_hours):
-        return (
-            f"requested slot {requested} is inside the {settings.booking_min_notice_hours} h "
-            "notice window; a same-day ask needs a person"
-        )
-    return None
 
 
 def parse_delivery_slot(
@@ -455,7 +398,11 @@ def scan(
             else:
                 status, reason = CaseStatus.UNSCHEDULED.value, None
                 if not profile.can_email:
-                    blocker = method_exception(profile.booking_method)
+                    blocker = method_exception(
+                        profile.booking_method,
+                        portal_vendor=profile.portal_vendor,
+                        portal_url=profile.portal_url,
+                    )
             case = BookingCase(
                 load_id=load.id,
                 waypoint_index=index,
@@ -500,7 +447,7 @@ def scan(
                 status=case.status,
                 reason=case.reason or (blocker[1] if blocker else None),
             )
-            _check_requested_slot(session, case, settings, now=now)
+            _check_requested_slot(session, case, settings, now=now, profile=profile)
             stats.created += 1
             stats.case_ids.append(case.id)
             if pickup_no:
@@ -511,13 +458,19 @@ def scan(
 
 
 def _check_requested_slot(
-    session: Session, case: BookingCase, settings: Settings, *, now: datetime
+    session: Session,
+    case: BookingCase,
+    settings: Settings,
+    *,
+    now: datetime,
+    profile: VendorProfile | None = None,
 ) -> None:
-    """Apply the PO-date floor and the notice window to a freshly scanned case.
+    """Apply the PO-date floor, the notice window and the desk's rules to a freshly scanned case.
 
     Only a case the agent could email is affected. A floor that still makes the delivery just
-    moves the ask; one that does not, or a slot already inside the notice window, is raised
-    for a person before any email is written.
+    moves the ask; one that does not, a slot already inside the notice window or past the desk's
+    cut-off, or a number the desk needs that the load lacks, is raised for a person before any
+    email is written. A desk that does not book that far ahead yet makes the request wait.
     """
     if case.status != CaseStatus.UNSCHEDULED.value or case.open_exceptions:
         return
@@ -528,10 +481,7 @@ def _check_requested_slot(
         if not feasible:
             flag(session, case, ExceptionType.SLOT_UNWORKABLE, why, requested=moved)
             return
-    stale = slot_is_stale(case.requested_local, case.vendor_timezone, settings, now=now)
-    if stale:
-        flag(session, case, ExceptionType.SLOT_UNWORKABLE, stale, requested=case.requested_local)
-        _event(session, case, "stale_slot", reason=stale)
+    check_desk_rules(session, case, settings, now=now, profile=profile)
 
 
 # ------------------------------------------------------------------ compose and draft
@@ -549,16 +499,23 @@ def _fmt_local(value: str | None) -> tuple[str, str]:
     return (parsed.strftime("%m/%d"), clock.replace(":", ""))
 
 
-def request_lines(case: BookingCase, *, date_only: bool = False) -> list[str]:
-    """The PO lines exactly as the pod writes them: "PO# X on MM/DD @ HHMM"."""
+def request_lines(
+    case: BookingCase, *, date_only: bool = False, extra: Iterable[str] = ()
+) -> list[str]:
+    """The PO lines exactly as the pod writes them: "PO# X on MM/DD @ HHMM".
+
+    ``extra`` holds the numbers the desk needs besides the PO ("Shipment# 7781234"); they follow
+    the PO: "PO# X / Shipment# 7781234 on MM/DD @ HHMM".
+    """
     mmdd, clock = _fmt_local(case.requested_local)
     when = f"on {mmdd}" + (f" @ {clock}" if clock and not date_only else "")
+    refs = "".join(f" / {ref}" for ref in extra)
     pos = [str(p) for p in case.po_numbers]
     if not pos:
-        return [f"Load {case.load_id} {when}"]
+        return [f"Load {case.load_id}{refs} {when}"]
     if len(pos) > 1:
-        return [f"PO# {' & '.join(pos)} (ALL IN ONE TRUCK) {when}"]
-    return [f"PO# {pos[0]} {when}"]
+        return [f"PO# {' & '.join(pos)} (ALL IN ONE TRUCK){refs} {when}"]
+    return [f"PO# {pos[0]}{refs} {when}"]
 
 
 def short_vendor(name: str | None) -> str:
@@ -590,7 +547,11 @@ def compose_request(
         "",
         ask,
         "",
-        *request_lines(case, date_only=bool(profile and profile.date_only)),
+        *request_lines(
+            case,
+            date_only=bool(profile and profile.date_only),
+            extra=extra_references(case, profile),
+        ),
         "",
         "Thank you!",
         "",
@@ -621,8 +582,8 @@ def draft_case(
     ``unscheduled`` until a person sends it. A slot that has gone stale since the scan is
     refused either way: a same-day ask needs a person.
     """
-    _check_draftable(case, settings, now=now or datetime.now(tz=UTC))
     profile = vendor_profile(Repository(session), case.facility_key) if case.facility_key else None
+    _check_draftable(case, settings, now=now or datetime.now(tz=UTC), profile=profile)
     draft = compose_request(case, settings, profile)
     if is_sender(mailer):
         trusted = profile.contact_email if profile and profile.can_email else None
@@ -646,11 +607,18 @@ def draft_case(
     return message
 
 
-def _check_draftable(case: BookingCase, settings: Settings, *, now: datetime) -> None:
+def _check_draftable(
+    case: BookingCase,
+    settings: Settings,
+    *,
+    now: datetime,
+    profile: VendorProfile | None = None,
+) -> None:
     """Refuse a request the agent must not write.
 
-    That is: a case that is not unscheduled, has open exceptions or no desk, or whose slot has
-    passed or is inside the notice window.
+    That is: a case that is not unscheduled, has open exceptions or no desk, whose slot has
+    passed or is inside the notice window or the desk's cut-off, that lacks a number the desk
+    needs, or that the desk would not book yet.
     """
     if case.status != CaseStatus.UNSCHEDULED.value:
         msg = f"case {case.id} is {case.status}; only unscheduled cases can be drafted"
@@ -662,9 +630,20 @@ def _check_draftable(case: BookingCase, settings: Settings, *, now: datetime) ->
     if not case.contact_email:
         msg = f"case {case.id} has no booking email"
         raise ValueError(msg)
-    stale = slot_is_stale(case.requested_local, case.vendor_timezone, settings, now=now)
+    stale = slot_is_stale(
+        case.requested_local, case.vendor_timezone, settings, now=now, profile=profile
+    )
     if stale:
         msg = f"case {case.id}: {stale}; not drafted"
+        raise ValueError(msg)
+    missing = missing_references(case, profile)
+    if missing:
+        names = ", ".join(REFERENCE_NAMES.get(m, m) for m in missing)
+        msg = f"case {case.id}: the desk needs the {names}; add it with booking ref"
+        raise ValueError(msg)
+    wait = too_early(case.requested_local, case.vendor_timezone, profile, now=now)
+    if wait:
+        msg = f"case {case.id}: {wait}; not drafted yet"
         raise ValueError(msg)
 
 
@@ -683,6 +662,67 @@ def ready_to_draft(session: Session) -> list[BookingCase]:
         for c in list_cases(session, CaseStatus.UNSCHEDULED.value)
         if c.contact_email and not c.open_exceptions and not has_request(c)
     ]
+
+
+def prepare_drafts(
+    session: Session, settings: Settings, *, now: datetime
+) -> tuple[list[BookingCase], list[tuple[BookingCase, str]]]:
+    """The cases to draft now, and those that wait, after checking each desk's rules.
+
+    A case the rules stop (past the cut-off, a number missing) gets its exception and drops out;
+    a case whose desk does not book that far ahead yet waits, with the day it can be asked.
+    """
+    repo = Repository(session)
+    ready: list[BookingCase] = []
+    waiting: list[tuple[BookingCase, str]] = []
+    for case in ready_to_draft(session):
+        profile = vendor_profile(repo, case.facility_key) if case.facility_key else None
+        wait = check_desk_rules(session, case, settings, now=now, profile=profile)
+        if case.open_exceptions:
+            continue
+        if wait:
+            waiting.append((case, wait))
+        else:
+            ready.append(case)
+    return ready, waiting
+
+
+def add_reference(
+    session: Session, case: BookingCase, kind: str, value: str, *, by: str
+) -> list[str]:
+    """A person adds a number the desk needs (the customer's shipment or SO number).
+
+    The number goes into the request line. When the case now has every number its desk needs,
+    the ``missing_reference`` to-do is resolved. Returns the numbers still missing.
+    """
+    if kind not in REFERENCE_LABELS:
+        msg = f"reference type must be one of {', '.join(REFERENCE_LABELS)}"
+        raise ValueError(msg)
+    value = value.strip()
+    if not value:
+        msg = "the reference needs a value"
+        raise ValueError(msg)
+    previous = (case.reference_numbers or {}).get(kind)
+    case.reference_numbers = {**(case.reference_numbers or {}), kind: value}
+    profile = vendor_profile(Repository(session), case.facility_key) if case.facility_key else None
+    missing = missing_references(case, profile)
+    label = f"{REFERENCE_LABELS[kind]} {value}"
+    if missing:
+        names = " and ".join(REFERENCE_NAMES.get(m, m) for m in missing)
+        flag(
+            session,
+            case,
+            ExceptionType.MISSING_REFERENCE,
+            f"the desk needs the {names} before it books",
+            actor=by,
+            missing=missing,
+        )
+    else:
+        resolve(
+            session, case, [ExceptionType.MISSING_REFERENCE], resolution=f"{label} added", by=by
+        )
+    _event(session, case, "reference_added", actor=by, kind=kind, value=value, previous=previous)
+    return missing
 
 
 def reschedule_case(
@@ -715,7 +755,11 @@ def reschedule_case(
     case.confirmed_start_utc = None
     case.confirmed_end_utc = None
     profile = vendor_profile(Repository(session), case.facility_key) if case.facility_key else None
-    line = request_lines(case, date_only=bool(profile and profile.date_only))[0]
+    line = request_lines(
+        case,
+        date_only=bool(profile and profile.date_only),
+        extra=extra_references(case, profile),
+    )[0]
     body_lines = ["Hello,", ""]
     if note:
         body_lines.extend([note.strip(), ""])
@@ -1460,16 +1504,18 @@ def draft_batch(
             for case in group:
                 messages.append(draft_case(session, case, mailer, settings, by=by, now=now))
             continue
-        for case in group:
-            _check_draftable(case, settings, now=now)
-        group.sort(key=lambda c: c.requested_local or "")
         profile = vendor_profile(repo, group[0].facility_key) if group[0].facility_key else None
+        for case in group:
+            _check_draftable(case, settings, now=now, profile=profile)
+        group.sort(key=lambda c: c.requested_local or "")
         date_only = bool(profile and profile.date_only)
         first = compose_request(group[0], settings, profile)
         ask = first.body.split("\n")[2]
         lines = ["Hello,", "", ask, ""]
         for case in group:
-            lines.extend(request_lines(case, date_only=date_only))
+            lines.extend(
+                request_lines(case, date_only=date_only, extra=extra_references(case, profile))
+            )
         lines.extend(["", "Thank you!", "", settings.booking_signature])
         pos = [str(p) for c in group for p in c.po_numbers]
         subject = f"Pick Up Appointments: {' & '.join(pos)}" if pos else "Pick Up Appointments"
@@ -1646,6 +1692,11 @@ def describe(case: BookingCase) -> str:
         f"  vendor    {case.vendor_name or '?'} {case.vendor_city or ''}  [{case.facility_key}]",
         f"  desk      {case.contact_email or 'none'}  ({case.booking_method or 'unknown method'})",
         f"  PO        {', '.join(str(p) for p in case.po_numbers) or 'none'}",
+        *(
+            f"  ref       {REFERENCE_LABELS.get(k, k)} {v}"
+            for k, v in sorted((case.reference_numbers or {}).items())
+            if v
+        ),
         f"  requested {case.requested_local or '?'} local",
         f"  delivery  {case.delivery_site or '?'}"
         + (f" {case.delivery_ref}" if case.delivery_ref else "")

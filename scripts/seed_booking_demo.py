@@ -35,6 +35,7 @@ from facility_profiles.booking.models import (
     ExceptionType,
 )
 from facility_profiles.booking.respond import Responder
+from facility_profiles.booking.rules import check_desk_rules, vendor_profile
 from facility_profiles.booking.schema import ReplyClassification, ReplyStatus
 from facility_profiles.booking.service import (
     approve,
@@ -47,7 +48,9 @@ from facility_profiles.booking.service import (
 from facility_profiles.booking.timers import sweep
 from facility_profiles.booking.worklist import flag, method_exception
 from facility_profiles.config import Settings
+from facility_profiles.domain.schema import FacilityIdentity, FieldState, Role
 from facility_profiles.storage.db import init_db, make_engine, session_factory, session_scope
+from facility_profiles.storage.repository import Repository
 
 ET = ZoneInfo("America/New_York")
 CT = ZoneInfo("America/Chicago")
@@ -249,8 +252,25 @@ class Demo:
         return f"{d:%m/%d}"
 
 
+def desk_profile(
+    session: Session, candidate: str, name: str, *, desk: str, required_refs: list[str]
+) -> str:
+    """A vendor profile with an email desk and the numbers it needs, as a person files them."""
+    repo = Repository(session)
+    record = repo.upsert_facility(
+        FacilityIdentity(candidate_key=candidate, company_name=name), latitude=None, longitude=None
+    )
+    for field, value in (
+        ("booking_method", "email"),
+        ("contact_email", desk),
+        ("required_refs", required_refs),
+    ):
+        repo.set_field_human(record.key, Role.SHIPPER, field, value, state=FieldState.HUMAN_SET)
+    return record.key
+
+
 def build(demo: Demo) -> int:
-    """Twenty cases, one per situation the board has to show."""
+    """Twenty-one cases, one per situation the board has to show."""
     s, d = demo.session, demo
     made = 0
 
@@ -587,8 +607,31 @@ def build(demo: Demo) -> int:
     )
     made += 1
 
+    # The desk will not book without the customer's shipment number, which the load lacks.
+    c = d.case(
+        21,
+        "Prairie Gold Mills",
+        "Salina, KS",
+        pickup=(4, "07:00"),
+        desk="appointments@prairiegold.example",
+        tz=CT,
+    )
+    key = desk_profile(
+        s,
+        "demo21prairiegold",
+        "Prairie Gold Mills",
+        desk="appointments@prairiegold.example",
+        required_refs=["shipment_number"],
+    )
+    with d.step(c, c.created_at):
+        c.facility_key = key
+        check_desk_rules(
+            s, c, d.settings, now=c.created_at, profile=vendor_profile(Repository(s), key)
+        )
+    made += 1
+
     # The timers run as they would on the server: what went silent, what slipped.
-    sweep(s, now=d.now)
+    sweep(s, now=d.now, settings=d.settings)
 
     # Each case's last change is when its last step happened, not when the demo was built.
     for case_id, when in demo.last_step.items():

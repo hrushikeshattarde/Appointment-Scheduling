@@ -34,6 +34,7 @@ class ExceptionType(StrEnum):
 
     MISSING_METHOD = "missing_method"  # no trusted email booking desk on the profile
     METHOD_NOT_SUPPORTED = "method_not_supported"  # the vendor books by portal, phone or other
+    MISSING_REFERENCE = "missing_reference"  # the desk needs a number the case does not have
     SLOT_UNWORKABLE = "slot_unworkable"  # the slot passed, is too soon, or misses the delivery
     CONFIRMATION_REVIEW = "confirmation_review"  # the vendor confirmed; a person approves it
     PROPOSED_TIME_REVIEW = "proposed_time_review"  # the vendor offered a different time
@@ -81,6 +82,11 @@ class BookingCase(Base):
     confirmed_start_utc: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     confirmed_end_utc: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     pickup_number: Mapped[str | None] = mapped_column(String(64))
+    # Numbers a desk needs that the load does not carry, added by a person: the customer's
+    # shipment number, its sales order number. Keyed by ReferenceType value.
+    reference_numbers: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=dict, server_default="{}"
+    )
     thread_id: Mapped[str | None] = mapped_column(String(128), index=True)
     status: Mapped[str] = mapped_column(String(24), default=CaseStatus.UNSCHEDULED.value)
     # Why the case has its status (a deferral, a decline, a closure, an earlier booking). What a
