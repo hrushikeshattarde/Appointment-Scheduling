@@ -47,6 +47,11 @@ booking_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(booking_app, name="booking")
+template_app = typer.Typer(
+    help="The agent's email wording, per desk or customer, with fill-in fields.",
+    no_args_is_help=True,
+)
+booking_app.add_typer(template_app, name="template")
 mail_app = typer.Typer(
     help="Group-mail archive in S3: collect Pick Up Appointment threads, check what is there.",
     no_args_is_help=True,
@@ -986,6 +991,173 @@ def booking_ref(
             raise typer.BadParameter(str(exc)) from exc
     still = f"; still missing: {', '.join(REFERENCE_NAMES[m] for m in missing)}" if missing else ""
     typer.echo(f"#{case_id} {kind} = {value.strip()}{still}")
+
+
+DeskOption = Annotated[str | None, typer.Option(help="For this booking desk's address only")]
+CustomerOption = Annotated[
+    str | None, typer.Option(help="For this customer only, e.g. 'Lidl - Inbound'")
+]
+
+
+def _template_kind(kind: str):  # type: ignore[no-untyped-def]
+    from facility_profiles.booking.templates import TemplateKind
+
+    try:
+        return TemplateKind(kind)
+    except ValueError as exc:
+        kinds = ", ".join(k.value for k in TemplateKind)
+        raise typer.BadParameter(f"kind must be one of {kinds}") from exc
+
+
+@template_app.command("fields")
+def template_fields_cmd() -> None:
+    """Every fill-in field, what it becomes, and which emails can use it."""
+    from facility_profiles.booking.templates import FIELDS, KIND_FIELDS
+
+    for name, meaning in FIELDS.items():
+        kinds = [k.value for k, allowed in KIND_FIELDS.items() if name in allowed]
+        typer.echo(f"{{{name}}}  {meaning}  [{', '.join(kinds)}]")
+
+
+@template_app.command("list")
+def template_list() -> None:
+    """The saved templates; every other email uses the built-in wording."""
+    from facility_profiles.booking.templates import saved_templates
+
+    settings = _settings()
+    with session_scope(_sessions(settings)) as session:
+        rows = saved_templates(session)
+        if not rows:
+            typer.echo("no saved templates: the agent writes with the built-in wording")
+            return
+        for row in rows:
+            scope = row.scope if row.scope == "default" else f"{row.scope} {row.match}"
+            when = f"{row.updated_at:%Y-%m-%d}" if row.updated_at else ""
+            typer.echo(f"{row.kind:<14} {scope:<48} by {row.updated_by or '?'} {when}")
+
+
+@template_app.command("show")
+def template_show(
+    kind: Annotated[
+        str, typer.Argument(help="request, batch_request, reschedule, follow_up, check_back")
+    ],
+    desk: DeskOption = None,
+    customer: CustomerOption = None,
+) -> None:
+    """The template that applies to a desk or customer (and where it comes from)."""
+    from facility_profiles.booking.templates import pick
+
+    settings = _settings()
+    with session_scope(_sessions(settings)) as session:
+        template = pick(session, _template_kind(kind), desk=desk, customer=customer)
+    typer.echo(f"# {template.kind.value} ({template.source})")
+    if template.subject:
+        typer.echo(f"Subject: {template.subject}")
+    typer.echo("")
+    typer.echo(template.body)
+
+
+@template_app.command("set")
+def template_set(
+    kind: Annotated[
+        str, typer.Argument(help="request, batch_request, reschedule, follow_up, check_back")
+    ],
+    by: Annotated[str, typer.Option(help="Who wrote it")],
+    body: Annotated[str | None, typer.Option(help=r"The body; write \n for a line break")] = None,
+    body_file: Annotated[Path | None, typer.Option(help="Read the body from this file")] = None,
+    subject: Annotated[str | None, typer.Option(help="The subject (requests only)")] = None,
+    desk: DeskOption = None,
+    customer: CustomerOption = None,
+) -> None:
+    """Save the wording for one kind of email, for a desk, a customer or (neither) the whole pod.
+
+    Fields in braces are filled in: {po}, {date}, {lines}... (see `booking template fields`).
+    """
+    from facility_profiles.booking.templates import save_template
+
+    if (body is None) == (body_file is None):
+        raise typer.BadParameter("give the body with --body or --body-file")
+    text = body_file.read_text(encoding="utf-8") if body_file else (body or "").replace("\\n", "\n")
+    settings = _settings()
+    with session_scope(_sessions(settings)) as session:
+        try:
+            template = save_template(
+                session,
+                _template_kind(kind),
+                body=text,
+                subject=subject,
+                desk=desk,
+                customer=customer,
+                by=by,
+            )
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"{template.kind.value} template saved for {template.source}")
+
+
+@template_app.command("remove")
+def template_remove(
+    kind: Annotated[
+        str, typer.Argument(help="request, batch_request, reschedule, follow_up, check_back")
+    ],
+    desk: DeskOption = None,
+    customer: CustomerOption = None,
+) -> None:
+    """Remove a saved template; the next one down (customer, default, built-in) applies again."""
+    from facility_profiles.booking.templates import remove_template
+
+    settings = _settings()
+    with session_scope(_sessions(settings)) as session:
+        removed = remove_template(session, _template_kind(kind), desk=desk, customer=customer)
+    if not removed:
+        typer.echo("no such saved template")
+        raise typer.Exit(code=1)
+    typer.echo(f"{kind} template removed")
+
+
+@template_app.command("preview")
+def template_preview(
+    case_id: int,
+    kind: Annotated[
+        str, typer.Option(help="request, reschedule, follow_up or check_back")
+    ] = "request",
+) -> None:
+    """Show the email the agent would write for a case now; nothing is drafted or sent."""
+    from facility_profiles.booking.rules import vendor_profile
+    from facility_profiles.booking.templates import (
+        TemplateKind,
+        case_values,
+        pick,
+        render,
+        request_values,
+        reschedule_values,
+    )
+
+    which = _template_kind(kind)
+    if which == TemplateKind.BATCH_REQUEST:
+        raise typer.BadParameter("a batch is previewed one case at a time: use request")
+    settings = _settings()
+    with session_scope(_sessions(settings)) as session:
+        case = _booking_case(session, case_id)
+        profile = (
+            vendor_profile(Repository(session), case.facility_key) if case.facility_key else None
+        )
+        template = pick(session, which, desk=case.contact_email, customer=case.customer_name)
+        if which == TemplateKind.REQUEST:
+            values = request_values([case], settings, profile)
+        elif which == TemplateKind.RESCHEDULE:
+            current = case.confirmed_local or case.requested_local
+            values = reschedule_values(case, settings, profile, previous=current, note=None)
+        else:
+            values = case_values([case], settings, profile)
+        subject, text = render(template, values)
+        to = case.contact_email or "(no desk)"
+    typer.echo(f"# {which.value} for case #{case_id} ({template.source} template)")
+    typer.echo(f"To: {to}")
+    if subject:
+        typer.echo(f"Subject: {subject}")
+    typer.echo("")
+    typer.echo(text)
 
 
 @booking_app.command("desks")

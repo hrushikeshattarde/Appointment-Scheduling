@@ -38,7 +38,15 @@ from facility_profiles.booking.models import (
     ExceptionType,
 )
 from facility_profiles.booking.outbox import dispatch
+from facility_profiles.booking.rules import vendor_profile
 from facility_profiles.booking.schema import ReplyClassification, ReplyStatus
+from facility_profiles.booking.templates import (
+    TemplateKind,
+    case_values,
+    customer_label,
+    pick,
+    render,
+)
 from facility_profiles.booking.worklist import UNANSWERED, annotate, flag, resolve
 from facility_profiles.config import Settings
 from facility_profiles.extraction.llm import ExtractionError
@@ -48,7 +56,7 @@ from facility_profiles.extraction.openrouter import (
     qualify_model,
     strict_json_schema,
 )
-from facility_profiles.storage.repository import as_utc
+from facility_profiles.storage.repository import Repository, as_utc
 
 FORBIDDEN_TOPICS = re.compile(
     r"\b(rate|rates|detention|accessorial|tonu|invoice|charge|charges|fee|fees|payment|pay|"
@@ -90,6 +98,7 @@ class ResponsePlan:
     body: str | None = None
     to_addr: str | None = None
     proposed_local: str | None = None
+    signed: bool = False  # the body already ends with the signature (it came from a template)
 
 
 # ------------------------------------------------------------------ facts and feasibility
@@ -111,11 +120,6 @@ def case_facts(case: BookingCase, settings: Settings) -> dict[str, Any]:
         "load_id": case.load_id,
         "pickup_number": case.pickup_number,
     }
-
-
-def customer_label(name: str | None) -> str:
-    """Strip the inbound/outbound suffix: "Lidl - Inbound" becomes "Lidl"."""
-    return re.sub(r"\s*-\s*(inbound|outbound)\s*$", "", name or "Lidl", flags=re.I).strip()
 
 
 def local_dt(day: str, clock: str | None, timezone: str | None) -> datetime:
@@ -484,7 +488,9 @@ class Responder:
             to_addr=plan.to_addr,
             cc_addr=", ".join(self.settings.booking_cc),
             subject=subject,
-            body=plan.body if escalation else (f"{plan.body}\n\n{self.settings.booking_signature}"),
+            body=plan.body
+            if escalation or plan.signed
+            else (f"{plan.body}\n\n{self.settings.booking_signature}"),
             thread_id=None if escalation else case.thread_id,
             # A new thread to the customer desk answers nothing; everything else answers the
             # vendor's message by its RFC Message-ID so the next reply threads back to the case.
@@ -598,7 +604,7 @@ class Responder:
             if self._now().astimezone(tz).date() < check_back:
                 return None  # the vendor said when to ask again; wait for that day
             reason = f"vendor said to check back on {check_back:%m/%d}"
-            body = "Good Morning,\n\nChecking in on this!"
+            kind = TemplateKind.CHECK_BACK
         else:
             if self._now() - last_out < timedelta(hours=self.settings.booking_follow_up_hours):
                 return None
@@ -609,8 +615,19 @@ class Responder:
             if replied_since:
                 return None
             reason = f"no reply for {self.settings.booking_follow_up_hours} hours"
-            body = "Hello,\n\nFollowing up on this."
-        plan = ResponsePlan(ResponseIntent.FOLLOW_UP, reason, body=body, to_addr=case.contact_email)
+            kind = TemplateKind.FOLLOW_UP
+        template = pick(session, kind, desk=case.contact_email, customer=case.customer_name)
+        profile = (
+            vendor_profile(Repository(session), case.facility_key) if case.facility_key else None
+        )
+        _, body = render(template, case_values([case], self.settings, profile))
+        plan = ResponsePlan(
+            ResponseIntent.FOLLOW_UP,
+            f"{reason} ({template.source} wording)" if template.source != "built-in" else reason,
+            body=body,
+            to_addr=case.contact_email,
+            signed=True,
+        )
         return self.act(session, case, None, plan)
 
     @staticmethod

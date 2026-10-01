@@ -53,7 +53,6 @@ from facility_profiles.booking.outbox import (
 )
 from facility_profiles.booking.respond import (
     Responder,
-    customer_label,
     local_dt,
     offer_is_feasible,
 )
@@ -62,13 +61,22 @@ from facility_profiles.booking.rules import (
     REFERENCE_NAMES,
     VendorProfile,
     check_desk_rules,
-    extra_references,
     missing_references,
     slot_is_stale,
     too_early,
     vendor_profile,
 )
 from facility_profiles.booking.schema import ReplyClassification, ReplyStatus
+from facility_profiles.booking.templates import (
+    BUILT_IN,
+    Template,
+    TemplateKind,
+    pick,
+    render,
+    request_values,
+    reschedule_values,
+    short_vendor,
+)
 from facility_profiles.booking.timers import fmt_slot
 from facility_profiles.booking.worklist import (
     QUESTION_SUPERSEDES,
@@ -488,81 +496,21 @@ def _check_requested_slot(
 # ------------------------------------------------------------------ compose and draft
 
 
-def _fmt_local(value: str | None) -> tuple[str, str]:
-    """Turn "YYYY-MM-DD HH:MM" into ("MM/DD", "HHMM"), the way the pod writes it."""
-    if not value:
-        return ("(date to confirm)", "")
-    day, _, clock = value.partition(" ")
-    try:
-        parsed = datetime.strptime(day, "%Y-%m-%d")
-    except ValueError:
-        return (day, clock.replace(":", ""))
-    return (parsed.strftime("%m/%d"), clock.replace(":", ""))
-
-
-def request_lines(
-    case: BookingCase, *, date_only: bool = False, extra: Iterable[str] = ()
-) -> list[str]:
-    """The PO lines exactly as the pod writes them: "PO# X on MM/DD @ HHMM".
-
-    ``extra`` holds the numbers the desk needs besides the PO ("Shipment# 7781234"); they follow
-    the PO: "PO# X / Shipment# 7781234 on MM/DD @ HHMM".
-    """
-    mmdd, clock = _fmt_local(case.requested_local)
-    when = f"on {mmdd}" + (f" @ {clock}" if clock and not date_only else "")
-    refs = "".join(f" / {ref}" for ref in extra)
-    pos = [str(p) for p in case.po_numbers]
-    if not pos:
-        return [f"Load {case.load_id}{refs} {when}"]
-    if len(pos) > 1:
-        return [f"PO# {' & '.join(pos)} (ALL IN ONE TRUCK){refs} {when}"]
-    return [f"PO# {pos[0]}{refs} {when}"]
-
-
-def short_vendor(name: str | None) -> str:
-    """Drop the corporate suffix: "Koch Foods, Inc." becomes "Koch Foods"."""
-    return re.sub(r",?\s*\b(inc|llc|corp|co)\b\.?$", "", name or "the shipper", flags=re.I).strip()
-
-
 def compose_request(
-    case: BookingCase, settings: Settings, profile: VendorProfile | None = None
+    case: BookingCase,
+    settings: Settings,
+    profile: VendorProfile | None = None,
+    template: Template | None = None,
 ) -> OutboundDraft:
-    """The request email, in the shape the pod already uses."""
-    pos = [str(p) for p in case.po_numbers]
-    shared = (case.contact_email or "").lower() in {
-        d.lower() for d in settings.booking_shared_desks
-    }
-    ask = (
-        f"Can I please schedule the following for {short_vendor(case.vendor_name)} going to "
-        f"{customer_label(case.customer_name)}?"
-        if shared
-        else "Can I please schedule the following?"
+    """The request email: the built-in template is the pod's own wording, word for word."""
+    subject, body = render(
+        template or BUILT_IN[TemplateKind.REQUEST], request_values([case], settings, profile)
     )
-    subject = (
-        f"Pick Up Appointment: {' & '.join(pos)}"
-        if pos
-        else f"Pick Up Appointment: load {case.load_id}"
-    )
-    lines = [
-        "Hello,",
-        "",
-        ask,
-        "",
-        *request_lines(
-            case,
-            date_only=bool(profile and profile.date_only),
-            extra=extra_references(case, profile),
-        ),
-        "",
-        "Thank you!",
-        "",
-        settings.booking_signature,
-    ]
     return OutboundDraft(
         to_addr=case.contact_email or "",
         cc_addr=", ".join(settings.booking_cc),
-        subject=subject,
-        body="\n".join(lines),
+        subject=subject or "",
+        body=body,
     )
 
 
@@ -585,7 +533,10 @@ def draft_case(
     """
     profile = vendor_profile(Repository(session), case.facility_key) if case.facility_key else None
     _check_draftable(case, settings, now=now or datetime.now(tz=UTC), profile=profile)
-    draft = compose_request(case, settings, profile)
+    template = pick(
+        session, TemplateKind.REQUEST, desk=case.contact_email, customer=case.customer_name
+    )
+    draft = compose_request(case, settings, profile, template)
     if is_sender(mailer):
         trusted = profile.contact_email if profile and profile.can_email else None
         check_send_gate(session, case, draft, settings, trusted_desk=trusted)
@@ -604,7 +555,15 @@ def draft_case(
     case.status = CaseStatus.PENDING.value if result.sent else CaseStatus.UNSCHEDULED.value
     case.reason = None
     session.flush()
-    _event(session, case, "drafted", draft_ref=result.ref, to=draft.to_addr, subject=draft.subject)
+    _event(
+        session,
+        case,
+        "drafted",
+        draft_ref=result.ref,
+        to=draft.to_addr,
+        subject=draft.subject,
+        template=template.source,
+    )
     return message
 
 
@@ -756,16 +715,11 @@ def reschedule_case(
     case.confirmed_start_utc = None
     case.confirmed_end_utc = None
     profile = vendor_profile(Repository(session), case.facility_key) if case.facility_key else None
-    line = request_lines(
-        case,
-        date_only=bool(profile and profile.date_only),
-        extra=extra_references(case, profile),
-    )[0]
-    body_lines = ["Hello,", ""]
-    if note:
-        body_lines.extend([note.strip(), ""])
-    body_lines.extend(
-        [f"Can we please reschedule {line}?", "", "Thank you!", "", settings.booking_signature]
+    template = pick(
+        session, TemplateKind.RESCHEDULE, desk=case.contact_email, customer=case.customer_name
+    )
+    _, body = render(
+        template, reschedule_values(case, settings, profile, previous=previous, note=note)
     )
     original = next((m.subject for m in case.messages if m.direction == "out" and m.subject), None)
     subject = original or f"Pick Up Appointment: {' & '.join(str(p) for p in case.po_numbers)}"
@@ -775,7 +729,7 @@ def reschedule_case(
         to_addr=case.contact_email,
         cc_addr=", ".join(settings.booking_cc),
         subject=subject,
-        body="\n".join(body_lines),
+        body=body,
         thread_id=case.thread_id,
         in_reply_to=last_in.rfc_message_id if last_in else None,
         references=last_in.references_header if last_in else None,
@@ -1509,22 +1463,16 @@ def draft_batch(
         for case in group:
             _check_draftable(case, settings, now=now, profile=profile)
         group.sort(key=lambda c: c.requested_local or "")
-        date_only = bool(profile and profile.date_only)
-        first = compose_request(group[0], settings, profile)
-        ask = first.body.split("\n")[2]
-        lines = ["Hello,", "", ask, ""]
-        for case in group:
-            lines.extend(
-                request_lines(case, date_only=date_only, extra=extra_references(case, profile))
-            )
-        lines.extend(["", "Thank you!", "", settings.booking_signature])
-        pos = [str(p) for c in group for p in c.po_numbers]
-        subject = f"Pick Up Appointments: {' & '.join(pos)}" if pos else "Pick Up Appointments"
+        template = pick(
+            session, TemplateKind.BATCH_REQUEST, desk=desk, customer=group[0].customer_name
+        )
+        rendered_subject, body = render(template, request_values(group, settings, profile))
+        subject = rendered_subject or "Pick Up Appointments"
         draft = OutboundDraft(
             to_addr=desk,
             cc_addr=", ".join(settings.booking_cc),
             subject=subject,
-            body="\n".join(lines),
+            body=body,
         )
         if is_sender(mailer):
             trusted = profile.contact_email if profile and profile.can_email else None
@@ -1555,6 +1503,7 @@ def draft_batch(
                 to=desk,
                 subject=subject,
                 batched_with=[c.id for c in group if c.id != case.id],
+                template=template.source,
             )
             messages.append(message)
     return messages

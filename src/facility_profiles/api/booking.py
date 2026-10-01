@@ -179,7 +179,9 @@ def _event_summary(event: BookingEvent) -> str:
     if event.action == "status_migrated":
         return f"{detail.get('from')} to {detail.get('to')}"
     if detail.get("to"):
-        return f"to {detail['to']}"
+        template = detail.get("template")
+        wording = f", {template} wording" if template and template != "built-in" else ""
+        return f"to {detail['to']}{wording}"
     return ""
 
 

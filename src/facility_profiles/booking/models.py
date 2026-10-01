@@ -184,6 +184,26 @@ class CaseException(Base):
     case: Mapped[BookingCase] = relationship(back_populates="exceptions")
 
 
+class BookingTemplate(Base):
+    """A person's wording for one kind of email, for one desk, one customer or the whole pod.
+
+    ``scope`` is desk, customer or default; ``match`` is the desk's address (lower case) or the
+    customer's name, "" for the default. The body and subject carry fields such as ``{po}``.
+    """
+
+    __tablename__ = "booking_templates"
+    __table_args__ = (UniqueConstraint("kind", "scope", "match", name="uq_booking_template"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    kind: Mapped[str] = mapped_column(String(24))  # TemplateKind value
+    scope: Mapped[str] = mapped_column(String(16))
+    match: Mapped[str] = mapped_column(String(255), default="")
+    subject: Mapped[str | None] = mapped_column(String(512))
+    body: Mapped[str] = mapped_column(Text)
+    updated_by: Mapped[str | None] = mapped_column(String(128))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class DeskMemory(Base):
     """A way of booking a facility that worked: the method, the desk, how often and when last.
 

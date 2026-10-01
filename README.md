@@ -347,6 +347,33 @@ profile has an email desk, the vendor's other cases waiting for one take it and 
 request them; the "No booking desk" to-do is resolved with where the desk came from. The same
 happens when a desk is filed with `profile set`, at once, and through the timers.
 
+### Email templates
+
+The agent's wording comes from templates (`booking/templates.py`, table `booking_templates`):
+`request` (one pickup), `batch_request` (several pickups for one desk in one email), `reschedule`,
+`follow_up` (after a day of silence) and `check_back` (on the day a vendor said to ask again).
+A template is a subject (requests only; the rest answer in the thread) and a body with fields in
+braces: `{lines}` (the PO lines), `{ask}`, `{po}`, `{load}`, `{date}`, `{time}`, `{vendor}`,
+`{customer}`, `{desk_name}`, `{delivery_ref}`, `{delivery_date}`, `{refs}`, `{carrier}`,
+`{signature}`, and for a reschedule `{line}`, `{previous}`, `{note}`. A field left empty leaves no
+blank gap.
+
+The template used is the most specific saved: for the desk's address, else for the customer
+(`Lidl - Inbound`), else the pod's default, else the built-in one, which is the pod's own wording
+word for word. Templates are checked when saved: an unknown field, an unmatched brace, a request
+without `{lines}` or a reschedule without `{line}` is refused. The "Request drafted" step on the
+board says which wording was used.
+
+```powershell
+facility-profiles booking template fields
+facility-profiles booking template set request --customer "Lidl - Inbound" --subject "Pick Up Appointment: {po}" --body-file lidl-request.txt --by megan
+facility-profiles booking template set follow_up --desk cci@udfinc.com --body "Hello,\n\nChecking on {po} for {date}.\n\n{signature}" --by megan
+facility-profiles booking template preview 12            # the email the agent would write now
+facility-profiles booking template show request --desk cci@udfinc.com
+facility-profiles booking template list
+facility-profiles booking template remove follow_up --desk cci@udfinc.com
+```
+
 ### One reply, several POs
 
 A batched request covers several cases with one email, and Morgan Foods answers it line by
