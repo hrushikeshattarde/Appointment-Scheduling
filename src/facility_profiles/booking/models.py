@@ -182,3 +182,26 @@ class CaseException(Base):
     resolution: Mapped[str | None] = mapped_column(String(255))
 
     case: Mapped[BookingCase] = relationship(back_populates="exceptions")
+
+
+class DeskMemory(Base):
+    """A way of booking a facility that worked: the method, the desk, how often and when last.
+
+    One row per facility, method and desk. ``desk`` is the email address, phone number or
+    portal URL the booking was made with, or "" when nobody said.
+    """
+
+    __tablename__ = "booking_desk_memory"
+    __table_args__ = (
+        UniqueConstraint("facility_key", "method", "desk", name="uq_booking_desk_memory"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    facility_key: Mapped[str] = mapped_column(String(64), index=True)
+    method: Mapped[str] = mapped_column(String(32))  # BookingMethod value
+    desk: Mapped[str] = mapped_column(String(512), default="")
+    worked_count: Mapped[int] = mapped_column(Integer, default=0)
+    first_worked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_worked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_case_id: Mapped[int | None] = mapped_column(Integer)
+    last_by: Mapped[str | None] = mapped_column(String(128))

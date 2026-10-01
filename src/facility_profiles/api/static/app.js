@@ -841,6 +841,7 @@ function bookedForm(d) {
   const date = h("input", { type: "date", value: slot ? slot.day : "" });
   const time = h("input", { type: "time", value: slot && slot.time ? slot.time : "" });
   const number = h("input", { type: "text", value: d.pickup_number || "", placeholder: "for example 20463798" });
+  const desk = h("input", { type: "text", value: d.desk || "", placeholder: "email, phone or portal address" });
   const note = h("input", { type: "text", placeholder: "optional" });
   const form = h(
     "form",
@@ -852,6 +853,7 @@ function bookedForm(d) {
       h("label", {}, "Vendor pickup number", number),
       h("label", {}, "Pickup date", date),
       h("label", {}, "Pickup time (vendor's local time)", time),
+      h("label", { class: "full" }, "Booked with (remembered for this vendor)", desk),
       h("label", { class: "full" }, "Note", note),
     ),
   );
@@ -868,6 +870,7 @@ function bookedForm(d) {
         time: time.value || null,
         pickup_number: number.value || null,
         note: note.value || null,
+        desk: desk.value || null,
       },
       "Marked booked: the pickup is scheduled",
     );
@@ -913,6 +916,17 @@ function actionSection(d) {
   return section;
 }
 
+// How the vendor was booked before: "email shipping@vendor.example, 3 times, last 10/01".
+function deskHistory(rows) {
+  if (!rows || !rows.length) return "-";
+  return rows
+    .map((r) => {
+      const last = r.last_worked_at ? `, last ${fmtInstant(r.last_worked_at).split(",")[0]}` : "";
+      return `${r.method.replace("_", " ")}${r.desk ? ` ${r.desk}` : ""}, ${plural(r.worked_count, "time")}${last}`;
+    })
+    .join("; ");
+}
+
 function factsSection(d) {
   const delivery = [d.delivery_site, d.delivery_ref, d.delivery_at ? `${fmtInstant(d.delivery_at)} your time` : null]
     .filter(Boolean)
@@ -924,6 +938,7 @@ function factsSection(d) {
     ["Confirmed", d.confirmed_local ? fmtSlot(d.confirmed_local) : "-"],
     ["Pickup number", d.pickup_number || "-"],
     ["References", (d.references || []).map((r) => `${r.label} ${r.value}`).join(", ") || "-"],
+    ["Booked before", deskHistory(d.desk_history)],
     ["Vendor", [d.vendor, d.vendor_city].filter(Boolean).join(", ") || "-"],
     ["Booking desk", desk],
     ["Delivery", delivery || "-"],

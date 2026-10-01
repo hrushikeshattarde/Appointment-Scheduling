@@ -32,6 +32,7 @@ from facility_profiles.booking.models import (
     BookingEvent,
     BookingMessage,
     CaseException,
+    DeskMemory,
     ExceptionType,
 )
 from facility_profiles.booking.respond import Responder
@@ -147,6 +148,10 @@ class Demo:
             if sent and message.direction == "out" and message.sent_at is None:
                 message.sent_at = when + timedelta(minutes=10)
                 message.draft_ref = None
+        for memory in s.scalars(select(DeskMemory).where(DeskMemory.last_case_id == case.id)):
+            memory.last_worked_at = when
+            if memory.worked_count <= 1:
+                memory.first_worked_at = when
         self.last_step[case.id] = max(when, self.last_step.get(case.id, when))
         s.flush()
 
@@ -506,6 +511,7 @@ def build(demo: Demo) -> int:
             local=f"{day:%Y-%m-%d} 12:00",
             pickup_number="TEL20811",
             note="no email slots left, booked with the desk",
+            desk="716-555-0144",  # a fictional 555 number
         )
     made += 1
 

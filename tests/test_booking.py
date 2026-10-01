@@ -292,7 +292,15 @@ def test_scan_draft_reply_and_approve_round_trip(settings, sessions):
         review = case.exceptions[0]
         assert (review.resolution, review.resolved_by) == ("approved", "megan")
         actions = [e.action for e in case.events]
-        assert actions == ["scanned", "drafted", "sent", "vendor_confirmed", "approved"]
+        # The desk that confirmed is remembered for the facility once the booking is approved.
+        assert actions == [
+            "scanned",
+            "drafted",
+            "sent",
+            "vendor_confirmed",
+            "approved",
+            "desk_remembered",
+        ]
         with pytest.raises(ValueError, match="nothing to approve"):
             approve(session, case, by="megan", client=None)
 

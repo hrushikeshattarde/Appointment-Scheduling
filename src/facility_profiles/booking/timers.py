@@ -15,7 +15,8 @@ Two clocks run over the cases still being booked (:func:`sweep`; ``booking timer
   vendor offered that still waits for a person, else the slot asked for.
 - **The desk's rules.** With settings, a request that has not gone out yet is checked against
   its desk's rules again (``booking/rules.py``): a cut-off or notice that passed overnight is
-  raised as ``slot_unworkable``, a number the desk now requires as ``missing_reference``.
+  raised as ``slot_unworkable``, a number the desk now requires as ``missing_reference``; a
+  case still waiting for a desk takes the one the profile has since learned.
 
 Each raise remembers what started its clock (the message that went unanswered, the slot that
 passed), so a person's resolution sticks: the same silence or the same slot is never raised
@@ -35,6 +36,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, selectinload
 
+from facility_profiles.booking.memory import take_desk
 from facility_profiles.booking.models import (
     BookingCase,
     BookingMessage,
@@ -308,6 +310,8 @@ def _check_desk(run: _Pass, case: BookingCase) -> None:
     profile = (
         vendor_profile(Repository(run.session), case.facility_key) if case.facility_key else None
     )
+    if profile is not None:  # a desk filed on the profile since the scan unblocks the case
+        take_desk(run.session, case, profile, by=TIMER)
     check_desk_rules(run.session, case, run.settings, now=run.now, profile=profile, actor=TIMER)
     for exc in case.open_exceptions:
         if exc.id not in before:

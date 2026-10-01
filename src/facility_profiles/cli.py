@@ -343,9 +343,19 @@ def profile_set(
             actor=by,
         )
         name = record.company_name
+        unblocked: list[int] = []
+        if role is Role.SHIPPER and field in ("booking_method", "contact_email"):
+            from facility_profiles.booking.memory import apply_desk_to_waiting_cases
+
+            unblocked = apply_desk_to_waiting_cases(session, record.key, by=by)
     typer.echo(
         f"{name} [{role.value}] {field} = {json.dumps(typed)} (was {json.dumps(before)})"
         + (f"; closed {closed} open review item(s)" if closed else "")
+        + (
+            f"; case(s) {', '.join(f'#{i}' for i in unblocked)} now have a desk"
+            if unblocked
+            else ""
+        )
     )
 
 
@@ -893,8 +903,16 @@ def booking_booked(
     time: Annotated[str | None, typer.Option(help="Pickup time, HH:MM local")] = None,
     pickup_number: Annotated[str | None, typer.Option(help="Vendor pickup number")] = None,
     note: Annotated[str | None, typer.Option(help="Anything worth keeping")] = None,
+    desk: Annotated[
+        str | None,
+        typer.Option(help="The email, phone or portal address it was booked with (remembered)"),
+    ] = None,
 ) -> None:
-    """Record a pickup booked outside the agent: the case becomes scheduled."""
+    """Record a pickup booked outside the agent: the case becomes scheduled.
+
+    The facility remembers how it was booked; a desk its profile lacked is filed there, and its
+    other cases waiting for a desk take it.
+    """
     from facility_profiles.booking.service import mark_booked
 
     if time and not date:
@@ -904,7 +922,7 @@ def booking_booked(
     with session_scope(_sessions(settings)) as session:
         case = _booking_case(session, case_id)
         try:
-            mark_booked(
+            learned = mark_booked(
                 session,
                 case,
                 by=by,
@@ -912,11 +930,16 @@ def booking_booked(
                 local=local,
                 pickup_number=pickup_number,
                 note=note,
+                desk=desk,
             )
         except ValueError as exc:
             typer.echo(str(exc))
             raise typer.Exit(code=1) from exc
     typer.echo(f"#{case_id} scheduled (booked by {via})")
+    if learned.filled:
+        typer.echo(f"  the vendor profile learned its {', '.join(learned.filled)}")
+    if learned.unblocked:
+        typer.echo(f"  case(s) {', '.join(f'#{i}' for i in learned.unblocked)} now have a desk")
 
 
 @booking_app.command("resolve")
@@ -963,6 +986,33 @@ def booking_ref(
             raise typer.BadParameter(str(exc)) from exc
     still = f"; still missing: {', '.join(REFERENCE_NAMES[m] for m in missing)}" if missing else ""
     typer.echo(f"#{case_id} {kind} = {value.strip()}{still}")
+
+
+@booking_app.command("desks")
+def booking_desks() -> None:
+    """How each facility was booked before: method, desk, how often and when last."""
+    from sqlalchemy import select
+
+    from facility_profiles.booking.models import DeskMemory
+
+    settings = _settings()
+    with session_scope(_sessions(settings)) as session:
+        rows = list(
+            session.scalars(
+                select(DeskMemory).order_by(DeskMemory.facility_key, DeskMemory.worked_count.desc())
+            )
+        )
+        if not rows:
+            typer.echo("nothing booked yet")
+            return
+        repo = Repository(session)
+        for row in rows:
+            record = repo.get_facility(row.facility_key)
+            name = record.company_name if record and record.company_name else row.facility_key
+            typer.echo(
+                f"{name[:36]:<36} {row.method:<10} {row.desk or '-':<40} x{row.worked_count:<3} "
+                f"last {row.last_worked_at:%Y-%m-%d} (case #{row.last_case_id})"
+            )
 
 
 @booking_app.command("timers")

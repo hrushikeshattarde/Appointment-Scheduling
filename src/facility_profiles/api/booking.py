@@ -18,12 +18,14 @@ from pydantic import BaseModel, StringConstraints
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
+from facility_profiles.booking.memory import desk_history
 from facility_profiles.booking.models import (
     BookingCase,
     BookingEvent,
     BookingMessage,
     CaseException,
     CaseStatus,
+    DeskMemory,
     ExceptionType,
 )
 from facility_profiles.booking.rules import REFERENCE_LABELS, REFERENCE_NAMES
@@ -71,6 +73,8 @@ EVENTS: dict[str, str] = {
     "escalate_to_customer": "Note to the customer desk",
     "status_migrated": "Moved to the new statuses",
     "reference_added": "Reference added",
+    "desk_remembered": "Desk remembered",
+    "desk_learned": "Desk on file now",
 }
 
 
@@ -218,9 +222,23 @@ def timeline(case: BookingCase) -> list[dict[str, Any]]:
     return sorted(rows, key=lambda r: r["at"] or "")
 
 
-def case_detail(case: BookingCase, *, now: datetime) -> dict[str, Any]:
-    """Everything about one case."""
+def desk_view(row: DeskMemory) -> dict[str, Any]:
+    """One way the facility was booked before."""
     return {
+        "method": row.method,
+        "desk": row.desk or None,
+        "worked_count": row.worked_count,
+        "last_worked_at": _iso(row.last_worked_at),
+        "last_case_id": row.last_case_id,
+    }
+
+
+def case_detail(
+    case: BookingCase, *, now: datetime, desks: list[DeskMemory] | None = None
+) -> dict[str, Any]:
+    """Everything about one case; ``desks`` is how its facility was booked before."""
+    return {
+        "desk_history": [desk_view(d) for d in desks or []],
         **case_summary(case, now=now),
         "requested_local": case.requested_local,
         "confirmed_local": case.confirmed_local,
@@ -337,6 +355,7 @@ class Booking(BaseModel):
     time: Clock | None = None
     pickup_number: str | None = None
     note: str | None = None
+    desk: Annotated[str, StringConstraints(strip_whitespace=True, max_length=255)] | None = None
 
 
 class Reference(BaseModel):
@@ -404,9 +423,13 @@ def _get_case(session: Session, case_id: int) -> BookingCase:
     return case
 
 
+def _detail(session: Session, case: BookingCase, now: datetime) -> dict[str, Any]:
+    return case_detail(case, now=now, desks=desk_history(session, case.facility_key))
+
+
 def _decided(session: Session, case: BookingCase, now: datetime) -> dict[str, Any]:
     session.commit()  # the decision is stored before anyone is told it was made
-    return case_detail(case, now=now)
+    return _detail(session, case, now)
 
 
 @router.get("/overview")
@@ -487,8 +510,8 @@ def get_cases(
 
 @router.get("/cases/{case_id}")
 def get_case_detail(case_id: int, session: SessionDep, now: NowDep) -> dict[str, Any]:
-    """One case in full."""
-    return case_detail(_get_case(session, case_id), now=now)
+    """One case in full, with how its facility was booked before."""
+    return _detail(session, _get_case(session, case_id), now)
 
 
 @router.post("/cases/{case_id}/approve")
@@ -529,6 +552,7 @@ def post_booked(case_id: int, body: Booking, session: SessionDep, now: NowDep) -
             local=local,
             pickup_number=(body.pickup_number or "").strip() or None,
             note=(body.note or "").strip() or None,
+            desk=body.desk or None,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

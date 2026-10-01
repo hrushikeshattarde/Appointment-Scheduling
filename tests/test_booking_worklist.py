@@ -144,7 +144,9 @@ def test_booked_another_way_is_scheduled_and_clears_what_was_open(settings, sess
         assert case.exceptions[0].resolution == "booked by phone"
         assert as_utc(case.confirmed_start_utc) == datetime(2026, 10, 1, 14, 30, tzinfo=UTC)
         assert case.pickup_number == "CCI-1"
-        assert case.events[-1].action == "marked_booked" and case.events[-1].actor == "megan"
+        booked, remembered = case.events[-2:]
+        assert (booked.action, booked.actor) == ("marked_booked", "megan")
+        assert (remembered.action, remembered.detail["method"]) == ("desk_remembered", "phone")
         # Scheduled is decided: no draft, and a cancellation is refused the other way round.
         with pytest.raises(ValueError, match="only unscheduled"):
             draft_case(session, case, RecordingMailer(), settings, now=NOW)

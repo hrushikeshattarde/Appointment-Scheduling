@@ -36,6 +36,7 @@ from facility_profiles.booking.mail import (
     Sender,
     deliver,
 )
+from facility_profiles.booking.memory import VIA_METHODS, Learned, remember_booking
 from facility_profiles.booking.models import (
     BookingCase,
     BookingEvent,
@@ -1608,6 +1609,8 @@ def approve(
         by=by,
     )
     _event(session, case, "approved", actor=by, payload=payload, written_to_tpro=written)
+    # The vendor confirmed by email: the desk the request went to worked.
+    remember_booking(session, case, method="email", desk=case.contact_email, by=by)
     return payload, written
 
 
@@ -1620,11 +1623,15 @@ def mark_booked(
     local: str | None = None,
     pickup_number: str | None = None,
     note: str | None = None,
-) -> None:
+    desk: str | None = None,
+) -> Learned:
     """A person booked the pickup outside the agent: by phone, on a portal, by their own email.
 
     The case becomes scheduled (with the slot, when given, as ``YYYY-MM-DD`` or
-    ``YYYY-MM-DD HH:MM`` vendor-local) and everything open on it is resolved as booked.
+    ``YYYY-MM-DD HH:MM`` vendor-local) and everything open on it is resolved as booked. The way
+    it was booked is remembered for the facility: ``desk`` is the email address, phone number or
+    portal address used (for an email booking, the desk on file when none is given). What the
+    vendor profile learned from it is returned.
     """
     if case.status == CaseStatus.CANCELED.value:
         msg = f"case {case.id} is canceled; nothing to mark as booked"
@@ -1648,7 +1655,11 @@ def mark_booked(
         local=local,
         pickup_number=case.pickup_number,
         note=note,
+        desk=desk,
     )
+    method = VIA_METHODS.get(via.strip().lower())
+    used = desk or (case.contact_email if method == "email" else None)
+    return remember_booking(session, case, method=method, desk=used, by=by)
 
 
 def close_case(session: Session, case: BookingCase, *, by: str, reason: str) -> None:

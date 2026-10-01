@@ -136,7 +136,8 @@ facility-profiles booking inbox --file data/lidl-mail/messages.jsonl   # or --ke
 facility-profiles booking show 12
 facility-profiles booking approve 12 --by megan
 facility-profiles booking resolve 12 facility_question --by megan --note "answered by phone"
-facility-profiles booking booked 12 --by megan --via phone --date 2026-10-05 --time 09:00
+facility-profiles booking booked 12 --by megan --via phone --date 2026-10-05 --time 09:00 --desk 812-794-1152
+facility-profiles booking desks             # how each vendor was booked before
 facility-profiles booking timers            # no reply in 24 h / 48 h, pickup passed unbooked
 facility-profiles booking ref 12 shipment_number 7781234 --by megan   # a number the desk needs
 facility-profiles booking today --out exports/today.txt  # the daily summary (runs the timers)
@@ -328,6 +329,23 @@ reference" on the board; the to-do clears once the case has every number its des
 `scripts/seed_lidl_desk_rules.py` files the two the lidl@ threads stated: Morgan Foods wants
 Lidl's TI shipment number, RLS Lebanon wants Lidl's SO number. A portal desk's to-do names its
 system and address ("books on opendock (https://...)").
+
+### Desk memory
+
+When a pickup is booked, the way it was booked is remembered for the vendor (`booking/memory.py`,
+table `booking_desk_memory`: method, desk, how many times, when last, by whom). Approving a
+vendor's email confirmation counts the desk the request went to. Marking a pickup booked counts
+`--via` phone, portal or email with `--desk`, the address or number used ("Booked with" on the
+board; an email booking without one counts the desk on file). Updating a booking does not count
+it twice.
+
+The profile learns from it where it has nothing trusted yet: the booking method, and the email
+desk, phone number or portal address (with the portal's system) are filed as a person's values,
+audited as `learned` with the case they came from. A value already trusted is never overwritten;
+the memory still shows what else worked ("Booked before" on the board, `booking desks`). Once the
+profile has an email desk, the vendor's other cases waiting for one take it and the agent can
+request them; the "No booking desk" to-do is resolved with where the desk came from. The same
+happens when a desk is filed with `profile set`, at once, and through the timers.
 
 ### One reply, several POs
 
