@@ -31,10 +31,12 @@ from facility_profiles.booking.models import (
     BookingCase,
     BookingEvent,
     BookingMessage,
+    BookingReference,
     CaseException,
     DeskMemory,
     ExceptionType,
 )
+from facility_profiles.booking.references import record_load_numbers
 from facility_profiles.booking.respond import Responder
 from facility_profiles.booking.rules import check_desk_rules, vendor_profile
 from facility_profiles.booking.schema import ReplyClassification, ReplyStatus
@@ -131,6 +133,7 @@ class Demo:
         last_event = s.scalar(select(func.max(BookingEvent.id))) or 0
         last_exc = s.scalar(select(func.max(CaseException.id))) or 0
         last_msg = s.scalar(select(func.max(BookingMessage.id))) or 0
+        last_ref = s.scalar(select(func.max(BookingReference.id))) or 0
         open_before = {e.id for e in s.scalars(select(CaseException)) if e.resolved_at is None}
         yield
         s.flush()
@@ -148,6 +151,10 @@ class Demo:
             if sent and message.direction == "out" and message.sent_at is None:
                 message.sent_at = when + timedelta(minutes=10)
                 message.draft_ref = None
+        for ref in s.scalars(select(BookingReference).where(BookingReference.id > last_ref)):
+            ref.created_at = when
+            if ref.replaced_at is not None:
+                ref.replaced_at = when
         for memory in s.scalars(select(DeskMemory).where(DeskMemory.last_case_id == case.id)):
             memory.last_worked_at = when
             if memory.worked_count <= 1:
@@ -205,6 +212,7 @@ class Demo:
             self.session.flush()
             case.created_at = when
             case.events.append(BookingEvent(action="scanned", detail={"status": case.status}))
+            record_load_numbers(self.session, case)
         return case
 
     def send(self, case: BookingCase, when: datetime) -> None:

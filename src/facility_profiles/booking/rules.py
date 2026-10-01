@@ -39,6 +39,9 @@ REFERENCE_LABELS: dict[str, str] = {
     ReferenceType.SHIPMENT_NUMBER.value: "Shipment#",
     ReferenceType.SALES_ORDER_NUMBER.value: "SO#",
     ReferenceType.BOL_NUMBER.value: "BOL#",
+    ReferenceType.PICKUP_NUMBER.value: "PU#",
+    ReferenceType.CONFIRMATION_NUMBER.value: "Confirmation#",
+    ReferenceType.PORTAL_APPOINTMENT_ID.value: "Portal appointment#",
 }
 # And in plain words, for the person asked to find one.
 REFERENCE_NAMES: dict[str, str] = {
@@ -48,15 +51,10 @@ REFERENCE_NAMES: dict[str, str] = {
     ReferenceType.SHIPMENT_NUMBER.value: "customer's shipment number",
     ReferenceType.SALES_ORDER_NUMBER.value: "customer's sales order (SO) number",
     ReferenceType.BOL_NUMBER.value: "BOL number",
+    ReferenceType.PICKUP_NUMBER.value: "vendor's pickup number",
+    ReferenceType.CONFIRMATION_NUMBER.value: "vendor's confirmation number",
+    ReferenceType.PORTAL_APPOINTMENT_ID.value: "portal appointment id",
 }
-# Numbers the case carries from the load itself; the rest a person adds.
-FROM_THE_LOAD = frozenset(
-    {
-        ReferenceType.PO_NUMBER.value,
-        ReferenceType.LOAD_NUMBER.value,
-        ReferenceType.DELIVERY_NUMBER.value,
-    }
-)
 
 
 @dataclass(frozen=True)
@@ -128,6 +126,8 @@ def reference_values(case: BookingCase) -> dict[str, str]:
     values[ReferenceType.LOAD_NUMBER.value] = str(case.load_id)
     if case.delivery_ref:
         values[ReferenceType.DELIVERY_NUMBER.value] = case.delivery_ref
+    if case.pickup_number:
+        values[ReferenceType.PICKUP_NUMBER.value] = case.pickup_number
     return values
 
 

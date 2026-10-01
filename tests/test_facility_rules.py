@@ -424,7 +424,7 @@ def test_booking_ref_from_the_command_line(
         )
         assert added.exit_code == 0 and f"#{case_id} shipment_number = 7781234" in added.output
         shown = runner.invoke(app, ["booking", "show", str(case_id)])
-        assert "ref       Shipment# 7781234" in shown.output
+        assert "number    Shipment# 7781234  (added by megan)" in shown.output
     finally:
         get_settings.cache_clear()
 
@@ -454,8 +454,9 @@ def test_the_board_adds_a_reference_and_shows_it(settings, tmp_path: Path):
         detail = client.post(
             f"{base}/reference", json={"by": "megan", "kind": "sales_order_number", "value": "SO1"}
         ).json()
-        assert detail["references"] == [
-            {"kind": "sales_order_number", "label": "SO#", "value": "SO1"}
+        added = [r for r in detail["references"] if r["kind"] == "sales_order_number"]
+        assert [(r["label"], r["value"], r["said"], r["current"]) for r in added] == [
+            ("SO#", "SO1", "added by megan", True)
         ]
         assert detail["open_exceptions"] == []
         assert any(t["title"] == "Reference added" for t in detail["timeline"])

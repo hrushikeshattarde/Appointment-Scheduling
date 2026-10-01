@@ -51,6 +51,13 @@ from facility_profiles.booking.outbox import (
     is_sender,
     record_delivery,
 )
+from facility_profiles.booking.references import (
+    ReferenceSource,
+    active,
+    case_numbers,
+    record_load_numbers,
+    record_reference,
+)
 from facility_profiles.booking.respond import (
     Responder,
     local_dt,
@@ -91,6 +98,7 @@ from facility_profiles.booking.worklist import (
 )
 from facility_profiles.config import Settings
 from facility_profiles.domain.resolution import FacilityResolver
+from facility_profiles.domain.schema import ReferenceType
 from facility_profiles.logging import get_logger
 from facility_profiles.mailarchive.filters import normalize_subject, participants
 from facility_profiles.pipeline.harvest import iter_terminal_loads, stop_identity
@@ -447,6 +455,7 @@ def scan(
             )
             session.add(case)
             session.flush()
+            record_load_numbers(session, case, at=now)
             if blocker is not None:
                 flag(session, case, blocker[0], blocker[1], method=profile.booking_method)
             _event(
@@ -662,8 +671,8 @@ def add_reference(
     if not value:
         msg = "the reference needs a value"
         raise ValueError(msg)
-    previous = (case.reference_numbers or {}).get(kind)
-    case.reference_numbers = {**(case.reference_numbers or {}), kind: value}
+    previous = next((r.value for r in active(case, kind)), None)
+    record_reference(session, case, kind, value, source=ReferenceSource.PERSON, by=by)
     profile = vendor_profile(Repository(session), case.facility_key) if case.facility_key else None
     missing = missing_references(case, profile)
     label = f"{REFERENCE_LABELS[kind]} {value}"
@@ -921,6 +930,7 @@ def apply_reply(
     *,
     actor: str = "agent",
     reply_sent_at: datetime | None = None,
+    message_id: int | None = None,
 ) -> str:
     """Move the case according to the classified reply; return the event recorded.
 
@@ -969,7 +979,15 @@ def apply_reply(
         case.confirmed_local = f"{day} {clock or ''}".strip()
         case.confirmed_start_utc = start
         case.confirmed_end_utc = end
-        case.pickup_number = result.pickup_number or case.pickup_number
+        record_reference(
+            session,
+            case,
+            ReferenceType.PICKUP_NUMBER.value,
+            result.pickup_number,
+            source=ReferenceSource.VENDOR,
+            by=actor,
+            message_id=message_id,
+        )
         pickup = f", pickup# {case.pickup_number}" if case.pickup_number else ""
         flag(
             session,
@@ -1008,7 +1026,15 @@ def apply_reply(
     if result.status == ReplyStatus.COUNTER_OFFER:
         _new_reading(session, case, "counter_offer")
         # Morgan Foods assigns the pickup number with the counter ("10/2 @ 9am pickup# 20463798").
-        case.pickup_number = result.pickup_number or case.pickup_number
+        record_reference(
+            session,
+            case,
+            ReferenceType.PICKUP_NUMBER.value,
+            result.pickup_number,
+            source=ReferenceSource.VENDOR,
+            by=actor,
+            message_id=message_id,
+        )
         offered = f"vendor offered {result.pickup_date or '?'} {result.pickup_time or ''}".strip()
         offered += f" to {result.pickup_time_end}" if result.pickup_time_end else ""
         flag(
@@ -1180,7 +1206,9 @@ def _ingest_reply(
         session.flush()
         if case.thread_id is None and message.thread_id:
             case.thread_id = message.thread_id
-        action = apply_reply(session, case, reading, issues, reply_sent_at=message.sent_at)
+        action = apply_reply(
+            session, case, reading, issues, reply_sent_at=message.sent_at, message_id=inbound.id
+        )
         if action == "vendor_confirmed":
             stats.proposed += 1
         elif action in ("counter_offer", "question", "rejected_by_vendor", "stale_confirmation"):
@@ -1361,7 +1389,14 @@ def _apply_customer_desk_message(
         return False
     start, ref = slot
     previous_ref, previous_at = case.delivery_ref, as_utc(case.delivery_at_utc)
-    case.delivery_ref = ref
+    record_reference(
+        session,
+        case,
+        ReferenceType.DELIVERY_NUMBER.value,
+        ref,
+        source=ReferenceSource.CUSTOMER_DESK,
+        message_id=inbound.id,
+    )
     case.delivery_at_utc = start
     _event(
         session,
@@ -1591,7 +1626,14 @@ def mark_booked(
         case.confirmed_local = local
         case.confirmed_start_utc = start
         case.confirmed_end_utc = start
-    case.pickup_number = pickup_number or case.pickup_number
+    record_reference(
+        session,
+        case,
+        ReferenceType.PICKUP_NUMBER.value,
+        pickup_number,
+        source=ReferenceSource.PERSON,
+        by=by,
+    )
     case.status = CaseStatus.SCHEDULED.value
     case.reason = (f"booked by {via}" + (f": {note}" if note else ""))[:255]
     resolve_all(session, case, resolution=f"booked by {via}", by=by)
@@ -1653,9 +1695,11 @@ def describe(case: BookingCase) -> str:
         f"  desk      {case.contact_email or 'none'}  ({case.booking_method or 'unknown method'})",
         f"  PO        {', '.join(str(p) for p in case.po_numbers) or 'none'}",
         *(
-            f"  ref       {REFERENCE_LABELS.get(k, k)} {v}"
-            for k, v in sorted((case.reference_numbers or {}).items())
-            if v
+            f"  {'number' if n.current else 'was':<9} {n.label} {n.value}  ({n.said}"
+            + (f", replaced {n.replaced_at:%m/%d}" if n.replaced_at else "")
+            + ")"
+            for n in case_numbers(case)
+            if n.kind not in ("load_number", "po_number")
         ),
         f"  requested {case.requested_local or '?'} local",
         f"  delivery  {case.delivery_site or '?'}"

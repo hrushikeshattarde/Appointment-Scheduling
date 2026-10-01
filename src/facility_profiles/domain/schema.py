@@ -57,7 +57,7 @@ class PortalVendor(StrEnum):
 
 
 class ReferenceType(StrEnum):
-    """A number a booking desk can ask for before it gives a slot."""
+    """A number on a pickup: one a desk can ask for, or one a vendor or portal gives back."""
 
     PO_NUMBER = "po_number"
     LOAD_NUMBER = "load_number"  # Circle's load number
@@ -65,6 +65,9 @@ class ReferenceType(StrEnum):
     SHIPMENT_NUMBER = "shipment_number"  # the customer's shipment number (Lidl's TI number)
     SALES_ORDER_NUMBER = "sales_order_number"  # the customer's sales order (Lidl's SO number)
     BOL_NUMBER = "bol_number"
+    PICKUP_NUMBER = "pickup_number"  # the vendor's pickup number for the driver
+    CONFIRMATION_NUMBER = "confirmation_number"  # a vendor's appointment or confirmation number
+    PORTAL_APPOINTMENT_ID = "portal_appointment_id"  # the booking's id on a scheduling portal
 
 
 class TimeGranularity(StrEnum):

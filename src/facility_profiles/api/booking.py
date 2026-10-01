@@ -28,6 +28,7 @@ from facility_profiles.booking.models import (
     DeskMemory,
     ExceptionType,
 )
+from facility_profiles.booking.references import case_numbers
 from facility_profiles.booking.rules import REFERENCE_LABELS, REFERENCE_NAMES
 from facility_profiles.booking.service import (
     add_reference,
@@ -129,6 +130,8 @@ def case_summary(case: BookingCase, *, now: datetime) -> dict[str, Any]:
         "pickup_date": local.partition(" ")[0] if local else None,
         "past_due": pickup_passed(case, now),
         "pickup_number": case.pickup_number,
+        # Every number the case has carried, so any of them finds it.
+        "numbers": sorted({r.value for r in case.references}),
         "desk": case.contact_email,
         "method": case.booking_method,
         "delivery_site": case.delivery_site,
@@ -248,11 +251,7 @@ def case_detail(
         "miles": case.miles,
         "reason": case.reason,
         "facility_key": case.facility_key,
-        "references": [
-            {"kind": k, "label": REFERENCE_LABELS.get(k, k), "value": v}
-            for k, v in sorted((case.reference_numbers or {}).items())
-            if v
-        ],
+        "references": [n.as_dict() for n in case_numbers(case)],
         "exceptions": [exception_view(e) for e in case.exceptions],
         "messages": [_message_view(m) for m in case.messages],
         "timeline": timeline(case),
@@ -324,6 +323,7 @@ def _matches(row: dict[str, Any], q: str) -> bool:
         row["customer"],
         row["desk"],
         *row["po_numbers"],
+        *row["numbers"],
     ]
     return any(needle in (h or "").lower() for h in haystack)
 
@@ -414,6 +414,7 @@ def _load_all(session: Session) -> list[BookingCase]:
         selectinload(BookingCase.exceptions),
         selectinload(BookingCase.messages),
         selectinload(BookingCase.events),
+        selectinload(BookingCase.references),
     )
     return list(session.scalars(stmt))
 

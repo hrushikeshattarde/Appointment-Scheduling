@@ -916,6 +916,20 @@ function actionSection(d) {
   return section;
 }
 
+// Every number on the case and where it came from: "PU# 20463798 (from the vendor, 10/01)".
+// The load number heads the facts already, so it is left out here.
+function numbersText(refs, current) {
+  const rows = (refs || []).filter((r) => r.current === current && r.kind !== "load_number");
+  if (!rows.length) return "-";
+  return rows
+    .map((r) => {
+      const when = (current ? r.at : r.replaced_at) ? fmtInstant(current ? r.at : r.replaced_at).split(",")[0] : "";
+      const how = current ? r.said : `replaced ${when}`;
+      return `${r.label} ${r.value} (${how}${current && when ? `, ${when}` : ""})`;
+    })
+    .join("; ");
+}
+
 // How the vendor was booked before: "email shipping@vendor.example, 3 times, last 10/01".
 function deskHistory(rows) {
   if (!rows || !rows.length) return "-";
@@ -937,7 +951,8 @@ function factsSection(d) {
     ["Requested", d.requested_local ? fmtSlot(d.requested_local) : "-"],
     ["Confirmed", d.confirmed_local ? fmtSlot(d.confirmed_local) : "-"],
     ["Pickup number", d.pickup_number || "-"],
-    ["References", (d.references || []).map((r) => `${r.label} ${r.value}`).join(", ") || "-"],
+    ["Numbers", numbersText(d.references, true)],
+    ["Earlier numbers", numbersText(d.references, false)],
     ["Booked before", deskHistory(d.desk_history)],
     ["Vendor", [d.vendor, d.vendor_city].filter(Boolean).join(", ") || "-"],
     ["Booking desk", desk],

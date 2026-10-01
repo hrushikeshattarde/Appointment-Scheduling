@@ -621,6 +621,8 @@ def booking_delivery_updated(
 
     from facility_profiles.booking.mail import LocalDraftMailer, OutboundDraft
     from facility_profiles.booking.models import BookingEvent, BookingMessage
+    from facility_profiles.booking.references import ReferenceSource, record_reference
+    from facility_profiles.domain.schema import ReferenceType
 
     settings = _settings()
     if not settings.booking_customer_desk:
@@ -633,7 +635,14 @@ def booking_delivery_updated(
             tzinfo=ZoneInfo(case.vendor_timezone or "America/New_York")
         )
         previous = case.delivery_ref
-        case.delivery_ref = ref.upper()
+        record_reference(
+            session,
+            case,
+            ReferenceType.DELIVERY_NUMBER.value,
+            ref,
+            source=ReferenceSource.PERSON,
+            by=by,
+        )
         case.delivery_at_utc = local.astimezone(UTC)
         pos = " & ".join(str(p) for p in case.po_numbers) or f"load {case.load_id}"
         body = "\n".join(
@@ -1158,6 +1167,27 @@ def template_preview(
         typer.echo(f"Subject: {subject}")
     typer.echo("")
     typer.echo(text)
+
+
+@booking_app.command("find")
+def booking_find(
+    number: Annotated[
+        str,
+        typer.Argument(help="Any number: PO, load, pickup#, DCT ref, shipment, SO, portal id"),
+    ],
+) -> None:
+    """Find the cases a number belongs to, now or before (a replaced pickup number too)."""
+    from facility_profiles.booking.references import find_cases
+    from facility_profiles.booking.service import summary_line
+
+    settings = _settings()
+    with session_scope(_sessions(settings)) as session:
+        cases = find_cases(session, number)
+        if not cases:
+            typer.echo(f"no case carries {number}")
+            raise typer.Exit(code=1)
+        for case in cases:
+            typer.echo(summary_line(case))
 
 
 @booking_app.command("desks")

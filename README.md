@@ -138,6 +138,7 @@ facility-profiles booking approve 12 --by megan
 facility-profiles booking resolve 12 facility_question --by megan --note "answered by phone"
 facility-profiles booking booked 12 --by megan --via phone --date 2026-10-05 --time 09:00 --desk 812-794-1152
 facility-profiles booking desks             # how each vendor was booked before
+facility-profiles booking find PYE_061026919     # the case(s) any number belongs to
 facility-profiles booking timers            # no reply in 24 h / 48 h, pickup passed unbooked
 facility-profiles booking ref 12 shipment_number 7781234 --by megan   # a number the desk needs
 facility-profiles booking today --out exports/today.txt  # the daily summary (runs the timers)
@@ -346,6 +347,23 @@ the memory still shows what else worked ("Booked before" on the board, `booking 
 profile has an email desk, the vendor's other cases waiting for one take it and the agent can
 request them; the "No booking desk" to-do is resolved with where the desk came from. The same
 happens when a desk is filed with `profile set`, at once, and through the timers.
+
+### Reference numbers
+
+Every number on a pickup is kept in one place (`booking/references.py`, table
+`booking_references`): PO numbers and the delivery (DCT) reference from the load, a vendor
+pickup number from the load or the vendor's reply, a new delivery reference from the customer's
+desk, and what a person adds (the customer's shipment or SO number, a vendor confirmation number,
+a portal appointment id: `booking ref CASE KIND VALUE`, "Add reference" on the board, or a pickup
+number given with `booking booked`). Each row says its kind, where it came from (load, vendor,
+customer_desk, person), who, when, and the email it came from. A newer value of a kind replaces
+the older one, which stays as history; a case keeps several POs side by side. The case's own
+`pickup_number`, `delivery_ref` and `reference_numbers` follow the current values, so nothing
+that reads them changes. Stores from before are filled once from those columns when opened.
+
+Any number finds its case, a replaced pickup number too: `booking find NUMBER` (any kind, any
+letter case, or a load number), the board's search. `booking show` and the board list the
+current numbers with their source, then the earlier ones.
 
 ### Email templates
 

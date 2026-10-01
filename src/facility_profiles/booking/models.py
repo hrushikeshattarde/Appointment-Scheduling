@@ -108,6 +108,9 @@ class BookingCase(Base):
     exceptions: Mapped[list[CaseException]] = relationship(
         back_populates="case", cascade="all", order_by="CaseException.id"
     )
+    references: Mapped[list[BookingReference]] = relationship(
+        back_populates="case", cascade="all", order_by="BookingReference.id"
+    )
 
     @property
     def open_exceptions(self) -> list[CaseException]:
@@ -182,6 +185,34 @@ class CaseException(Base):
     resolution: Mapped[str | None] = mapped_column(String(255))
 
     case: Mapped[BookingCase] = relationship(back_populates="exceptions")
+
+
+class BookingReference(Base):
+    """One number on a pickup, where it came from and when; the one place they are kept.
+
+    ``kind`` is a ReferenceType value (pickup_number, delivery_number, po_number,
+    shipment_number, confirmation_number, portal_appointment_id ...). A newer value of the same
+    kind replaces the older one (``replaced_at``), which stays as history; a case can carry
+    several POs at once. The case's ``pickup_number``, ``delivery_ref`` and
+    ``reference_numbers`` columns mirror the current values.
+    """
+
+    __tablename__ = "booking_references"
+    __table_args__ = (Index("ix_booking_references_value", "value"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    case_id: Mapped[int] = mapped_column(ForeignKey("booking_cases.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(32))
+    value: Mapped[str] = mapped_column(String(128))
+    # load | vendor | customer_desk | person | migration
+    source: Mapped[str] = mapped_column(String(24))
+    actor: Mapped[str] = mapped_column(String(128), default="agent")
+    message_id: Mapped[int | None] = mapped_column(Integer)  # the email it came from
+    note: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    replaced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    case: Mapped[BookingCase] = relationship(back_populates="references")
 
 
 class BookingTemplate(Base):
