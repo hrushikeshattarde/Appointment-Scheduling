@@ -491,12 +491,15 @@ def test_customers_new_show_and_list(cli_env: Path) -> None:
     result = runner.invoke(app, ["customers", "show", "acme"])
     assert result.exit_code == 0 and "not set: [numbers] delivery_ref" in result.output
 
+    # `show` reads a PO date within two months of today, so the sample PO carries today's date.
+    today = date.today()
+    po = f"1158{today:%d%m%y}60"
     result = runner.invoke(
         app,
-        ["customers", "show", "lidl", "--sample", "10/6 730AM - PYE_061026919 PO 115802102660"],
+        ["customers", "show", "lidl", "--sample", f"10/6 730AM - PYE_061026919 PO {po}"],
     )
     assert result.exit_code == 0, result.output
-    assert "date in 115802102660" in result.output and "Fri 10/02/2026" in result.output
+    assert f"date in {po}" in result.output and f"{today:%a %m/%d/%Y}" in result.output
     assert "delivery slot" in result.output and "PYE_061026919" in result.output
     assert runner.invoke(app, ["customers", "show", "nobody"]).exit_code == 1
 
