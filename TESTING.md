@@ -25,6 +25,8 @@ Transport Pro.
 
 Every test passes and coverage stays above the 80% gate. The booking tests are in
 `tests/test_booking*.py`, `tests/test_desk_memory.py` and `tests/test_facility_rules.py`.
+`tests/test_customers.py` books an invented second customer next to Lidl from its own customer
+file: its own cc, sender, signature, desk and delivery references, and nothing of Lidl's.
 
 ## 2. The board with demo data (about 15 minutes)
 
@@ -107,7 +109,9 @@ Then, prefixed with `.\.venv\Scripts\facility-profiles.exe` as before:
 - `booking template preview 7`: the Morgan Foods request, identical to the one drafted on 9/29
   (the built-in template is the pod's wording word for word).
 - `booking find 20463798`: the Morgan Foods case.
-- `booking today`: the daily summary for the Lidl pod.
+- `booking today`: the daily summary for the Lidl pod (`--customer lidl` gives the same here).
+- `customers show lidl --sample "10/6 730AM - PYE_061026919"`: what the agent reads from Lidl's
+  customer file (no store needed); `customers list` shows every customer file.
 - The board on the copy, on a second port:
   `serve --db sqlite:///./data/lidl-test.db --port 8001`.
 

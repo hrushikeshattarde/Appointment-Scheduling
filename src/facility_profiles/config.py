@@ -62,6 +62,13 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./data/facility_profiles.db"
     export_dir: str = "./exports"
 
+    # --- Customers ------------------------------------------------------------------------
+    # The customer files this pod works on by default (keys such as "lidl"): a harvest, run or
+    # scan without --customer or --terminal covers their Transport Pro customers and terminals.
+    customers: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    # A folder of extra customer files (*.toml), for example outside the public repository.
+    customers_dir: str | None = None
+
     # --- Run controls -------------------------------------------------------------------
     mode: RunMode = RunMode.RECOMMEND
     pilot_terminal_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
@@ -92,16 +99,15 @@ class Settings(BaseSettings):
     booking_days_ahead: int = Field(7, gt=0)
     booking_default_pickup_time: str = "09:00"
     booking_transit_miles_per_day: int = Field(550, gt=0)
-    booking_sender: str = "lidl@circledelivers.com"
-    booking_cc: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: ["lidl@circledelivers.com"]
-    )
-    booking_signature: str = (
-        "Circle Logistics, Inc. | Fort Wayne | 260-208-4500 | lidl@circledelivers.com"
-    )
+    # Sender, cc, signature and customer desk for a customer that has no customer file. A
+    # customer file (src/facility_profiles/customers/*.toml) sets its own; these never reach
+    # the customers that have one.
+    booking_sender: str | None = None
+    booking_cc: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    booking_signature: str = "Circle Logistics, Inc. | Fort Wayne | 260-208-4500"
     booking_drafts_dir: str = "./exports/drafts"
     booking_carrier_name: str = "Circle Logistics, Inc."
-    booking_customer_desk: str | None = "inbound@lidl.us"
+    booking_customer_desk: str | None = None
     booking_max_rounds: int = Field(3, gt=0)
     booking_follow_up_hours: int = Field(24, gt=0)
     booking_min_notice_hours: int = Field(4, ge=0)
@@ -111,12 +117,13 @@ class Settings(BaseSettings):
     booking_shared_desks: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["cci@udfinc.com"]
     )
-    # Desks that read the date inside a Lidl PO as the earliest pickup date ("this is showing a
-    # pickup date of 10/2, we cannot schedule early pickups"): never ask them for an earlier day.
+    # Vendor desks that read the date inside the customer's PO as the earliest pickup date ("this
+    # is showing a pickup date of 10/2, we cannot schedule early pickups"): never ask them for an
+    # earlier day. Only customers whose file says how a PO carries a date ([numbers] po_date).
     booking_po_date_floor_desks: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["shipping.appointments@morganfoods.com"]
     )
-    # The pod's own time zone: what "today" means in the daily summary (Fort Wayne for Lidl).
+    # The pod's own time zone: what "today" means in the daily summary (Fort Wayne).
     booking_timezone: str = "America/Indiana/Indianapolis"
 
     # --- Group-mail archive in S3 (Pick Up Appointment threads) ---------------------------
@@ -146,6 +153,7 @@ class Settings(BaseSettings):
         raise TypeError(msg)
 
     @field_validator(
+        "customers",
         "internal_email_domains",
         "internal_phone_numbers",
         "booking_cc",

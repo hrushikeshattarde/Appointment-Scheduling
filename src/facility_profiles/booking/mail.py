@@ -141,6 +141,9 @@ class OutboundDraft:
     thread_id: str | None = None
     in_reply_to: str | None = None  # the RFC Message-ID this answers
     references: str | None = None  # the References chain of the message this answers
+    # Drafts only: the customer's group the draft is from. A send is always from the sending
+    # mailbox (a group cannot send through the API).
+    from_addr: str | None = None
 
 
 @dataclass(frozen=True)
@@ -188,7 +191,8 @@ def build_mime(
 ) -> EmailMessage:
     """The message as it will travel: headers, threading ids and the plain-text body."""
     msg = EmailMessage()
-    msg["From"] = sender
+    if sender:
+        msg["From"] = sender
     msg["To"] = draft.to_addr
     if draft.cc_addr:
         msg["Cc"] = draft.cc_addr
@@ -215,14 +219,16 @@ class LocalDraftMailer:
     """Write each draft as an ``.eml`` file under ``directory`` (draft mode)."""
 
     directory: Path
-    sender: str = "lidl@circledelivers.com"
+    sender: str = ""  # From when the draft names none; blank lets the mail client fill it in
     created: list[Path] = field(default_factory=list)
 
     def create_draft(self, draft: OutboundDraft) -> str:
         """Write the draft and return its path."""
         self.directory.mkdir(parents=True, exist_ok=True)
         msg = build_mime(
-            draft, self.sender, extra_headers={"X-Facility-Profiles-Draft": "draft mode; not sent"}
+            draft,
+            draft.from_addr or self.sender,
+            extra_headers={"X-Facility-Profiles-Draft": "draft mode; not sent"},
         )
         stamp = datetime.now(tz=UTC).strftime("%Y%m%d-%H%M%S")
         safe = re.sub(r"[^A-Za-z0-9]+", "-", draft.subject)[:60].strip("-")
@@ -295,7 +301,8 @@ class GmailDraftMailer:
 
     def create_draft(self, draft: OutboundDraft) -> str:  # pragma: no cover - live API
         """POST users/me/drafts; returns the draft ID."""
-        payload: dict[str, Any] = {"message": {"raw": _raw(build_mime(draft, self.sender))}}
+        raw = _raw(build_mime(draft, draft.from_addr or self.sender))
+        payload: dict[str, Any] = {"message": {"raw": raw}}
         if draft.thread_id:
             payload["message"]["threadId"] = draft.thread_id
         session = _gmail_session(self.key_path, self.subject_user, SCOPE_COMPOSE)

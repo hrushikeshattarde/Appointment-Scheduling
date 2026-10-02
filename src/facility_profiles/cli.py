@@ -3,7 +3,8 @@
 facility-profiles init-db
 facility-profiles check-tpro
 facility-profiles harvest --terminal 1160 --days 90
-facility-profiles harvest --terminal 1089 --customer 6680 --customer 7211 --days 90
+facility-profiles harvest --customer lidl --days 90     (or --customer 7211 --terminal 1089)
+facility-profiles customers list | show lidl | new acme --name Acme --tpro-customer 1234
 facility-profiles run --no-harvest --cap 50
 facility-profiles lookup 196508
 facility-profiles review list | accept 12 --by name | edit 12 --value ... | reject 12
@@ -57,8 +58,22 @@ mail_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(mail_app, name="mail-archive")
+customers_app = typer.Typer(
+    help="Customer files: whose loads, which mailbox, their own desk, their numbers.",
+    no_args_is_help=True,
+)
+app.add_typer(customers_app, name="customers")
 
 log = get_logger(__name__)
+
+CustomerScope = Annotated[
+    list[str] | None,
+    typer.Option(
+        "--customer",
+        help="A customer file's key (lidl) or a Transport Pro customer ID; repeatable. "
+        "Default: FP_CUSTOMERS, else FP_PILOT_CUSTOMER_IDS",
+    ),
+]
 
 
 def _settings() -> Settings:
@@ -72,6 +87,22 @@ def _sessions(settings: Settings):  # type: ignore[no-untyped-def]  # sessionmak
     init_db(engine)
     atexit.register(engine.dispose)
     return session_factory(engine)
+
+
+def _scope(
+    settings: Settings,
+    customer: list[str] | None,
+    terminal: list[int] | None,
+    *,
+    booking: bool = False,
+) -> tuple[list[int], list[int]]:
+    """Terminals and Transport Pro customer ids from --customer/--terminal and the settings."""
+    from facility_profiles.customers import CustomerFileError, scope
+
+    try:
+        return scope(settings, customer, terminal, booking=booking)
+    except CustomerFileError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
 
 def _client(settings: Settings, *, allow_writes: bool = False):  # type: ignore[no-untyped-def]
@@ -170,21 +201,21 @@ def harvest(
     terminal: Annotated[
         list[int] | None, typer.Option(help="Terminal ID(s); default from settings")
     ] = None,
-    customer: Annotated[
-        list[int] | None,
-        typer.Option(help="Customer ID(s) to restrict the loads to; default from settings"),
-    ] = None,
+    customer: CustomerScope = None,
     days: Annotated[int | None, typer.Option(help="Look-back window in days")] = None,
 ) -> None:
     """Pull loads and store facilities, links and stop notes (FR-1, FR-2)."""
     settings = _settings()
+    terminal, customer_ids = _scope(settings, customer, terminal)
     end = datetime.now(tz=UTC).date()
     start = end - timedelta(days=days or settings.lookback_days)
     with _client(settings) as client:
         pipeline = Pipeline(
             settings, _sessions(settings), client=client, extractor=_extractor(settings, fake=True)
         )
-        stats = pipeline.harvest(terminal_ids=terminal, customer_ids=customer, start=start, end=end)
+        stats = pipeline.harvest(
+            terminal_ids=terminal, customer_ids=customer_ids, start=start, end=end
+        )
     typer.echo(json.dumps(stats, indent=2))
 
 
@@ -198,9 +229,7 @@ def run(
     ] = False,
     cap: Annotated[int | None, typer.Option(help="Max facilities this run")] = None,
     terminal: Annotated[list[int] | None, typer.Option(help="Terminal ID(s)")] = None,
-    customer: Annotated[
-        list[int] | None, typer.Option(help="Customer ID(s) to restrict the harvest to")
-    ] = None,
+    customer: CustomerScope = None,
     fake_llm: Annotated[bool, typer.Option(help="Use the fake extractor (no model calls)")] = False,
     offline: Annotated[
         bool, typer.Option(help="No Transport Pro calls; use stored sources only")
@@ -216,6 +245,7 @@ def run(
 ) -> None:
     """Run the pipeline: collect, extract, score and apply every facility."""
     settings = _settings()
+    terminal, customer_ids = _scope(settings, customer, terminal)
     if budget is not None:
         settings = settings.model_copy(update={"llm_budget_usd": budget})
     client = None if offline else _client(settings)
@@ -233,7 +263,7 @@ def run(
             refresh_only=refresh,
             facility_cap=cap,
             terminal_ids=terminal,
-            customer_ids=customer,
+            customer_ids=customer_ids,
             run_id=resume,
         )
     finally:
@@ -468,20 +498,21 @@ def _booking_case(session, case_id: int):  # type: ignore[no-untyped-def]
 @booking_app.command("scan")
 def booking_scan(
     terminal: Annotated[list[int] | None, typer.Option(help="Terminal ID(s)")] = None,
-    customer: Annotated[list[int] | None, typer.Option(help="Customer ID(s)")] = None,
+    customer: CustomerScope = None,
     days_ahead: Annotated[int | None, typer.Option(help="Pickup window in days")] = None,
 ) -> None:
     """Open a booking case for every pickup stop that still needs an appointment."""
     from facility_profiles.booking.service import scan
 
     settings = _settings()
+    terminal, customer_ids = _scope(settings, customer, terminal, booking=True)
     with _client(settings) as client:
         stats = scan(
             client,
             _sessions(settings),
             settings,
             terminal_ids=terminal,
-            customer_ids=customer,
+            customer_ids=customer_ids,
             days_ahead=days_ahead,
         )
     typer.echo(json.dumps(stats.__dict__, indent=2))
@@ -542,7 +573,9 @@ def booking_draft(
     from facility_profiles.booking.service import draft_batch, draft_case, prepare_drafts
 
     settings = _settings()
-    mailer = LocalDraftMailer(Path(settings.booking_drafts_dir), sender=settings.booking_sender)
+    mailer = LocalDraftMailer(
+        Path(settings.booking_drafts_dir), sender=settings.booking_sender or ""
+    )
     now = datetime.now(tz=UTC)
     with session_scope(_sessions(settings)) as session:
         if case_id is not None:
@@ -609,28 +642,42 @@ def booking_send(
 @booking_app.command("delivery-updated")
 def booking_delivery_updated(
     case_id: int,
-    ref: Annotated[str, typer.Option(help="New DCT reference, e.g. FRG_200526615")],
+    ref: Annotated[
+        str, typer.Option(help="New delivery reference, e.g. Lidl's DCT ref FRG_200526615")
+    ],
     date: Annotated[str, typer.Option(help="New delivery date, YYYY-MM-DD")],
     time: Annotated[str, typer.Option(help="New delivery time, HH:MM local")],
-    by: Annotated[str, typer.Option(help="Who rebooked it in DCT")],
+    by: Annotated[str, typer.Option(help="Who rebooked the delivery")],
     note: Annotated[str | None, typer.Option(help="Why, e.g. We missed the pickup today")] = None,
     tag: Annotated[str, typer.Option(help="Subject tag")] = "MISSED PICK UP",
 ) -> None:
-    """A person rebooked the Lidl delivery in DCT: record it and draft the note to Lidl's desk."""
+    """A person rebooked the customer's delivery: record it and draft the note to their desk.
+
+    The desk and the booking system's name come from the case's customer file (Lidl: inbound@
+    and DCT).
+    """
     from zoneinfo import ZoneInfo
 
     from facility_profiles.booking.mail import LocalDraftMailer, OutboundDraft
     from facility_profiles.booking.models import BookingEvent, BookingMessage
     from facility_profiles.booking.references import ReferenceSource, record_reference
+    from facility_profiles.customers import customer_of
     from facility_profiles.domain.schema import ReferenceType
 
     settings = _settings()
-    if not settings.booking_customer_desk:
-        typer.echo("FP_BOOKING_CUSTOMER_DESK is not set")
-        raise typer.Exit(code=2)
-    mailer = LocalDraftMailer(Path(settings.booking_drafts_dir), sender=settings.booking_sender)
+    mailer = LocalDraftMailer(
+        Path(settings.booking_drafts_dir), sender=settings.booking_sender or ""
+    )
     with session_scope(_sessions(settings)) as session:
         case = _booking_case(session, case_id)
+        customer = customer_of(case, settings)
+        if not customer.customer_desk:
+            typer.echo(
+                f"no customer desk for {customer.label(case.customer_name)}: set "
+                f"[customer_desk] email in {customer.source}"
+            )
+            raise typer.Exit(code=2)
+        where = f" in {customer.delivery_system}" if customer.delivery_system else ""
         local = datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M").replace(
             tzinfo=ZoneInfo(case.vendor_timezone or "America/New_York")
         )
@@ -650,22 +697,24 @@ def booking_delivery_updated(
                 "Hello,",
                 "",
                 f"{(note or 'We missed the pickup for this today.').strip()} "
-                f"I rescheduled the load in DCT for delivery on {local:%m/%d}. "
+                f"I rescheduled the load{where} for delivery on {local:%m/%d}. "
                 "Can you please delete my original appointment?",
                 "",
                 f"New Appointment: {ref.upper()} {local:%m/%d} @ {local:%H%M}",
                 "",
                 "Thank you!",
                 "",
-                settings.booking_signature,
+                customer.signature or settings.booking_signature,
             ]
         )
         draft = OutboundDraft(
-            to_addr=settings.booking_customer_desk,
-            cc_addr=", ".join(settings.booking_cc),
+            to_addr=customer.customer_desk,
+            cc_addr=customer.cc_header,
             subject=f"{pos} {tag}",
             body=body,
+            from_addr=customer.sender,
         )
+        label = customer.label(case.customer_name)
         draft_ref = mailer.create_draft(draft)
         case.messages.append(
             BookingMessage(
@@ -692,7 +741,8 @@ def booking_delivery_updated(
             )
         )
     typer.echo(
-        f"#{case_id} delivery now {ref.upper()} {date} {time}; note to Lidl drafted [{draft_ref}]"
+        f"#{case_id} delivery now {ref.upper()} {date} {time}; note to {label} drafted "
+        f"[{draft_ref}]"
     )
 
 
@@ -711,7 +761,9 @@ def booking_reschedule(
     from facility_profiles.booking.service import reschedule_case
 
     settings = _settings()
-    mailer = LocalDraftMailer(Path(settings.booking_drafts_dir), sender=settings.booking_sender)
+    mailer = LocalDraftMailer(
+        Path(settings.booking_drafts_dir), sender=settings.booking_sender or ""
+    )
     requested = f"{date} {time}" if time else date
     with session_scope(_sessions(settings)) as session:
         case = _booking_case(session, case_id)
@@ -795,10 +847,18 @@ def booking_inbox(
         s3_bucket, _, s3_prefix = s3.removeprefix("s3://").strip("/").partition("/")
         messages = S3MailReader(Store(s3_bucket, s3_prefix)).fetch(days=days)
     elif key is not None and subject:
-        group = settings.booking_sender
-        messages = GmailReader(key, subject).fetch(
-            f"(to:{group} OR cc:{group} OR deliveredto:{group}) newer_than:{days}d"
+        from facility_profiles.customers import customers
+
+        known = customers(settings)
+        chosen = [known.get(k) for k in settings.customers] or list(known.files)
+        groups = [g for g in dict.fromkeys(c.group for c in chosen) if g] or (
+            [settings.booking_sender] if settings.booking_sender else []
         )
+        if not groups:
+            typer.echo("no group to read: set [mail] group in a customer file")
+            raise typer.Exit(code=2)
+        where = " OR ".join(f"to:{g} OR cc:{g} OR deliveredto:{g}" for g in groups)
+        messages = GmailReader(key, subject).fetch(f"({where}) newer_than:{days}d")
     else:
         typer.echo("give --file messages.jsonl, --s3 s3://bucket, or --key and --subject for Gmail")
         raise typer.Exit(code=2)
@@ -829,7 +889,9 @@ def booking_inbox(
             )
         responder = Responder(
             settings,
-            LocalDraftMailer(Path(settings.booking_drafts_dir), sender=settings.booking_sender),
+            LocalDraftMailer(
+                Path(settings.booking_drafts_dir), sender=settings.booking_sender or ""
+            ),
             composer=composer,
         )
     with session_scope(_sessions(settings)) as session:
@@ -839,7 +901,7 @@ def booking_inbox(
             classifier,
             internal_domains=settings.internal_email_domains,
             responder=responder,
-            customer_desk=settings.booking_customer_desk,
+            settings=settings,
         )
     typer.echo(json.dumps(stats.__dict__, indent=2))
 
@@ -854,7 +916,7 @@ def booking_follow_up() -> None:
     settings = _settings()
     responder = Responder(
         settings,
-        LocalDraftMailer(Path(settings.booking_drafts_dir), sender=settings.booking_sender),
+        LocalDraftMailer(Path(settings.booking_drafts_dir), sender=settings.booking_sender or ""),
     )
     count = 0
     with session_scope(_sessions(settings)) as session:
@@ -1004,7 +1066,10 @@ def booking_ref(
 
 DeskOption = Annotated[str | None, typer.Option(help="For this booking desk's address only")]
 CustomerOption = Annotated[
-    str | None, typer.Option(help="For this customer only, e.g. 'Lidl - Inbound'")
+    str | None,
+    typer.Option(
+        help="For this customer only: its key (lidl), or a Transport Pro name ('Lidl - Inbound')"
+    ),
 ]
 
 
@@ -1141,6 +1206,7 @@ def template_preview(
         request_values,
         reschedule_values,
     )
+    from facility_profiles.customers import customer_of
 
     which = _template_kind(kind)
     if which == TemplateKind.BATCH_REQUEST:
@@ -1151,7 +1217,8 @@ def template_preview(
         profile = (
             vendor_profile(Repository(session), case.facility_key) if case.facility_key else None
         )
-        template = pick(session, which, desk=case.contact_email, customer=case.customer_name)
+        names = customer_of(case, settings).template_matches(case.customer_name)
+        template = pick(session, which, desk=case.contact_email, customer=names)
         if which == TemplateKind.REQUEST:
             values = request_values([case], settings, profile)
         elif which == TemplateKind.RESCHEDULE:
@@ -1242,7 +1309,8 @@ def booking_timers() -> None:
 @booking_app.command("today")
 def booking_today(
     customer: Annotated[
-        str | None, typer.Option(help="Only this customer, e.g. 'Lidl - Inbound'")
+        str | None,
+        typer.Option(help="Only this customer: its key (lidl) or a Transport Pro customer name"),
     ] = None,
     out: Annotated[Path | None, typer.Option(help="Also write the summary to this file")] = None,
     timers: Annotated[
@@ -1253,15 +1321,23 @@ def booking_today(
     from facility_profiles.booking.service import list_cases
     from facility_profiles.booking.timers import sweep
     from facility_profiles.booking.today import render_today, today_summary
+    from facility_profiles.customers import customers
 
     settings = _settings()
     now = datetime.now(tz=UTC)
+    known = customers(settings)
+    wanted = (customer or "").strip().lower()
+    key = wanted if wanted in {c.key for c in known.files} else None
+    timezone = (known.get(key).timezone if key else None) or settings.booking_timezone
     with session_scope(_sessions(settings)) as session:
         if timers:
             sweep(session, now=now, settings=settings)
-        data = today_summary(
-            list_cases(session), now=now, timezone=settings.booking_timezone, customer=customer
-        )
+        cases = list_cases(session)
+        if key:
+            cases = [c for c in cases if known.for_case(c).key == key]
+        data = today_summary(cases, now=now, timezone=timezone, customer=None if key else customer)
+    if key:
+        data["customer"] = known.get(key).name
     text = render_today(data)
     if out is not None:
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -1280,7 +1356,13 @@ def mail_archive_collect(
         str | None, typer.Option(help="Archive bucket (FP_MAIL_ARCHIVE_BUCKET)")
     ] = None,
     prefix: Annotated[str | None, typer.Option(help="Key prefix (FP_MAIL_ARCHIVE_PREFIX)")] = None,
-    group: Annotated[str, typer.Option(help="The group address")] = "lidl@circledelivers.com",
+    customer: Annotated[
+        str | None,
+        typer.Option(help="Whose group and rules (a customer file's key); default: the only one"),
+    ] = None,
+    group: Annotated[
+        str | None, typer.Option(help="The group address; default: the customer file's")
+    ] = None,
     days: Annotated[int, typer.Option(help="How many days back to list")] = 3,
     max_messages: Annotated[int, typer.Option("--max", help="Per-pass cap")] = 300,
     desk: Annotated[
@@ -1289,12 +1371,20 @@ def mail_archive_collect(
     verbose: Annotated[bool, typer.Option(help="Print every stored message")] = False,
 ) -> None:
     """One collection pass from this machine: the same code the Lambda runs every 15 minutes."""
+    from facility_profiles.customers import CustomerFileError, customers
     from facility_profiles.mailarchive import filters
     from facility_profiles.mailarchive.collector import run
     from facility_profiles.mailarchive.gmail import Delegated, load_service_account
     from facility_profiles.mailarchive.store import Store
 
     settings = _settings()
+    try:
+        chosen = customers(settings).only_or(
+            customer or (settings.customers[0] if len(settings.customers) == 1 else None)
+        )
+    except CustomerFileError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    rules = filters.rules_for(chosen).with_desks(desk or [])
     bucket = bucket or settings.mail_archive_bucket
     subject = subject or settings.mail_archive_gmail_user
     if not bucket or not subject:
@@ -1313,9 +1403,9 @@ def mail_archive_collect(
         gmail,
         store,
         mailbox=subject,
+        rules=rules,
         group=group,
         days=days,
-        desks=filters.DEFAULT_DESKS | {d.strip().lower() for d in desk or [] if d.strip()},
         max_messages=max_messages,
         verbose=verbose,
     )
@@ -1498,6 +1588,184 @@ def digest(
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(text, encoding="utf-8")
     typer.echo(text)
+
+
+# ------------------------------------------------------------------ customers
+
+
+@customers_app.command("list")
+def customers_list() -> None:
+    """Every customer file: key, name, Transport Pro customers, pods, mailbox and desk."""
+    from facility_profiles.customers import CustomerFileError, customers
+
+    settings = _settings()
+    try:
+        known = customers(settings)
+    except CustomerFileError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+    for c in known.files:
+        default = " (default)" if c.key in settings.customers else ""
+        ids = ", ".join(str(i) for i in c.tpro_customer_ids) or "-"
+        pods = ", ".join(str(t) for t in c.terminal_ids) or "-"
+        typer.echo(
+            f"{c.key:<12} {c.name}{default}: customers {ids}; pods {pods}; "
+            f"group {c.group or '-'}; desk {c.customer_desk or '-'}"
+        )
+        typer.echo(f"{'':<12} {c.source}")
+    fb = known.fallback
+    typer.echo(
+        f"{'(no file)':<12} any other customer: group {fb.group or '-'}; "
+        f"desk {fb.customer_desk or '-'} (FP_BOOKING_* settings)"
+    )
+
+
+@customers_app.command("show")
+def customers_show(
+    key: Annotated[str, typer.Argument(help="The customer file's key, e.g. lidl")],
+    sample: Annotated[
+        list[str] | None,
+        typer.Option(
+            help="Text to try the customer's number patterns on, e.g. a desk's email line "
+            "(repeatable)"
+        ),
+    ] = None,
+) -> None:
+    """Check one customer file and show what the agent will do with it."""
+    from facility_profiles.customers import CustomerFileError, customers
+    from facility_profiles.mailarchive import filters
+
+    settings = _settings()
+    try:
+        c = customers(settings).get(key)
+    except CustomerFileError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+    rules = filters.rules_for(c)
+
+    def line(label: str, value: object) -> None:
+        typer.echo(f"  {label:<18} {value if value not in (None, '', ()) else '-'}")
+
+    typer.echo(f"{c.key}: {c.name}  ({c.source})")
+    if c.description:
+        typer.echo(f"  {c.description}")
+    line("TPro customers", ", ".join(str(i) for i in c.tpro_customer_ids))
+    line("books pickups for", ", ".join(str(i) for i in c.booking_customer_ids))
+    line("TPro names", ", ".join(c.tpro_customer_names))
+    line("pods (terminals)", ", ".join(str(t) for t in c.terminal_ids))
+    line("time zone", c.timezone or f"{settings.booking_timezone} (FP_BOOKING_TIMEZONE)")
+    line("group", c.group)
+    line("drafts from", c.sender)
+    line("cc", c.cc_header)
+    line("signature", c.signature or f"{settings.booking_signature} (FP_BOOKING_SIGNATURE)")
+    line("customer desk", c.customer_desk)
+    line("delivery booked in", c.delivery_system)
+    line("PO pattern", c.po.pattern if c.po else None)
+    line("PO date pattern", c.po_date.pattern if c.po_date else None)
+    line("delivery ref", c.delivery_ref.pattern if c.delivery_ref else None)
+    line("archive subjects", ", ".join(name for name, _ in rules.keep))
+    line(
+        "archive desks",
+        f"{len(rules.desks)} address(es), domains {', '.join(sorted(rules.desk_domains))}",
+    )
+    gaps = [
+        what
+        for what, missing in (
+            ("[mail] group: drafts carry no From and copy no one", not c.group),
+            ("[customer_desk] email: 'vendor cannot ship' goes to a person", not c.customer_desk),
+            ("[numbers] delivery_ref: no delivery reference is read", not c.delivery_ref),
+            (
+                "[transport_pro] customer_ids: `--customer` cannot scope a scan",
+                not c.tpro_customer_ids,
+            ),
+        )
+        if missing
+    ]
+    for gap in gaps:
+        typer.echo(f"  not set: {gap}")
+    for text in sample or []:
+        typer.echo(f"sample: {text!r}")
+        found = filters.identifiers(text, rules=rules)
+        line("PO numbers", ", ".join(found["po_numbers"]))
+        for po in found["po_numbers"]:
+            embedded = c.po_embedded_date(po, near=date.today())
+            if embedded:
+                line(f"  date in {po}", f"{embedded:%a %m/%d/%Y}")
+        line("delivery refs", ", ".join(found["delivery_refs"]))
+        line("pickup numbers", ", ".join(found["pickup_numbers"]))
+        slot = next((m for p in c.slot_patterns() if (m := p.search(text))), None)
+        if slot:
+            when = (
+                f"{slot.group('m')}/{slot.group('d')} {slot.group('h')}"
+                f"{slot.group('min') or ''}{slot.group('ampm') or ''}"
+            )
+            line("delivery slot", f"{when} -> {slot.group('ref').upper()}")
+        subject = filters.match_reason(text, set(), rules)
+        line("as a subject", subject or "not kept")
+
+
+@customers_app.command("new")
+def customers_new(
+    key: Annotated[str, typer.Argument(help="Short key, lower-case: acme, costco-west")],
+    name: Annotated[str, typer.Option(help="How emails name the customer, e.g. Acme")],
+    tpro_customer: Annotated[
+        list[int] | None, typer.Option(help="Transport Pro customer ID (repeatable)")
+    ] = None,
+    tpro_name: Annotated[
+        list[str] | None, typer.Option(help="Transport Pro customer name (repeatable)")
+    ] = None,
+    terminal: Annotated[list[int] | None, typer.Option(help="Pod terminal ID (repeatable)")] = None,
+    group: Annotated[str | None, typer.Option(help="The group the threads run through")] = None,
+    desk: Annotated[str | None, typer.Option(help="The customer's own inbound desk")] = None,
+    folder: Annotated[
+        Path | None,
+        typer.Option(help="Where to write it; default FP_CUSTOMERS_DIR, else the built-in folder"),
+    ] = None,
+) -> None:
+    """Write a starter customer file with what you know, then check it."""
+    from facility_profiles.customers import (
+        BUILT_IN_DIR,
+        CustomerFileError,
+        load_customer,
+        reload,
+    )
+    from facility_profiles.customers.starter import starter_text
+
+    settings = _settings()
+    key = key.strip().lower()
+    target_dir = folder or (
+        Path(settings.customers_dir) if settings.customers_dir else BUILT_IN_DIR
+    )
+    path = target_dir / f"{key}.toml"
+    if path.exists():
+        typer.echo(f"{path} already exists; edit it, or pick another key")
+        raise typer.Exit(code=1)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        starter_text(
+            key,
+            name=name,
+            customer_ids=tpro_customer or [],
+            customer_names=tpro_name or [],
+            terminal_ids=terminal or [],
+            group=group,
+            desk=desk,
+        ),
+        encoding="utf-8",
+        newline="\n",
+    )
+    reload()
+    typer.echo(f"wrote {path}")
+    if target_dir == BUILT_IN_DIR:
+        typer.echo("  it is in the package folder, which the public repository carries")
+    elif folder is not None and settings.customers_dir != str(folder):
+        typer.echo(f"  set FP_CUSTOMERS_DIR={folder} so the agent reads it")
+    try:
+        load_customer(path)
+    except CustomerFileError as exc:
+        typer.echo(f"still to fill in:\n{exc}")
+        return
+    typer.echo(f"it reads cleanly; next: facility-profiles customers show {key}")
 
 
 if __name__ == "__main__":  # pragma: no cover

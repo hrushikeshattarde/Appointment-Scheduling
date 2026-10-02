@@ -12,16 +12,17 @@ from facility_profiles.booking.service import (
     draft_case,
     list_cases,
     parse_delivery_slot,
-    po_embedded_date,
     scan,
 )
 from facility_profiles.booking.worklist import open_kinds
+from facility_profiles.customers import built_in_customers
 from facility_profiles.storage.db import session_scope
 from tests.conftest import FakeTPro
 from tests.test_booking import NOW, lidl_load, seed_vendor
 from tests.test_booking_real_thread import morgan_load, seed_morgan
 
 EARLY = datetime(2026, 9, 23, 12, 0, tzinfo=UTC)
+LIDL = built_in_customers().get("lidl")
 
 
 @pytest.mark.parametrize(
@@ -49,16 +50,17 @@ EARLY = datetime(2026, 9, 23, 12, 0, tzinfo=UTC)
     ],
 )
 def test_delivery_slot_wordings_from_the_inbound_desk(text: str, expected) -> None:  # type: ignore[no-untyped-def]
-    assert parse_delivery_slot(text, year=2026, timezone="America/New_York") == expected
+    got = parse_delivery_slot(text, year=2026, timezone="America/New_York", customer=LIDL)
+    assert got == expected
 
 
 def test_po_embedded_date_reads_lidl_pos_and_nothing_else() -> None:
     near = date(2026, 10, 2)
-    assert po_embedded_date("115802102660", near=near) == date(2026, 10, 2)
-    assert po_embedded_date("118830092663", near=near) == date(2026, 9, 30)
-    assert po_embedded_date("20463798", near=near) is None  # a pickup number, eight digits
-    assert po_embedded_date("115899092660", near=near) is None  # day 99
-    assert po_embedded_date("115802103060", near=near) is None  # 2030: too far from near
+    assert LIDL.po_embedded_date("115802102660", near=near) == date(2026, 10, 2)
+    assert LIDL.po_embedded_date("118830092663", near=near) == date(2026, 9, 30)
+    assert LIDL.po_embedded_date("20463798", near=near) is None  # a pickup number, eight digits
+    assert LIDL.po_embedded_date("115899092660", near=near) is None  # day 99
+    assert LIDL.po_embedded_date("115802103060", near=near) is None  # 2030: too far from near
 
 
 def test_morgan_foods_request_is_never_earlier_than_the_po_date(settings, sessions):

@@ -97,6 +97,7 @@ from facility_profiles.booking.worklist import (
     resolve_all,
 )
 from facility_profiles.config import Settings
+from facility_profiles.customers import Customer, built_in_customers, customer_of, customers
 from facility_profiles.domain.resolution import FacilityResolver
 from facility_profiles.domain.schema import ReferenceType
 from facility_profiles.logging import get_logger
@@ -109,25 +110,7 @@ from facility_profiles.tpro.models import Load, Waypoint
 
 log = get_logger(__name__)
 
-DELIVERY_REF_RE = re.compile(r"\b[A-Z]{3}_\d{6,}\b")
 PO_RE = re.compile(r"\b\d{9,15}\b")
-# Lidl's inbound desk writes a delivery slot as "8/20 7AM - GRM_200826926", as "10/6 730AM -
-# PYE_061026919", or on two lines ("9/30 at 1100" then "PYE_300926723"); the pod writes its own
-# DCT bookings as "FRG_200526615 05/20 @ 1100". All forms are read.
-DELIVERY_SLOT_RE = re.compile(
-    r"(?P<m>\d{1,2})/(?P<d>\d{1,2})(?:/(?P<y>\d{2,4}))?\s*(?:@|at)?\s*(?P<h>\d{1,2})(?::?(?P<min>\d{2}))?"
-    r"\s*(?P<ampm>AM|PM)?[\s,;:\-\u2013\u2014]*(?P<ref>[A-Z]{3}_\d{6,})",
-    re.I,
-)
-# Lidl PO numbers are twelve digits with the delivery date as DDMMYY in digits five to ten
-# ("115802102660" is 2 October 2026). Morgan Foods reads that date as the earliest pickup.
-LIDL_PO_RE = re.compile(r"^\d{12}$")
-PO_DATE_WINDOW_DAYS = 60
-DELIVERY_SLOT_REF_FIRST_RE = re.compile(
-    r"(?P<ref>[A-Z]{3}_\d{6,})\s+(?P<m>\d{1,2})/(?P<d>\d{1,2})(?:/(?P<y>\d{2,4}))?\s*(?:@|at)?\s*"
-    r"(?P<h>\d{1,2})(?::?(?P<min>\d{2}))?\s*(?P<ampm>AM|PM)?",
-    re.I,
-)
 OPEN_STATUSES = (
     CaseStatus.UNSCHEDULED.value,
     CaseStatus.PENDING.value,
@@ -231,26 +214,21 @@ def requested_local(
     return f"{day:%Y-%m-%d} {settings.booking_default_pickup_time}"
 
 
-def po_embedded_date(po: str, *, near: date) -> date | None:
-    """The DDMMYY date inside a Lidl PO, when it is a real date within two months of ``near``."""
-    if not LIDL_PO_RE.match(po):
-        return None
-    try:
-        found = date(2000 + int(po[8:10]), int(po[6:8]), int(po[4:6]))
-    except ValueError:
-        return None
-    return found if abs((found - near).days) <= PO_DATE_WINDOW_DAYS else None
-
-
 def pickup_floor(case: BookingCase, settings: Settings) -> date | None:
-    """The earliest day the desk will load, for desks that read the PO date as the pickup date."""
+    """The earliest day the desk will load, for desks that read the PO date as the pickup date.
+
+    Only for a customer whose PO numbers carry a date (its file's ``[numbers] po_date``).
+    """
     desk = (case.contact_email or "").lower()
     if desk not in {d.lower() for d in settings.booking_po_date_floor_desks}:
         return None
+    customer = customer_of(case, settings)
     tz = ZoneInfo(case.vendor_timezone or "America/New_York")
     anchor = as_utc(case.delivery_at_utc) or as_utc(case.tendered_pickup_utc)
     near = (anchor or datetime.now(tz=UTC)).astimezone(tz).date()
-    found = [d for d in (po_embedded_date(str(p), near=near) for p in case.po_numbers) if d]
+    found = [
+        d for d in (customer.po_embedded_date(str(p), near=near) for p in case.po_numbers) if d
+    ]
     return max(found) if found else None
 
 
@@ -289,10 +267,16 @@ def floor_requested(
 
 
 def parse_delivery_slot(
-    text: str, *, year: int, timezone: str | None
+    text: str, *, year: int, timezone: str | None, customer: Customer
 ) -> tuple[datetime, str] | None:
-    """Read a Lidl delivery slot and DCT reference out of a message; returns (UTC start, ref)."""
-    match = DELIVERY_SLOT_RE.search(text) or DELIVERY_SLOT_REF_FIRST_RE.search(text)
+    """Read a delivery slot and the customer's delivery reference out of a message.
+
+    Returns (UTC start, reference). Lidl's inbound desk writes "8/20 7AM - GRM_200826926",
+    "10/6 730AM - PYE_061026919" or "9/30 at 1100" with the reference on the next line; the pod
+    writes its own bookings reference first, "FRG_200526615 05/20 @ 1100". A customer without a
+    delivery reference format has no slot to read.
+    """
+    match = next((m for p in customer.slot_patterns() if (m := p.search(text))), None)
     if match is None:
         return None
     hour = int(match.group("h"))
@@ -348,6 +332,11 @@ def outside_request(
     return f"{said} ({hours:g} h {'later' if gap > timedelta(0) else 'earlier'})"
 
 
+def _names(case: BookingCase, settings: Settings) -> list[str]:
+    """What a customer-scoped template may be saved under for this case."""
+    return customer_of(case, settings).template_matches(case.customer_name)
+
+
 def _event(
     session: Session, case: BookingCase, action: str, actor: str = "agent", **detail: Any
 ) -> None:
@@ -372,13 +361,14 @@ def scan(
     start = now.date()
     end = start + timedelta(days=days_ahead or settings.booking_days_ahead)
     terminals: list[int | None] = list(terminal_ids or settings.pilot_terminal_ids) or [None]
-    customers: list[int | None] = list(customer_ids or settings.pilot_customer_ids) or [None]
+    billed_to: list[int | None] = list(customer_ids or settings.pilot_customer_ids) or [None]
     stats = ScanStats()
     resolver = FacilityResolver([])
+    known = customers(settings)
     with session_scope(sessions) as session:
         repo = Repository(session)
         for load in iter_terminal_loads(
-            client, terminal_ids=terminals, customer_ids=customers, start=start, end=end
+            client, terminal_ids=terminals, customer_ids=billed_to, start=start, end=end
         ):
             stats.loads += 1
             found = pickup_waypoint(load)
@@ -400,9 +390,11 @@ def scan(
                 continue
             key = resolver.resolve(stop_identity(wp)).key
             profile = vendor_profile(repo, key)
+            customer_id = load.billing_info.customer_id if load.billing_info else None
+            customer = known.for_customer(customer_id, load.customer_name)
             drop = delivery_waypoint(load)
             delivery_at = drop.appointment_time.open_at if drop and drop.appointment_time else None
-            ref_match = DELIVERY_REF_RE.search(drop.notes or "") if drop else None
+            delivery_ref = customer.find_delivery_ref(drop.notes) if drop else None
             loc = wp.location
             miles = (load.reference or {}).get("miles")
             pickup_no = str((load.reference or {}).get("pickupNumber") or "").strip()
@@ -423,7 +415,7 @@ def scan(
             case = BookingCase(
                 load_id=load.id,
                 waypoint_index=index,
-                customer_id=load.billing_info.customer_id if load.billing_info else None,
+                customer_id=customer_id,
                 customer_name=load.customer_name,
                 facility_key=key,
                 vendor_name=loc.company_name if loc else None,
@@ -438,7 +430,7 @@ def scan(
                     if drop and drop.location and drop.location.company_name
                     else None
                 ),
-                delivery_ref=ref_match.group(0) if ref_match else None,
+                delivery_ref=delivery_ref,
                 delivery_at_utc=delivery_at,
                 tendered_pickup_utc=appt.open_at if appt else None,
                 miles=int(miles) if isinstance(miles, int | float) else None,
@@ -515,11 +507,13 @@ def compose_request(
     subject, body = render(
         template or BUILT_IN[TemplateKind.REQUEST], request_values([case], settings, profile)
     )
+    customer = customer_of(case, settings)
     return OutboundDraft(
         to_addr=case.contact_email or "",
-        cc_addr=", ".join(settings.booking_cc),
+        cc_addr=customer.cc_header,
         subject=subject or "",
         body=body,
+        from_addr=customer.sender,
     )
 
 
@@ -543,7 +537,7 @@ def draft_case(
     profile = vendor_profile(Repository(session), case.facility_key) if case.facility_key else None
     _check_draftable(case, settings, now=now or datetime.now(tz=UTC), profile=profile)
     template = pick(
-        session, TemplateKind.REQUEST, desk=case.contact_email, customer=case.customer_name
+        session, TemplateKind.REQUEST, desk=case.contact_email, customer=_names(case, settings)
     )
     draft = compose_request(case, settings, profile, template)
     if is_sender(mailer):
@@ -725,7 +719,7 @@ def reschedule_case(
     case.confirmed_end_utc = None
     profile = vendor_profile(Repository(session), case.facility_key) if case.facility_key else None
     template = pick(
-        session, TemplateKind.RESCHEDULE, desk=case.contact_email, customer=case.customer_name
+        session, TemplateKind.RESCHEDULE, desk=case.contact_email, customer=_names(case, settings)
     )
     _, body = render(
         template, reschedule_values(case, settings, profile, previous=previous, note=note)
@@ -734,14 +728,16 @@ def reschedule_case(
     subject = original or f"Pick Up Appointment: {' & '.join(str(p) for p in case.po_numbers)}"
     subject = subject if subject.lower().startswith("re:") else f"Re: {subject}"
     last_in = next((m for m in reversed(case.messages) if m.direction == "in"), None)
+    customer = customer_of(case, settings)
     draft = OutboundDraft(
         to_addr=case.contact_email,
-        cc_addr=", ".join(settings.booking_cc),
+        cc_addr=customer.cc_header,
         subject=subject,
         body=body,
         thread_id=case.thread_id,
         in_reply_to=last_in.rfc_message_id if last_in else None,
         references=last_in.references_header if last_in else None,
+        from_addr=customer.sender,
     )
     if is_sender(mailer):
         profile = (
@@ -1099,14 +1095,19 @@ def ingest(  # noqa: PLR0912 - one branch per reply outcome
     internal_domains: list[str],
     responder: Responder | None = None,
     customer_desk: str | None = None,
+    settings: Settings | None = None,
 ) -> IngestStats:
     """Match inbound mail to cases, classify the replies, move the cases, draft answers.
 
-    Mail from the customer's inbound desk is not a vendor reply: it is read only for a new
-    delivery slot (date, time and DCT reference), which moves the pickup request.
+    Mail from a case's own customer desk (its customer file's ``[customer_desk] email``, or
+    ``customer_desk`` here) is not a vendor reply: it is read only for a new delivery slot
+    (date, time and the customer's delivery reference), which moves the pickup request.
     """
     stats = IngestStats()
     internal = {d.lower() for d in internal_domains}
+    settings = settings or (responder.settings if responder is not None else None)
+    known = customers(settings) if settings is not None else built_in_customers()
+    extra_desk = (customer_desk or "").strip().lower()
     for message in messages:
         stats.messages += 1
         if message.from_domain in internal:
@@ -1125,11 +1126,22 @@ def ingest(  # noqa: PLR0912 - one branch per reply outcome
         if not cases:
             stats.unmatched += 1
             continue
-        if customer_desk and message.from_email == customer_desk.lower():
-            moved = [_apply_customer_desk_message(session, c, message, responder) for c in cases]
+        from_desk = [
+            c
+            for c in cases
+            if message.from_email
+            and message.from_email in {known.for_case(c).customer_desk, extra_desk or None}
+        ]
+        if from_desk:
+            moved = [
+                _apply_customer_desk_message(session, c, message, responder, known.for_case(c))
+                for c in from_desk
+            ]
             if any(moved):
                 stats.delivery_updates += 1
-            continue
+            cases = [c for c in cases if c not in from_desk]
+            if not cases:
+                continue
         live: list[BookingCase] = []
         for case in cases:
             if case.status in DECIDED_STATUSES:
@@ -1368,11 +1380,18 @@ def _record_after_decision(session: Session, case: BookingCase, message: Inbound
 
 
 def _apply_customer_desk_message(
-    session: Session, case: BookingCase, message: InboundMessage, responder: Responder | None
+    session: Session,
+    case: BookingCase,
+    message: InboundMessage,
+    responder: Responder | None,
+    customer: Customer,
 ) -> bool:
     """Record a customer-desk message; on a new delivery slot, move the pickup request."""
     slot = parse_delivery_slot(
-        message.full_text, year=message.sent_at.year, timezone=case.vendor_timezone
+        message.full_text,
+        year=message.sent_at.year,
+        timezone=case.vendor_timezone,
+        customer=customer,
     )
     inbound = _inbound_record(
         case,
@@ -1482,14 +1501,20 @@ def draft_batch(
     by: str = "agent",
     now: datetime | None = None,
 ) -> list[BookingMessage]:
-    """Draft (or send) new cases, one email per vendor desk, the way the pod batches requests."""
+    """Draft (or send) new cases, one email per vendor desk, the way the pod batches requests.
+
+    A desk that ships for two customers gets one email per customer: each is copied to and
+    signed for its own customer's group.
+    """
     now = now or datetime.now(tz=UTC)
-    groups: dict[str, list[BookingCase]] = {}
+    known = customers(settings)
+    groups: dict[tuple[str, str], list[BookingCase]] = {}
     for case in cases:
-        groups.setdefault((case.contact_email or "").lower(), []).append(case)
+        key = (known.for_case(case).key, (case.contact_email or "").lower())
+        groups.setdefault(key, []).append(case)
     messages: list[BookingMessage] = []
     repo = Repository(session)
-    for desk, group in groups.items():
+    for (_, desk), group in groups.items():
         if len(group) == 1 or not desk:
             for case in group:
                 messages.append(draft_case(session, case, mailer, settings, by=by, now=now))
@@ -1499,15 +1524,17 @@ def draft_batch(
             _check_draftable(case, settings, now=now, profile=profile)
         group.sort(key=lambda c: c.requested_local or "")
         template = pick(
-            session, TemplateKind.BATCH_REQUEST, desk=desk, customer=group[0].customer_name
+            session, TemplateKind.BATCH_REQUEST, desk=desk, customer=_names(group[0], settings)
         )
         rendered_subject, body = render(template, request_values(group, settings, profile))
         subject = rendered_subject or "Pick Up Appointments"
+        customer = known.for_case(group[0])
         draft = OutboundDraft(
             to_addr=desk,
-            cc_addr=", ".join(settings.booking_cc),
+            cc_addr=customer.cc_header,
             subject=subject,
             body=body,
+            from_addr=customer.sender,
         )
         if is_sender(mailer):
             trusted = profile.contact_email if profile and profile.can_email else None

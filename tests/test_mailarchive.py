@@ -17,8 +17,10 @@ from botocore.exceptions import ClientError
 from typer.testing import CliRunner
 
 from facility_profiles.cli import app
+from facility_profiles.customers import built_in_customers
 from facility_profiles.mailarchive import filters
-from facility_profiles.mailarchive.collector import Stats, default_query, parse_raw, run
+from facility_profiles.mailarchive.collector import Stats, default_query, parse_raw
+from facility_profiles.mailarchive.collector import run as collector_run
 from facility_profiles.mailarchive.gmail import (
     METADATA_HEADERS,
     headers_of,
@@ -39,6 +41,13 @@ MEGAN = "Megan Goodwin <megan.goodwin@circledelivers.com>"
 DESK = "Morgan Foods Appointments <shipping.appointments@morganfoods.com>"
 GROUP = "Lidl Group <Lidl@circledelivers.com>"
 NOW = datetime(2026, 9, 30, 12, 0, tzinfo=UTC)
+# Lidl's group, subjects and desks, from its customer file.
+LIDL = filters.rules_for(built_in_customers().get("lidl"))
+
+
+def run(gmail: Any, store: Store, **kwargs: Any) -> Stats:
+    """One pass over the lidl@ group with Lidl's rules."""
+    return collector_run(gmail, store, rules=LIDL, **kwargs)
 
 
 # ------------------------------------------------------------------------------- fakes ----
@@ -322,7 +331,7 @@ def seeded_mailbox() -> FakeGmail:
         ("226321092660 MISSED PICK UP", "subject:po-incident"),
         ("RESCHEDULE 226321092660", "subject:po-incident"),
         ("Appointment Shipment Change: 5847944", "subject:portal-appointment"),
-        ("DCT Transporter Too Late", "subject:portal-appointment"),
+        ("DCT Transporter Too Late", "subject:dct-portal"),
         ("Fwd: SET! PU# 4119085", "subject:pickup-number"),
         ("CIR Capacity 9/29, DD 9/30", None),
         ("CRL Daily Recap 09/30/26", None),
@@ -333,29 +342,54 @@ def seeded_mailbox() -> FakeGmail:
     ],
 )
 def test_subject_rules_from_the_archive(subject: str, expected: str | None) -> None:
-    assert filters.match_reason(subject, set()) == expected
+    assert filters.match_reason(subject, set(), LIDL) == expected
+
+
+def test_only_the_shared_subject_rules_apply_without_a_customer() -> None:
+    assert filters.match_reason("Pick Up Appointment: 115824092601", set()) == (
+        "subject:pickup-appointment"
+    )
+    assert filters.match_reason("RESCHEDULE 226321092660", set()) == "subject:reschedule"
+    # Lidl's own subjects, PO shapes, portal and tour planning are Lidl's alone.
+    for subject in ("Re: Lidl Pick Ups", "115802102660 & 115802102661", "DCT Transporter Too Late"):
+        assert filters.match_reason(subject, set()) is None
+    assert filters.subject_reason("CIR Capacity 9/29, DD 9/30") is None
+    assert not filters.is_dropped("CIR Capacity 9/29, DD 9/30")
+    assert filters.is_dropped("CIR Capacity 9/29, DD 9/30", LIDL)
+    assert filters.is_dropped("New Tender Request from Acme for Tender S1")
 
 
 def test_desk_participants_keep_a_bare_subject_but_never_a_dropped_one() -> None:
     addrs = filters.participants("Polar CS <csrpolarbev@polarbev.com>", MEGAN, GROUP)
-    assert filters.match_reason("Re: hello", addrs) == "desk:csrpolarbev@polarbev.com"
-    assert filters.match_reason("CIR Capacity 9/29", {"inbound@lidl.us"}) is None
-    assert filters.match_reason("Re: x", {"noreply@softhouse.nl"}) == "desk:noreply@softhouse.nl"
+    assert filters.match_reason("Re: hello", addrs, LIDL) == "desk:csrpolarbev@polarbev.com"
+    assert filters.match_reason("CIR Capacity 9/29", {"inbound@lidl.us"}, LIDL) is None
     assert (
-        filters.match_reason("Re: x", {"someone@example.com"}, desks={"someone@example.com"})
+        filters.match_reason("Re: x", {"noreply@softhouse.nl"}, LIDL) == "desk:noreply@softhouse.nl"
+    )
+    assert filters.match_reason("Re: x", {"noreply@softhouse.nl"}) is None  # Lidl's portal only
+    assert filters.match_reason("Re: x", {"noreply@opendock.com"}) == "desk:noreply@opendock.com"
+    assert (
+        filters.match_reason(
+            "Re: x", {"someone@example.com"}, LIDL.with_desks(["Someone@Example.com"])
+        )
         == "desk:someone@example.com"
     )
 
 
 def test_identifiers_find_po_dct_and_pickup_numbers() -> None:
-    found = filters.identifiers(
+    texts = (
         "Pick Up Appointment: 115802102660",
         "PO# 115802102660 & 115802102661 on 10/05 @ 0900\n10/5 @ 9am pickup# 20463798\n"
         "New Appointment: PYE_061026919\nSET! PU# 4119085\nCCI pickup number CCI-9389",
     )
+    found = filters.identifiers(*texts, rules=LIDL)
     assert found["po_numbers"] == ["115802102660", "115802102661"]
     assert found["delivery_refs"] == ["PYE_061026919"]
     assert found["pickup_numbers"] == ["20463798", "4119085", "CCI-9389"]
+    # Without a customer file nothing says what a PO or a delivery reference looks like.
+    bare = filters.identifiers(*texts)
+    assert bare["po_numbers"] == [] and bare["delivery_refs"] == []
+    assert bare["pickup_numbers"] == found["pickup_numbers"]
 
 
 # ------------------------------------------------------------------------------- keys ----

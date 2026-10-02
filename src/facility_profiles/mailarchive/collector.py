@@ -38,8 +38,6 @@ from facility_profiles.mailarchive.store import (
     message_key,
 )
 
-DEFAULT_GROUP = "lidl@circledelivers.com"
-
 
 @dataclass
 class Stats:
@@ -106,15 +104,21 @@ def run(
     store: Store,
     *,
     mailbox: str,
-    group: str = DEFAULT_GROUP,
+    rules: filters.MailRules,
+    group: str | None = None,
     days: int = 3,
-    desks: frozenset[str] | set[str] = filters.DEFAULT_DESKS,
-    desk_domains: frozenset[str] | set[str] = filters.DEFAULT_DESK_DOMAINS,
     max_messages: int = 300,
     deadline: float | None = None,
     verbose: bool = False,
 ) -> Stats:
-    """One pass. Returns what it did; ``error`` is set when it stopped on one."""
+    """One pass over one customer's group. Returns what it did; ``error`` is set on a stop.
+
+    ``rules`` are the customer's (:func:`filters.rules_for`); ``group`` defaults to theirs.
+    """
+    group = group or rules.group
+    if not group:
+        msg = "no group address: give one, or set [mail] group in the customer file"
+        raise ValueError(msg)
     st = Stats()
     threads: dict[str, str] = dict(store.get_json(THREADS_KEY) or {})
     threads_changed = False
@@ -136,8 +140,7 @@ def run(
             reason = filters.match_reason(
                 h.get("subject"),
                 filters.participants(h.get("from"), h.get("to"), h.get("cc")),
-                desks,
-                desk_domains,
+                rules,
             )
             if reason is None and thread_id in threads:
                 reason = f"thread:{threads[thread_id]}"
@@ -156,10 +159,11 @@ def run(
                     reason=reason,
                     mailbox=mailbox,
                     st=st,
-                    desks=desks,
-                    desk_domains=desk_domains,
+                    rules=rules,
                 )
-            stored = collect_message(gmail, store, ref["id"], mailbox=mailbox, reason=reason, st=st)
+            stored = collect_message(
+                gmail, store, ref["id"], mailbox=mailbox, reason=reason, st=st, rules=rules
+            )
             if verbose and stored is not None:
                 print(f"  {ref['id']} -> {stored.key}  ({reason})")  # noqa: T201 - CLI progress
         except Exception as e:  # recorded, then reported by the caller
@@ -194,8 +198,7 @@ def _backfill_thread(
     reason: str,
     mailbox: str,
     st: Stats,
-    desks: frozenset[str] | set[str],
-    desk_domains: frozenset[str] | set[str],
+    rules: filters.MailRules,
 ) -> None:
     """Collect the other messages of a thread that just qualified, oldest first.
 
@@ -215,17 +218,23 @@ def _backfill_thread(
         own = filters.match_reason(
             h.get("subject"),
             filters.participants(h.get("from"), h.get("to"), h.get("cc")),
-            desks,
-            desk_domains,
+            rules,
         )
         if collect_message(
-            gmail, store, mid, mailbox=mailbox, reason=own or f"thread:{reason}", st=st
+            gmail, store, mid, mailbox=mailbox, reason=own or f"thread:{reason}", st=st, rules=rules
         ):
             st.backfilled += 1
 
 
 def collect_message(
-    gmail: GmailClient, store: Store, gmail_id: str, *, mailbox: str, reason: str, st: Stats
+    gmail: GmailClient,
+    store: Store,
+    gmail_id: str,
+    *,
+    mailbox: str,
+    reason: str,
+    st: Stats,
+    rules: filters.MailRules = filters.GENERIC,
 ) -> Stored | None:
     """Fetch one message raw and store its attachments, its ``.eml`` and its ``.json``."""
     msg = gmail.message(gmail_id, fmt="raw")
@@ -284,7 +293,7 @@ def collect_message(
         "own_text": own,
         "quoted": quoted,
         "body_text": parsed.text,
-        "identifiers": filters.identifiers(h.get("subject"), parsed.text),
+        "identifiers": filters.identifiers(h.get("subject"), parsed.text, rules=rules),
         "attachments": manifest,
         "eml_key": store.full(base + ".eml"),
     }

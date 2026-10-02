@@ -553,28 +553,40 @@ def test_reschedule_drafts_in_thread_and_resets_the_slot(settings, sessions):
 
 
 def test_parse_delivery_slot_reads_both_forms_lidl_uses():
-    from facility_profiles.booking.service import parse_delivery_slot
+    from functools import partial
 
-    got = parse_delivery_slot(
+    from facility_profiles.booking.service import parse_delivery_slot
+    from facility_profiles.customers import built_in_customers
+
+    known = built_in_customers()
+    parse = partial(parse_delivery_slot, customer=known.get("lidl"))
+    got = parse(
         "Here is an updated appointment! 8/20 7AM - GRM_200826926.",
         year=2026,
         timezone="America/New_York",
     )
     assert got == (datetime(2026, 8, 20, 11, 0, tzinfo=UTC), "GRM_200826926")
-    got = parse_delivery_slot(
+    got = parse(
         "New Appointment: FRG_200526615 05/20 @ 1100", year=2026, timezone="America/New_York"
     )
     assert got == (datetime(2026, 5, 20, 15, 0, tzinfo=UTC), "FRG_200526615")
-    got = parse_delivery_slot(
+    got = parse(
         "your new appointment on 8/20 at 8AM - FRG_200826660",
         year=2026,
         timezone="America/New_York",
     )
     assert got is not None and got[1] == "FRG_200826660" and got[0].hour == 12
     # The desk's wording after the 9/29 delivery miss: time and reference with no dash between.
-    got = parse_delivery_slot("9/30 at 1100 PYE_300926723", year=2026, timezone="America/New_York")
+    got = parse("9/30 at 1100 PYE_300926723", year=2026, timezone="America/New_York")
     assert got == (datetime(2026, 9, 30, 15, 0, tzinfo=UTC), "PYE_300926723")
-    assert parse_delivery_slot("Thanks for the update!", year=2026, timezone=None) is None
+    assert parse("Thanks for the update!", year=2026, timezone=None) is None
+    # A customer whose file names no delivery reference has no slot to read.
+    assert (
+        parse_delivery_slot(
+            "8/20 7AM - GRM_200826926", year=2026, timezone=None, customer=known.fallback
+        )
+        is None
+    )
 
 
 def test_customer_desk_slot_moves_the_pickup_and_redrafts_in_thread(settings, sessions):

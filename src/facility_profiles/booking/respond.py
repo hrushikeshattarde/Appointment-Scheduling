@@ -43,12 +43,12 @@ from facility_profiles.booking.schema import ReplyClassification, ReplyStatus
 from facility_profiles.booking.templates import (
     TemplateKind,
     case_values,
-    customer_label,
     pick,
     render,
 )
 from facility_profiles.booking.worklist import UNANSWERED, annotate, flag, resolve
 from facility_profiles.config import Settings
+from facility_profiles.customers import customer_of
 from facility_profiles.extraction.llm import ExtractionError
 from facility_profiles.extraction.openrouter import (
     DEFAULT_BASE_URL,
@@ -112,7 +112,7 @@ def case_facts(case: BookingCase, settings: Settings) -> dict[str, Any]:
         "po_numbers": [str(p) for p in case.po_numbers],
         "carrier": settings.booking_carrier_name,
         "equipment": None,
-        "customer": customer_label(case.customer_name),
+        "customer": customer_of(case, settings).label(case.customer_name),
         "delivery_site": case.delivery_site,
         "delivery_date": delivery.astimezone(tz).strftime("%m/%d") if delivery else None,
         "delivery_ref": case.delivery_ref,
@@ -446,9 +446,13 @@ class Responder:
     def _plan_rejection(
         self, case: BookingCase, result: ReplyClassification, text: str
     ) -> ResponsePlan:
-        desk = self.settings.booking_customer_desk
+        customer = customer_of(case, self.settings)
+        desk = customer.customer_desk
         if not desk:
-            return ResponsePlan(ResponseIntent.HANDOFF, "vendor cannot ship; no customer desk set")
+            who = customer.label(case.customer_name)
+            return ResponsePlan(
+                ResponseIntent.HANDOFF, f"vendor cannot ship; no customer desk set for {who}"
+            )
         pos = " & ".join(str(p) for p in case.po_numbers) or f"load {case.load_id}"
         quote = (result.question or text).strip().replace("\n", " ")[:300]
         ready = (
@@ -462,7 +466,7 @@ class Responder:
             f'"{quote}"\n\n'
             f"{ready.strip()} Can you please assist with a new delivery appointment?\n\n"
             "Thank you!\n\n"
-            f"{self.settings.booking_signature}"
+            f"{customer.signature or self.settings.booking_signature}"
         )
         return ResponsePlan(
             ResponseIntent.ESCALATE_TO_CUSTOMER,
@@ -484,13 +488,14 @@ class Responder:
             return None
         subject = self._subject(case, reply, plan)
         escalation = plan.intent == ResponseIntent.ESCALATE_TO_CUSTOMER
+        customer = customer_of(case, self.settings)
+        signature = customer.signature or self.settings.booking_signature
         draft = OutboundDraft(
             to_addr=plan.to_addr,
-            cc_addr=", ".join(self.settings.booking_cc),
+            cc_addr=customer.cc_header,
+            from_addr=customer.sender,
             subject=subject,
-            body=plan.body
-            if escalation or plan.signed
-            else (f"{plan.body}\n\n{self.settings.booking_signature}"),
+            body=plan.body if escalation or plan.signed else f"{plan.body}\n\n{signature}",
             thread_id=None if escalation else case.thread_id,
             # A new thread to the customer desk answers nothing; everything else answers the
             # vendor's message by its RFC Message-ID so the next reply threads back to the case.
@@ -616,7 +621,8 @@ class Responder:
                 return None
             reason = f"no reply for {self.settings.booking_follow_up_hours} hours"
             kind = TemplateKind.FOLLOW_UP
-        template = pick(session, kind, desk=case.contact_email, customer=case.customer_name)
+        names = customer_of(case, self.settings).template_matches(case.customer_name)
+        template = pick(session, kind, desk=case.contact_email, customer=names)
         profile = (
             vendor_profile(Repository(session), case.facility_key) if case.facility_key else None
         )

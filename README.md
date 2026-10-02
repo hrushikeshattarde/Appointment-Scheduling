@@ -106,8 +106,8 @@ pilot pod gets its own SQLite file. Point `FP_DATABASE_URL` at it for every comm
 
 ```powershell
 $env:FP_DATABASE_URL = 'sqlite:///./data/facility_profiles_pod-1089-lidl.db'
-facility-profiles harvest --terminal 1089 --customer 6680 --customer 7211 --days 90
-facility-profiles run --no-harvest --terminal 1089 --customer 6680 --customer 7211 --budget 8
+facility-profiles harvest --customer lidl --days 90     # = --terminal 1089 --customer 6680 --customer 7211
+facility-profiles run --no-harvest --customer lidl --budget 8
 facility-profiles export-xlsx --out exports/facility-profiles-review-pod-1089-lidl-2026-09-29.xlsx
 ```
 
@@ -119,6 +119,61 @@ and Lidl outbound 6680 only).
 
 Lidl store deliveries are tours planned by Lidl (nothing to book), so the bookable facilities on that pod are the twelve vendor pickup sites on Lidl - Inbound loads. `scripts/seed_lidl_vendor_profiles.py` files what the Transport Pro notes and the lidl@ group mail established for them (firm appointments, exact times, driver rules, and for Morgan Foods the email booking desk) as human-set values with their evidence, and queues the two questions Megan has to answer per vendor: booking channel and appointment-desk address. Hand-off workbook: `export-xlsx --facility <vendor> ...`; her answers come back through `review import`. `scripts/seed_lidl_vendor_mail_findings.py` then files the booking channels confirmed in the lidl@ Google Groups archive (Opendock for Polar Fitzgerald, email desks for the rest, inbound@lidl.us for the RDC delivery slots), each with the thread it rests on.
 
+## Customers
+
+Everything that differs from one customer to the next lives in one file per customer, and no
+other code names a customer. Lidl's is
+[`src/facility_profiles/customers/lidl.toml`](src/facility_profiles/customers/lidl.toml):
+
+| Section | What the agent does with it | Lidl |
+|---|---|---|
+| `name` | how emails name the customer ("for Koch Foods going to Lidl?") | `Lidl` |
+| `[transport_pro]` | which loads are theirs (`customer_ids`, else `customer_names`); `harvest`/`run --customer lidl` cover these ids on these pods, `booking scan --customer lidl` only `booking_customer_ids` | 7211, 6680; pod 1089; books for 7211 only (outbound loads are Lidl's own tours) |
+| `[mail]` | drafts are from `group`, copy `cc` (default: the group), end with `signature` | lidl@circledelivers.com |
+| `[customer_desk]` | where "the vendor cannot ship" goes; mail from it moves the delivery slot; `delivery_system` names where the pod rebooks | inbound@lidl.us, DCT |
+| `[numbers]` | `po`: subjects made of PO numbers; `po_date`: the date inside a PO (named groups dd, mm, yy); `delivery_ref`: read off the delivery stop and the desk's mail | `\d{12}`, DDMMYY in digits 5-10, `[A-Z]{3}_\d{6,}` |
+| `[mail_archive]` | which group mail the S3 archive keeps or drops, on top of the shared rules | "Lidl Pick Ups", DCT, the vendor desks; drops "CIR Capacity" |
+| `timezone` | what "today" means in `booking today --customer lidl` | America/Indiana/Indianapolis |
+
+A load or case belongs to the file that lists its Transport Pro customer id (or name). A load no
+file claims is written with the `FP_BOOKING_*` settings, which name no customer: no cc, no
+customer desk, a plain Circle signature. A desk that books for two customers gets one email per
+customer, each copied to its own group.
+
+Two lists stay pod-wide because they describe vendor desks, not customers:
+`FP_BOOKING_SHARED_DESKS` (desks that need the shipper and customer named) and
+`FP_BOOKING_PO_DATE_FLOOR_DESKS` (desks that read the customer's PO date as the earliest pickup;
+it applies only to customers whose file has a `po_date`).
+
+### Adding a customer
+
+1. Find the customer's Transport Pro customer record(s) and the pod that books them (customer
+   search by terminal; a name search can miss, as it did for Lidl).
+2. Write the starter file and check it:
+
+   ```powershell
+   facility-profiles customers new acme --name "Acme" --tpro-customer 1234 --terminal 1160 --group acme@circledelivers.com --desk inbound@acme.example
+   facility-profiles customers show acme --sample "10/6 0700 - ACM-123456"   # what the agent reads
+   facility-profiles customers list
+   ```
+
+   The file goes into the built-in folder, which the public repository carries. For a customer
+   whose desks should stay private, set `FP_CUSTOMERS_DIR` to a folder outside the repository
+   first; `customers new` writes there, and a file there replaces a built-in one with the same key.
+3. Fill in what you know: the PO and delivery-reference patterns, the customer desk, the mail
+   archive rules. Leave out what you do not; `customers show` lists what is not set and what that
+   turns off.
+4. A new pod gets its own store: set `FP_DATABASE_URL`, then `harvest --customer acme` and
+   `run --no-harvest --customer acme`.
+5. File the vendor desks with `profile set` (booking method, desk address, `required_refs`,
+   `cutoff_time`), the way `scripts/seed_lidl_*.py` did for Lidl.
+6. Word it the pod's way if it differs: `booking template set request --customer acme ...`.
+7. Book in draft mode: `booking scan --customer acme`, `booking draft`, and read the drafts in
+   `exports/drafts` (from, cc and signature are Acme's) before anything is sent.
+8. Optional: `FP_CUSTOMERS=acme` makes it the pod's default for harvest, run and scan;
+   `mail-archive collect --customer acme` archives its group (the Lambda takes
+   `ARCHIVE_CUSTOMER=acme`).
+
 ## Booking agent prototype (draft mode)
 
 `facility-profiles booking ...` books vendor pickup appointments by email for customer-tendered
@@ -128,7 +183,7 @@ touching real data, follow [TESTING.md](TESTING.md).
 
 ```powershell
 $env:FP_DATABASE_URL = 'sqlite:///./data/facility_profiles_pod-1089-lidl.db'
-facility-profiles booking scan --terminal 1089 --customer 7211 --days-ahead 7
+facility-profiles booking scan --customer lidl --days-ahead 7   # = --terminal 1089 --customer 7211
 facility-profiles booking list                     # status, !open exceptions, vendor, PO, slot
 facility-profiles booking list --exception any     # only what needs a person
 facility-profiles booking draft            # one .eml per desk in exports/drafts
@@ -270,7 +325,7 @@ slot (miles at `FP_BOOKING_AVG_MPH` plus `FP_BOOKING_LOAD_HOURS`), otherwise the
 alternatives inside the workable window; a factual question is answered only from data on
 the case (PO numbers, carrier, delivery site and number, load number), by rule first and by
 the model second, and every number in the answer must exist on the case; a vendor that
-cannot ship gets a drafted note to the customer's inbound desk (`FP_BOOKING_CUSTOMER_DESK`)
+cannot ship gets a drafted note to the customer's inbound desk (its customer file's `[customer_desk]`)
 asking for a new delivery slot; `booking follow-up` nudges once after
 `FP_BOOKING_FOLLOW_UP_HOURS` of silence. Replies that mention rates, fees, detention, claims
 or damage, and threads past `FP_BOOKING_MAX_ROUNDS`, go to a person untouched.
@@ -304,8 +359,8 @@ Morgan Foods thread in the mail pull's format, Outlook cruft included, and
 ### Three rules from the live threads
 
 A freshly scanned case is checked before any email is written. A desk listed in
-`FP_BOOKING_PO_DATE_FLOOR_DESKS` (Morgan Foods by default) reads the DDMMYY date inside a Lidl PO
-as the earliest pickup, so a request earlier than that day is moved up to it (weekends roll to
+`FP_BOOKING_PO_DATE_FLOOR_DESKS` (Morgan Foods by default) reads the date inside the customer's
+PO (Lidl's DDMMYY, from `[numbers] po_date` in its customer file) as the earliest pickup, so a request earlier than that day is moved up to it (weekends roll to
 Monday); if the floored day can no longer make the delivery the case goes to a person instead.
 A requested slot that has already passed, or sits inside `FP_BOOKING_MIN_NOTICE_HOURS`, goes to
 a person too, at scan time and again at draft or send time, because a same-day ask is a phone
@@ -378,14 +433,14 @@ braces: `{lines}` (the PO lines), `{ask}`, `{po}`, `{load}`, `{date}`, `{time}`,
 blank gap.
 
 The template used is the most specific saved: for the desk's address, else for the customer
-(`Lidl - Inbound`), else the pod's default, else the built-in one, which is the pod's own wording
+(its key `lidl`, its name, or a Transport Pro name such as `Lidl - Inbound`), else the pod's default, else the built-in one, which is the pod's own wording
 word for word. Templates are checked when saved: an unknown field, an unmatched brace, a request
 without `{lines}` or a reschedule without `{line}` is refused. The "Request drafted" step on the
 board says which wording was used.
 
 ```powershell
 facility-profiles booking template fields
-facility-profiles booking template set request --customer "Lidl - Inbound" --subject "Pick Up Appointment: {po}" --body-file lidl-request.txt --by megan
+facility-profiles booking template set request --customer lidl --subject "Pick Up Appointment: {po}" --body-file lidl-request.txt --by megan
 facility-profiles booking template set follow_up --desk cci@udfinc.com --body "Hello,\n\nChecking on {po} for {date}.\n\n{signature}" --by megan
 facility-profiles booking template preview 12            # the email the agent would write now
 facility-profiles booking template show request --desk cci@udfinc.com
@@ -528,3 +583,8 @@ the board on a demo store, the commands, and a pod's real cases on a copy of its
 - Digest delivery (email or Slack) and single sign-on in front of the API are deployment
   concerns not included here.
 - Alembic migrations before Postgres.
+- Customers: the board and `GET /api/booking/today` still filter by Transport Pro customer name,
+  not by customer key; the S3 collector's deploy script still deploys Lidl's function only
+  (`circle-lidl-mail-collector`), so a second customer's collector needs its own function name,
+  bucket or prefix and `ARCHIVE_CUSTOMER`. The vendor-desk lists (`FP_BOOKING_SHARED_DESKS`,
+  `FP_BOOKING_PO_DATE_FLOOR_DESKS`) belong on the vendor profiles as desk rules.

@@ -1,0 +1,66 @@
+# Lidl US: inbound vendor pickups to the Lidl RDCs, booked by email from the lidl@ group.
+#
+# Everything here was read off the lidl@ threads in September 2026. The file name is the key
+# ("lidl"): `facility-profiles booking scan --customer lidl`, `customers show lidl`.
+
+name = "Lidl"
+description = "Inbound vendor pickups to the Lidl RDCs (PYE, FRG, GRM), pod 1089"
+# The pod's own time zone: what "today" means for this customer's daily summary.
+timezone = "America/Indiana/Indianapolis"
+
+[transport_pro]
+# "Lidl - Inbound" and "Lidl-Outbound". A load billed to either is Lidl's.
+customer_ids = [7211, 6680]
+customer_names = ["Lidl - Inbound", "Lidl-Outbound"]
+terminal_ids = [1089]
+# The agent books vendor pickups on inbound loads only: outbound loads are Lidl's own store
+# tours, planned by Lidl, with nothing to book.
+booking_customer_ids = [7211]
+
+[mail]
+# The Google Group every pickup thread runs through. Drafts are from it and copy it.
+group = "lidl@circledelivers.com"
+cc = ["lidl@circledelivers.com"]
+signature = "Circle Logistics, Inc. | Fort Wayne | 260-208-4500 | lidl@circledelivers.com"
+
+[customer_desk]
+# Lidl's inbound desk assigns and moves RDC delivery slots. When a vendor cannot ship, the note
+# goes here; mail from here is read for a new slot, never classified as a vendor reply.
+email = "inbound@lidl.us"
+# Where the pod books the delivery slot itself (Schwarz/Softhouse DCT dock portal).
+delivery_system = "DCT"
+
+[numbers]
+# Lidl PO numbers are twelve digits.
+po = '\d{12}'
+# Digits five to ten are the RDC delivery date as DDMMYY: 115802102660 is 2 October 2026.
+# Some vendor desks read it as the earliest pickup (FP_BOOKING_PO_DATE_FLOOR_DESKS).
+po_date = '\d{4}(?P<dd>\d{2})(?P<mm>\d{2})(?P<yy>\d{2})\d{2}'
+# DCT delivery references: PYE_061026919, FRG_200526615, GRM_200826926.
+delivery_ref = '[A-Z]{3}_\d{6,}'
+
+[mail_archive]
+# Subjects that are about a Lidl pickup, on top of the rules every customer shares
+# ("Pick Up Appointment", "RESCHEDULE", portal notices, "PU#"). Subjects made of PO numbers
+# ("115802102660 & 115802102661", "<PO> MISSED PICK UP") come from [numbers] po.
+keep_subjects = { lidl-pickups = '\blidl\b.{0,24}\bpick\s*-?\s*ups?\b|\bpick\s*-?\s*ups?\b.{0,24}\blidl\b', dct-portal = '\bdct\b|\btransporter too late\b' }
+# Tour planning for Lidl's dedicated fleet: never about a pickup appointment.
+drop_subjects = ['^\W*cir capacity\b', '^\W*crl daily recap\b']
+# Desks that only ever write about appointments: the vendors' booking desks confirmed in the
+# archive and Lidl's inbound desk.
+desks = [
+  "inbound@lidl.us",
+  "shipping.appointments@morganfoods.com",
+  "csrpolarbev@polarbev.com",
+  "mmcdonald@polarbev.com",
+  "gweaver@delgrossos.com",
+  "transportation@hanoverlogistics.com",
+  "lebanonvalley@rlslogistics.com",
+  "wesley.brown@premiumwaters.com",
+  "l.albadawi@cgroxane.com",
+  "shippingjohnstown@cgroxane.com",
+  "cci@udfinc.com",
+  "ripondistribution@senecafoods.com",
+]
+# The DCT portal's notifier.
+desk_domains = ["softhouse.nl"]

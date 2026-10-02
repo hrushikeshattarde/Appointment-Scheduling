@@ -11,8 +11,9 @@ Five kinds of email are written from a template:
 A template is a subject (requests only: the others answer in the thread) and a body with fields
 in braces, ``{po}`` or ``{lines}`` (see :data:`FIELDS`). The one used is the most specific
 saved: for the desk's address, else for the customer, else the pod's default, else the built-in
-one, which is the pod's own wording word for word. Templates are checked when saved: an unknown
-field, an unmatched brace, or a request without its PO lines is refused.
+one, which is the pod's own wording word for word. A customer template is saved under the
+customer's key (``lidl``), its name, or a Transport Pro customer name. Templates are checked when
+saved: an unknown field, an unmatched brace, or a request without its PO lines is refused.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from sqlalchemy.orm import Session
 from facility_profiles.booking.models import BookingCase, BookingTemplate
 from facility_profiles.booking.rules import VendorProfile, extra_references
 from facility_profiles.config import Settings
+from facility_profiles.customers import customer_of
 from facility_profiles.storage.models import utcnow
 from facility_profiles.storage.repository import as_utc
 
@@ -57,7 +59,7 @@ FIELDS: dict[str, str] = {
     "date": "the pickup date asked for, MM/DD (the first one in a batch)",
     "time": "the pickup time asked for, HHMM; empty for a desk that is given a date only",
     "vendor": "the shipper's name without Inc. or LLC",
-    "customer": "the customer's name without Inbound or Outbound, e.g. Lidl",
+    "customer": "the customer's name from its customer file, e.g. Lidl",
     "desk_name": "the desk contact's name on the vendor profile, or empty",
     "delivery_ref": "the customer's delivery reference (the DCT number), or empty",
     "delivery_date": "the delivery date, MM/DD, or empty",
@@ -176,11 +178,6 @@ def short_vendor(name: str | None) -> str:
     return re.sub(r",?\s*\b(inc|llc|corp|co)\b\.?$", "", name or "the shipper", flags=re.I).strip()
 
 
-def customer_label(name: str | None) -> str:
-    """Strip the inbound/outbound suffix: "Lidl - Inbound" becomes "Lidl"."""
-    return re.sub(r"\s*-\s*(inbound|outbound)\s*$", "", name or "Lidl", flags=re.I).strip()
-
-
 def is_shared_desk(case: BookingCase, settings: Settings) -> bool:
     """A desk that books for several shippers needs the shipper and customer named."""
     return (case.contact_email or "").lower() in {d.lower() for d in settings.booking_shared_desks}
@@ -205,13 +202,13 @@ def case_values(
         "date": mmdd,
         "time": "" if date_only else clock,
         "vendor": short_vendor(first.vendor_name),
-        "customer": customer_label(first.customer_name),
+        "customer": customer_of(first, settings).label(first.customer_name),
         "desk_name": first.contact_name or (profile.contact_name if profile else None) or "",
         "delivery_ref": first.delivery_ref or "",
         "delivery_date": delivery.astimezone(tz).strftime("%m/%d") if delivery else "",
         "refs": ", ".join(ref for c in cases for ref in extra_references(c, profile)),
         "carrier": settings.booking_carrier_name,
-        "signature": settings.booking_signature,
+        "signature": customer_of(first, settings).signature or settings.booking_signature,
     }
 
 
@@ -223,7 +220,7 @@ def request_values(
     date_only = bool(profile and profile.date_only)
     ask = (
         f"Can I please schedule the following for {short_vendor(first.vendor_name)} going to "
-        f"{customer_label(first.customer_name)}?"
+        f"{customer_of(first, settings).label(first.customer_name)}?"
         if is_shared_desk(first, settings)
         else "Can I please schedule the following?"
     )
@@ -327,9 +324,17 @@ def _template(row: BookingTemplate) -> Template:
 
 
 def pick(
-    session: Session, kind: TemplateKind, *, desk: str | None, customer: str | None
+    session: Session,
+    kind: TemplateKind,
+    *,
+    desk: str | None,
+    customer: str | Sequence[str] | None,
 ) -> Template:
-    """The template to write with: the desk's, else the customer's, else the default."""
+    """The template to write with: the desk's, else the customer's, else the default.
+
+    ``customer`` is what a customer template may be saved under, tried in order: the
+    customer's key, its name, the case's Transport Pro customer name.
+    """
     rows = {
         (r.scope, r.match): r
         for r in session.scalars(select(BookingTemplate).where(BookingTemplate.kind == kind.value))
@@ -337,8 +342,8 @@ def pick(
     wanted: list[tuple[str, str]] = []
     if desk:
         wanted.append(("desk", desk.strip().lower()))
-    if customer:
-        wanted.append(("customer", customer.strip()))
+    names = [customer] if isinstance(customer, str) else list(customer or [])
+    wanted.extend(("customer", n.strip()) for n in names if n and n.strip())
     wanted.append(("default", ""))
     for key in wanted:
         row = rows.get(key)

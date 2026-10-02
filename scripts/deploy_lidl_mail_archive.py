@@ -163,6 +163,7 @@ def function_env(bucket: str, prefix: str, user: str, group: str) -> dict[str, s
         "LIDL_GMAIL_SECRET": GMAIL_SECRET,
         "LIDL_GMAIL_USER": user,
         "LIDL_GROUP": group,
+        "ARCHIVE_CUSTOMER": "lidl",  # the customer file whose subject and desk rules apply
         "LIDL_WINDOW_DAYS": "3",
         "LIDL_MAX_MESSAGES": "300",
     }

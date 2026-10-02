@@ -7,10 +7,15 @@ service-account key comes from Secrets Manager and stays in memory. Environment:
     LIDL_MAIL_PREFIX      key prefix inside it (default none)
     LIDL_GMAIL_SECRET     Secrets Manager id of the service account's JSON key (required)
     LIDL_GMAIL_USER       the group member whose mailbox is read (required)
-    LIDL_GROUP            the group address (default lidl@circledelivers.com)
+    ARCHIVE_CUSTOMER      the customer file whose group and rules apply (default: the only
+                          built-in one); the files ship inside the bundle
+    LIDL_GROUP            the group address (default: the customer file's [mail] group)
     LIDL_WINDOW_DAYS      how many days back each pass lists (default 3)
     LIDL_MAX_MESSAGES     per-pass cap (default 300)
     LIDL_DESKS            extra appointment-desk addresses, comma-separated
+
+The LIDL_ names are the ones the deployed function already carries; a second customer's
+collector is the same function with its own ARCHIVE_CUSTOMER, bucket or prefix.
 """
 
 from __future__ import annotations
@@ -20,8 +25,9 @@ import os
 import time
 from typing import Any
 
+from facility_profiles.customers.profile import choose, load_customers
 from facility_profiles.mailarchive import filters
-from facility_profiles.mailarchive.collector import DEFAULT_GROUP, run
+from facility_profiles.mailarchive.collector import run
 from facility_profiles.mailarchive.gmail import Delegated
 from facility_profiles.mailarchive.store import Store
 
@@ -45,14 +51,15 @@ def handler(event: dict[str, Any] | None, context: Any) -> dict[str, Any]:  # pr
         msg = f"secret {env['LIDL_GMAIL_SECRET']} must hold the service account's JSON key"
         raise ValueError(msg)
     gmail = Delegated(info, subject=env["LIDL_GMAIL_USER"])
-    extra = {d.strip().lower() for d in env.get("LIDL_DESKS", "").split(",") if d.strip()}
+    customer = choose(load_customers(), env.get("ARCHIVE_CUSTOMER"))
+    rules = filters.rules_for(customer).with_desks(env.get("LIDL_DESKS", "").split(","))
     st = run(
         gmail,
         store,
         mailbox=env["LIDL_GMAIL_USER"],
-        group=env.get("LIDL_GROUP", DEFAULT_GROUP),
+        rules=rules,
+        group=env.get("LIDL_GROUP") or None,
         days=int(env.get("LIDL_WINDOW_DAYS", "3")),
-        desks=filters.DEFAULT_DESKS | extra,
         max_messages=int(env.get("LIDL_MAX_MESSAGES", "300")),
         deadline=started + remaining - RESERVE_S,
     )
