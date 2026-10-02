@@ -18,6 +18,7 @@ from pydantic import BaseModel, StringConstraints
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
+from facility_profiles.booking.links import offer_state
 from facility_profiles.booking.memory import desk_history
 from facility_profiles.booking.models import (
     BookingCase,
@@ -27,6 +28,7 @@ from facility_profiles.booking.models import (
     CaseStatus,
     DeskMemory,
     ExceptionType,
+    SlotOffer,
 )
 from facility_profiles.booking.references import case_numbers
 from facility_profiles.booking.rules import REFERENCE_LABELS, REFERENCE_NAMES
@@ -37,7 +39,7 @@ from facility_profiles.booking.service import (
     has_request,
     mark_booked,
 )
-from facility_profiles.booking.timers import pickup_passed
+from facility_profiles.booking.timers import fmt_slot, pickup_passed
 from facility_profiles.booking.today import pickup_slot, render_today, stage, today_summary
 from facility_profiles.booking.worklist import KINDS, resolve
 from facility_profiles.config import Settings, get_settings
@@ -76,6 +78,8 @@ EVENTS: dict[str, str] = {
     "reference_added": "Reference added",
     "desk_remembered": "Desk remembered",
     "desk_learned": "Desk on file now",
+    "confirmed_by_link": "Vendor picked a time from the link",
+    "proposed_by_link": "Vendor proposed a time from the link",
 }
 
 
@@ -227,6 +231,25 @@ def timeline(case: BookingCase) -> list[dict[str, Any]]:
     return sorted(rows, key=lambda r: r["at"] or "")
 
 
+def offer_view(offer: SlotOffer, *, now: datetime) -> dict[str, Any]:
+    """The times one request offered by link, and what became of them."""
+    detail = offer.answer_detail or {}
+    answer = offer.answer
+    if answer == "proposed":
+        proposed = f"{detail.get('date') or ''} {detail.get('time') or ''}".strip()
+        answer = f"proposed {fmt_slot(proposed)}"
+    elif answer:
+        answer = fmt_slot(answer)
+    return {
+        "id": offer.id,
+        "slots": [fmt_slot(s) for s in offer.slots],
+        "state": offer_state(offer, now),
+        "answer": answer,
+        "answered_at": _iso(offer.answered_at),
+        "expires_at": _iso(offer.expires_at),
+    }
+
+
 def desk_view(row: DeskMemory) -> dict[str, Any]:
     """One way the facility was booked before."""
     return {
@@ -254,6 +277,7 @@ def case_detail(
         "references": [n.as_dict() for n in case_numbers(case)],
         "exceptions": [exception_view(e) for e in case.exceptions],
         "messages": [_message_view(m) for m in case.messages],
+        "offers": [offer_view(o, now=now) for o in case.offers],
         "timeline": timeline(case),
         "can_approve": case.status == CaseStatus.PENDING.value
         and any(e.kind == ExceptionType.CONFIRMATION_REVIEW for e in case.open_exceptions),

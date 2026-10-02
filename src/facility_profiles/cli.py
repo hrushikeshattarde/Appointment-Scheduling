@@ -178,6 +178,38 @@ def serve(
     uvicorn.run(app_, host=host, port=port, log_level="warning")
 
 
+@app.command("serve-links")
+def serve_links(
+    host: Annotated[str, typer.Option(help="Interface to listen on")] = "127.0.0.1",
+    port: Annotated[int, typer.Option(help="Port to listen on")] = 8010,
+    db: Annotated[str | None, typer.Option(help="Store the links answer into")] = None,
+) -> None:
+    """Serve only the vendors' click-to-confirm pages (/c/...), no board and no API.
+
+    This is what goes behind FP_BOOKING_LINK_BASE_URL. Making it reachable from outside is a
+    deployment decision; by default it listens on this machine only.
+    """
+    try:
+        import uvicorn
+    except ImportError as exc:
+        typer.echo("the pages need the api extra: uv sync --extra api")
+        raise typer.Exit(code=2) from exc
+    from facility_profiles.api.links import create_links_app
+    from facility_profiles.booking.links import links_enabled
+
+    settings = _settings()
+    if db:
+        settings = settings.model_copy(update={"database_url": db})
+    if not links_enabled(settings):
+        typer.echo("set FP_BOOKING_LINK_BASE_URL and FP_BOOKING_LINK_SECRET first")
+        raise typer.Exit(code=2)
+    typer.echo(
+        f"vendor link pages on http://{host}:{port}/c/...  (links say "
+        f"{settings.booking_link_base_url}; store {settings.database_url})"
+    )
+    uvicorn.run(create_links_app(settings), host=host, port=port, log_level="warning")
+
+
 @app.command("check-tpro")
 def check_tpro() -> None:
     """Authenticate against Transport Pro and read one terminal (read-only smoke test)."""
@@ -1197,6 +1229,7 @@ def template_preview(
     ] = "request",
 ) -> None:
     """Show the email the agent would write for a case now; nothing is drafted or sent."""
+    from facility_profiles.booking.links import link_lines, links_enabled, offered_slots
     from facility_profiles.booking.rules import vendor_profile
     from facility_profiles.booking.templates import (
         TemplateKind,
@@ -1205,7 +1238,9 @@ def template_preview(
         render,
         request_values,
         reschedule_values,
+        with_links,
     )
+    from facility_profiles.booking.timers import fmt_slot
     from facility_profiles.customers import customer_of
 
     which = _template_kind(kind)
@@ -1219,11 +1254,21 @@ def template_preview(
         )
         names = customer_of(case, settings).template_matches(case.customer_name)
         template = pick(session, which, desk=case.contact_email, customer=names)
+        links = ""
+        if links_enabled(settings) and which in (TemplateKind.REQUEST, TemplateKind.RESCHEDULE):
+            slots = offered_slots(case, settings, profile, now=datetime.now(tz=UTC))
+            if slots:
+                url = f"{settings.booking_link_base_url}/c/(made when drafted)"
+                links = link_lines([case], {case.id: url})
+                links += "\n(offers " + ", ".join(fmt_slot(slot) for slot in slots) + ")"
+                template = with_links(template)
         if which == TemplateKind.REQUEST:
-            values = request_values([case], settings, profile)
+            values = request_values([case], settings, profile, links=links)
         elif which == TemplateKind.RESCHEDULE:
             current = case.confirmed_local or case.requested_local
-            values = reschedule_values(case, settings, profile, previous=current, note=None)
+            values = reschedule_values(
+                case, settings, profile, previous=current, note=None, links=links
+            )
         else:
             values = case_values([case], settings, profile)
         subject, text = render(template, values)
@@ -1234,6 +1279,32 @@ def template_preview(
         typer.echo(f"Subject: {subject}")
     typer.echo("")
     typer.echo(text)
+
+
+@booking_app.command("links")
+def booking_links(case_id: int) -> None:
+    """The times a case's requests offered by link, the links, and what the vendor did."""
+    from facility_profiles.booking.links import LinkError, offer_state, offer_url
+    from facility_profiles.booking.timers import fmt_slot
+
+    settings = _settings()
+    now = datetime.now(tz=UTC)
+    with session_scope(_sessions(settings)) as session:
+        case = _booking_case(session, case_id)
+        if not case.offers:
+            typer.echo(f"#{case_id} has offered no times by link")
+            return
+        for offer in case.offers:
+            state = offer_state(offer, now)
+            answer = f" -> {offer.answer}" if offer.answer else ""
+            typer.echo(
+                f"offer {offer.id} ({state}{answer}), expires {offer.expires_at:%m/%d %H:%M}Z: "
+                + ", ".join(fmt_slot(str(slot)) for slot in offer.slots)
+            )
+            try:
+                typer.echo(f"  {offer_url(offer, settings)}")
+            except LinkError as exc:
+                typer.echo(f"  (no link: {exc})")
 
 
 @booking_app.command("find")

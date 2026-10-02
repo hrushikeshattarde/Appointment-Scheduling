@@ -159,11 +159,11 @@ def weekday_hours(start: datetime, end: datetime, tz: ZoneInfo) -> float:
 
 
 def is_vendor_answer(message: BookingMessage) -> bool:
-    """An inbound reply read as being about this case (not unrelated, not skipped)."""
+    """An inbound reply read as being about this case, or a time picked from a link."""
     reading = message.classification or {}
     return (
         message.direction == "in"
-        and message.kind == "reply"
+        and message.kind in ("reply", "link")
         and reading.get("status") not in (None, "unrelated")
     )
 

@@ -332,14 +332,22 @@ def test_the_demo_seeder_builds_every_situation_and_refuses_a_used_store(
     db = f"sqlite:///{(tmp_path / 'demo.db').as_posix()}"
     monkeypatch.setattr(sys, "argv", ["seed", "--db", db])
     assert module.main() == 0
-    assert "21 demo cases" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert (
+        "23 demo cases" in out
+        and "waiting link (Orchard Valley Juice): http://127.0.0.1:8000/c/" in out
+    )
     engine = make_engine(db)
     with session_scope(session_factory(engine)) as s:
         statuses = sorted(c.status for c in s.query(BookingCase))
         kinds = sorted(e.kind for c in s.query(BookingCase) for e in c.open_exceptions)
+        # One time picked from a link and booked, one link still waiting for the vendor.
+        offers = {o.case.vendor_name: o.answer for c in s.query(BookingCase) for o in c.offers}
     engine.dispose()
-    assert statuses.count("scheduled") == 2 and statuses.count("declined") == 1
-    assert statuses.count("canceled") == 1 and len(statuses) == 21
+    assert sorted(offers) == ["Orchard Valley Juice", "Pinecrest Bakery"]
+    assert offers["Orchard Valley Juice"] is None and offers["Pinecrest Bakery"].endswith(" 10:00")
+    assert statuses.count("scheduled") == 3 and statuses.count("declined") == 1
+    assert statuses.count("canceled") == 1 and len(statuses) == 23
     assert kinds == sorted(
         [
             "confirmation_review",

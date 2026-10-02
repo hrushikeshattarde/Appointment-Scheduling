@@ -1,8 +1,8 @@
-# Testing the booking agent (Phase 1)
+# Testing the booking agent
 
-How to check the six Phase 1 steps: statuses and to-dos, timers and the daily summary, desk
-rules, desk memory, email templates and reference numbers. There are three layers, quickest
-first. Everything here runs on throwaway stores: nothing reaches a vendor, the customer or
+How to check the six Phase 1 steps (statuses and to-dos, timers and the daily summary, desk
+rules, desk memory, email templates, reference numbers) and Phase 2's click-to-confirm links.
+There are three layers, quickest first. Everything here runs on throwaway stores: nothing reaches a vendor, the customer or
 Transport Pro.
 
 ## Before you start
@@ -30,7 +30,7 @@ file: its own cc, sender, signature, desk and delivery references, and nothing o
 
 ## 2. The board with demo data (about 15 minutes)
 
-Build a demo store: 21 invented pickups, one per situation, on `.example` addresses. The seeder
+Build a demo store: 23 invented pickups, one per situation, on `.example` addresses. The seeder
 refuses a store that already has cases; delete the file to start again.
 
 ```powershell
@@ -59,6 +59,20 @@ recorded under it). Then check:
 | 4. Desk memory | Case 14 Maple Leaf Imports | "Booked before: phone 716-555-0144" |
 | 6. Numbers | Case 1 Harbor Beverage | "Numbers": PO, Delivery# and PU# 44710, each with where it came from |
 | 6. Search | Appointments, search box | `44710` finds case 1 |
+| 7. Click-to-confirm | Case 22 Pinecrest Bakery | "Offered by link": four times, "picked" one; stage "Vendor picked ... from the link" |
+| 7. Click-to-confirm | Case 23 Orchard Valley Juice | "Offered by link: ... waiting for a click" |
+
+To click as the vendor (case 23), the board must know the demo signing key. Stop it, start it
+again like this, and open the "waiting link" the seeder printed:
+
+```powershell
+$env:FP_BOOKING_LINK_SECRET = 'booking-demo-links-not-a-secret'; $env:FP_BOOKING_LINK_BASE_URL = 'http://127.0.0.1:8000'
+.\.venv\Scripts\facility-profiles.exe serve --db sqlite:///./data/phase1-demo.db
+```
+
+Opening the page changes nothing. Pick a time, add a pickup number and press "Confirm pickup
+time": the page thanks you, and case 23 is Scheduled with that time and number. Remove both
+variables afterwards (see Clean up).
 
 Case numbers follow the seeder's order. The timers' cases are built relative to the time the
 store is seeded, so they show the same to-dos whenever it is run.
@@ -126,13 +140,16 @@ The same works for pod 1160: copy `data/facility_profiles.db` the same way, then
   pays for model calls. Section 4 tests the same logic on a copy.
 - `profile portals --apply`, `scripts/seed_lidl_*.py` or any command without a test store: they
   write to the real stores.
+- `serve-links --host 0.0.0.0`, or setting `FP_BOOKING_LINK_*` in `.env`: drafts would then carry
+  links, and the pages would be reachable from outside this machine. Keep the link variables to
+  the one terminal that serves the demo.
 
 ## Clean up
 
 Stop the board with Ctrl+C, then:
 
 ```powershell
-Remove-Item Env:FP_DATABASE_URL
+Remove-Item Env:FP_DATABASE_URL, Env:FP_BOOKING_LINK_SECRET, Env:FP_BOOKING_LINK_BASE_URL -ErrorAction SilentlyContinue
 ```
 
 ```powershell

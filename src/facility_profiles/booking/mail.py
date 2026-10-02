@@ -144,6 +144,8 @@ class OutboundDraft:
     # Drafts only: the customer's group the draft is from. A send is always from the sending
     # mailbox (a group cannot send through the API).
     from_addr: str | None = None
+    # An HTML part beside the text, when the request carries one-click times (booking/links.py).
+    html: str | None = None
 
 
 @dataclass(frozen=True)
@@ -205,6 +207,8 @@ def build_mime(
     for name, value in (extra_headers or {}).items():
         msg[name] = value
     msg.set_content(draft.body)
+    if draft.html:
+        msg.add_alternative(draft.html, subtype="html")
     return msg
 
 

@@ -10,6 +10,10 @@ summary all have something to show.
     python scripts/seed_booking_demo.py --db sqlite:///./data/booking-demo.db
     facility-profiles serve --db sqlite:///./data/booking-demo.db
 
+Two cases carry click-to-confirm links signed with a demo-only key (one picked, one waiting for
+the vendor). To open the waiting one's vendor page, serve the board with that key and address:
+the seeder prints both and the link.
+
 The store must be new or empty: the demo is never mixed into a real store.
 """
 
@@ -22,10 +26,12 @@ from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from pydantic import SecretStr
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from facility_profiles.booking.classify import FakeReplyClassifier
+from facility_profiles.booking.links import confirm, offer_url
 from facility_profiles.booking.mail import InboundMessage, RecordingMailer
 from facility_profiles.booking.models import (
     BookingCase,
@@ -56,6 +62,9 @@ from facility_profiles.storage.db import init_db, make_engine, session_factory, 
 from facility_profiles.storage.repository import Repository
 
 ET = ZoneInfo("America/New_York")
+# Demo links: signed with a key that guards nothing, pointing at the board on this machine.
+LINK_SECRET = "booking-demo-links-not-a-secret"  # noqa: S105 - a demo key that guards nothing
+LINK_BASE = "http://127.0.0.1:8000"
 CT = ZoneInfo("America/Chicago")
 CUSTOMER = "Demo Grocer - Inbound"
 DC = "Demo Grocer DC (Harrisburg, PA)"
@@ -215,10 +224,10 @@ class Demo:
             record_load_numbers(self.session, case)
         return case
 
-    def send(self, case: BookingCase, when: datetime) -> None:
+    def send(self, case: BookingCase, when: datetime, settings: Settings | None = None) -> None:
         """The request drafted by the agent and sent by the person on duty."""
         with self.step(case, when, sent=False):
-            draft_case(self.session, case, RecordingMailer(), self.settings, now=when)
+            draft_case(self.session, case, RecordingMailer(), settings or self.settings, now=when)
             mark_sent(
                 self.session,
                 case,
@@ -282,8 +291,15 @@ def desk_profile(
     return record.key
 
 
+def linked(settings: Settings, base: str = LINK_BASE) -> Settings:
+    """The demo settings with click-to-confirm on."""
+    return settings.model_copy(
+        update={"booking_link_base_url": base, "booking_link_secret": SecretStr(LINK_SECRET)}
+    )
+
+
 def build(demo: Demo) -> int:
-    """Twenty-one cases, one per situation the board has to show."""
+    """Twenty-three cases, one per situation the board has to show."""
     s, d = demo.session, demo
     made = 0
 
@@ -644,6 +660,39 @@ def build(demo: Demo) -> int:
         )
     made += 1
 
+    # Click-to-confirm: the request carried one-click times and the vendor picked one.
+    with_links = linked(d.settings)
+    c = d.case(
+        22,
+        "Pinecrest Bakery",
+        "Lancaster, PA",
+        pickup=(2, "09:00"),
+        desk="shipping@pinecrest.example",
+    )
+    d.send(c, d.at(-1, "10:00"), with_links)
+    with d.step(c, d.ago(3)):
+        confirm(
+            s,
+            c.offers[-1],
+            2,
+            settings=with_links,
+            now=d.ago(3),
+            pickup_number="PB-3301",
+            name="Dock office",
+        )
+    made += 1
+
+    # A request with one-click times, still waiting for the vendor's click.
+    c = d.case(
+        23,
+        "Orchard Valley Juice",
+        "Hagerstown, MD",
+        pickup=(3, "13:00"),
+        desk="appointments@orchardvalley.example",
+    )
+    d.send(c, d.ago(2), with_links)
+    made += 1
+
     # The timers run as they would on the server: what went silent, what slipped.
     sweep(s, now=d.now, settings=d.settings)
 
@@ -668,9 +717,19 @@ def main() -> int:
             print(f"{args.db} already has {existing} cases; the demo only goes into an empty store")
             return 1
         made = build(Demo(session, settings, datetime.now(tz=UTC)))
+        waiting = session.scalar(select(BookingCase).where(BookingCase.load_id == 2_700_023))
+        link = (
+            offer_url(waiting.offers[-1], linked(settings)) if waiting and waiting.offers else None
+        )
     engine.dispose()
     print(f"{made} demo cases in {args.db}")
     print(f"run: facility-profiles serve --db {args.db}")
+    if link:
+        print(
+            "the vendor's link page needs the demo key at serve time: set "
+            f"FP_BOOKING_LINK_SECRET={LINK_SECRET} and FP_BOOKING_LINK_BASE_URL={LINK_BASE}"
+        )
+        print(f"waiting link (Orchard Valley Juice): {link}")
     return 0
 
 

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
 from string import Formatter
@@ -68,6 +68,8 @@ FIELDS: dict[str, str] = {
     "note": "the one line of context given with a reschedule, or empty",
     "carrier": "Circle's name as the carrier",
     "signature": "the pod's signature block",
+    "links": "one-click links to confirm a time (empty when links are off); a template without "
+    "it gets them after its PO lines",
 }
 _COMMON = frozenset(
     {
@@ -86,9 +88,9 @@ _COMMON = frozenset(
     }
 )
 KIND_FIELDS: dict[TemplateKind, frozenset[str]] = {
-    TemplateKind.REQUEST: _COMMON | {"lines", "ask"},
-    TemplateKind.BATCH_REQUEST: _COMMON | {"lines", "ask"},
-    TemplateKind.RESCHEDULE: _COMMON | {"line", "previous", "note"},
+    TemplateKind.REQUEST: _COMMON | {"lines", "ask", "links"},
+    TemplateKind.BATCH_REQUEST: _COMMON | {"lines", "ask", "links"},
+    TemplateKind.RESCHEDULE: _COMMON | {"line", "previous", "note", "links"},
     TemplateKind.FOLLOW_UP: _COMMON,
     TemplateKind.CHECK_BACK: _COMMON,
 }
@@ -100,7 +102,9 @@ REQUIRED: dict[TemplateKind, frozenset[str]] = {
 }
 # Only a request starts a thread; everything else answers in it, under the thread's subject.
 HAS_SUBJECT = frozenset({TemplateKind.REQUEST, TemplateKind.BATCH_REQUEST})
-_REQUEST_BODY = "Hello,\n\n{ask}\n\n{lines}\n\nThank you!\n\n{signature}"
+# {links} is empty unless click-to-confirm is on; the blank lines around it then collapse, so the
+# email is the pod's wording exactly.
+_REQUEST_BODY = "Hello,\n\n{ask}\n\n{lines}\n\n{links}\n\nThank you!\n\n{signature}"
 
 
 @dataclass(frozen=True)
@@ -124,7 +128,8 @@ BUILT_IN: dict[TemplateKind, Template] = {
     TemplateKind.RESCHEDULE: Template(
         TemplateKind.RESCHEDULE,
         None,
-        "Hello,\n\n{note}\n\nCan we please reschedule {line}?\n\nThank you!\n\n{signature}",
+        "Hello,\n\n{note}\n\nCan we please reschedule {line}?\n\n{links}\n\n"
+        "Thank you!\n\n{signature}",
         "built-in",
     ),
     TemplateKind.FOLLOW_UP: Template(
@@ -213,9 +218,13 @@ def case_values(
 
 
 def request_values(
-    cases: Sequence[BookingCase], settings: Settings, profile: VendorProfile | None
+    cases: Sequence[BookingCase],
+    settings: Settings,
+    profile: VendorProfile | None,
+    *,
+    links: str = "",
 ) -> dict[str, str]:
-    """The fields of a request: the PO lines and the ask, on top of the common ones."""
+    """The fields of a request: the PO lines, the ask and any links, on top of the common ones."""
     first = cases[0]
     date_only = bool(profile and profile.date_only)
     ask = (
@@ -229,7 +238,12 @@ def request_values(
         for c in cases
         for line in request_lines(c, date_only=date_only, extra=extra_references(c, profile))
     ]
-    return {**case_values(cases, settings, profile), "lines": "\n".join(lines), "ask": ask}
+    return {
+        **case_values(cases, settings, profile),
+        "lines": "\n".join(lines),
+        "ask": ask,
+        "links": links,
+    }
 
 
 def reschedule_values(
@@ -239,6 +253,7 @@ def reschedule_values(
     *,
     previous: str | None,
     note: str | None,
+    links: str = "",
 ) -> dict[str, str]:
     """The fields of a reschedule: the line asked for again, the slot before, the note."""
     date_only = bool(profile and profile.date_only)
@@ -249,7 +264,27 @@ def reschedule_values(
         "line": line,
         "previous": f"{mmdd} @ {clock}" if previous and clock else (mmdd if previous else ""),
         "note": (note or "").strip(),
+        "links": links,
     }
+
+
+def with_links(template: Template) -> Template:
+    """A template without ``{links}`` carries them after the line with its PO lines.
+
+    Applied only when there are links to show, so a saved template written before they existed
+    reads exactly as it did while links are off.
+    """
+    body = template.body
+    if "{links}" in body:
+        return template
+    for anchor in ("{lines}", "{line}"):
+        at = body.find(anchor)
+        if at < 0:
+            continue
+        end = body.find("\n", at)
+        end = len(body) if end < 0 else end
+        return replace(template, body=f"{body[:end]}\n\n{{links}}{body[end:]}")
+    return template
 
 
 # ------------------------------------------------------------------ checking and rendering

@@ -941,6 +941,22 @@ function deskHistory(rows) {
     .join("; ");
 }
 
+// The times the latest request offered by link and what became of them:
+// "Thu 10/01 08:00, 09:00, 10:00 · picked Thu 10/01 10:00".
+const OFFER_STATES = {
+  open: "waiting for a click",
+  superseded: "replaced by a later request",
+  closed: "pickup settled",
+  expired: "link expired",
+};
+function offerText(offers) {
+  if (!offers || !offers.length) return null;
+  const o = offers[offers.length - 1];
+  const times = o.slots.map((s, i) => (i ? s.split(" ").slice(2).join(" ") || s : s)).join(", ");
+  const answer = o.answer ? (o.answer.startsWith("proposed") ? o.answer : `picked ${o.answer}`) : OFFER_STATES[o.state] || o.state;
+  return `${times} · ${answer}`;
+}
+
 function factsSection(d) {
   const delivery = [d.delivery_site, d.delivery_ref, d.delivery_at ? `${fmtInstant(d.delivery_at)} your time` : null]
     .filter(Boolean)
@@ -950,6 +966,7 @@ function factsSection(d) {
     ["Pickup", `${fmtSlot(d.pickup_local)} (${d.pickup_source}, vendor's time${d.timezone ? `, ${d.timezone}` : ""})`],
     ["Requested", d.requested_local ? fmtSlot(d.requested_local) : "-"],
     ["Confirmed", d.confirmed_local ? fmtSlot(d.confirmed_local) : "-"],
+    ...(offerText(d.offers) ? [["Offered by link", offerText(d.offers)]] : []),
     ["Pickup number", d.pickup_number || "-"],
     ["Numbers", numbersText(d.references, true)],
     ["Earlier numbers", numbersText(d.references, false)],

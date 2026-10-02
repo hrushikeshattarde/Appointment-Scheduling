@@ -448,6 +448,51 @@ facility-profiles booking template list
 facility-profiles booking template remove follow_up --desk cci@udfinc.com
 ```
 
+### Click-to-confirm links
+
+A request can carry the pickup times as one-click links, so a vendor clicks a time instead of
+writing a reply. It is off until two settings are set:
+
+```powershell
+$env:FP_BOOKING_LINK_BASE_URL = 'https://book.example.com'    # where the vendor pages are served
+$env:FP_BOOKING_LINK_SECRET = '<a long random string>'         # signs the links; keep it secret
+facility-profiles serve-links --port 8010                      # the vendor pages, and nothing else
+```
+
+With both set, each request (single, batched per desk, or a reschedule) offers the time asked for
+and the hours around it on the same day (`FP_BOOKING_LINK_OFFSETS_MINUTES`, default -60, 0, +60,
++120). A desk given dates only is offered the day asked for and the next two weekdays. Only times
+that still make the delivery and pass the desk's rules are offered. The text gets one line after
+the PO lines ("Or confirm a time with one click: <link>", one per PO in a batch). The HTML part
+shows each time as a button. A saved template without `{links}` gets the line after its PO lines;
+with links off, every email reads exactly as before.
+
+The link opens a page with the times, the vendor's optional pickup number and name, and "None of
+these work? Propose a time". Opening the page changes nothing, because mail scanners open every
+link. The vendor's second click, a POST, is what counts:
+
+- **A time picked** is recorded as the vendor's answer: an inbound "link" message, the
+  confirmation, and the pickup number as a vendor reference, with no model call. It is booked
+  straight away (`FP_BOOKING_LINK_AUTO_SCHEDULE`, on by default; off, it waits for "Approve" like
+  an emailed confirmation). The time is checked again on the click, so one too close to dispatch
+  a driver is refused.
+- **A time proposed** becomes the usual "vendor offered another time" to-do, with whether it
+  still makes the delivery.
+- A link is signed (HMAC, never guessable), expires after `FP_BOOKING_LINK_VALID_HOURS` (72) or
+  the last time offered, whichever comes first, and stops working once answered, once a later
+  request replaces it, or once the pickup is booked or canceled another way.
+- A draft nobody marked as sent is marked sent by the click: the vendor holds the link.
+
+`booking links ID` lists a case's offers, their links and what the vendor did; `booking template
+preview ID` shows where the link goes. The board shows "Offered by link" in the case and the
+click in the timeline. `serve-links` serves only `/c/...` and `/health`: no board, no API, no docs.
+Its responses are not cached, not indexed and not framed. `serve` also mounts `/c/...` for trying
+links on this machine.
+
+Going live needs the open decisions from the plan: a public HTTPS address for `serve-links` in
+front of the same store the agent uses (a shared database rather than a laptop's SQLite file), and
+the shared mailbox the requests go out from.
+
 ### One reply, several POs
 
 A batched request covers several cases with one email, and Morgan Foods answers it line by

@@ -14,7 +14,7 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -28,6 +28,13 @@ from facility_profiles.booking.classify import (
     ReplyContext,
     for_case,
     validate_classification,
+)
+from facility_profiles.booking.links import (
+    create_offer,
+    html_body,
+    link_lines,
+    links_enabled,
+    offer_url,
 )
 from facility_profiles.booking.mail import (
     InboundMessage,
@@ -44,6 +51,7 @@ from facility_profiles.booking.models import (
     CaseException,
     CaseStatus,
     ExceptionType,
+    SlotOffer,
 )
 from facility_profiles.booking.outbox import (
     check_send_gate,
@@ -83,6 +91,7 @@ from facility_profiles.booking.templates import (
     request_values,
     reschedule_values,
     short_vendor,
+    with_links,
 )
 from facility_profiles.booking.timers import fmt_slot
 from facility_profiles.booking.worklist import (
@@ -497,16 +506,55 @@ def _check_requested_slot(
 # ------------------------------------------------------------------ compose and draft
 
 
+def _offers(
+    session: Session,
+    cases: list[BookingCase],
+    settings: Settings,
+    profile: VendorProfile | None,
+    *,
+    now: datetime,
+) -> dict[int, SlotOffer]:
+    """The one-click times each case's request offers, by case id; none while links are off."""
+    if not links_enabled(settings):
+        return {}
+    found: dict[int, SlotOffer] = {}
+    for case in cases:
+        offer = create_offer(session, case, settings, profile, now=now)
+        if offer is not None:
+            found[case.id] = offer
+    return found
+
+
+def _with_links(
+    template: Template,
+    cases: list[BookingCase],
+    offers: dict[int, SlotOffer] | None,
+    settings: Settings,
+) -> tuple[Template, str, dict[str, SlotOffer]]:
+    """The template to use, the {links} text, and each link's offer by URL."""
+    if not offers:
+        return template, "", {}
+    urls = {case_id: offer_url(offer, settings) for case_id, offer in offers.items()}
+    by_url = {urls[case_id]: offers[case_id] for case_id in urls}
+    return with_links(template), link_lines(cases, urls), by_url
+
+
 def compose_request(
     case: BookingCase,
     settings: Settings,
     profile: VendorProfile | None = None,
     template: Template | None = None,
+    offers: dict[int, SlotOffer] | None = None,
 ) -> OutboundDraft:
-    """The request email: the built-in template is the pod's own wording, word for word."""
-    subject, body = render(
-        template or BUILT_IN[TemplateKind.REQUEST], request_values([case], settings, profile)
+    """The request email: the built-in template is the pod's own wording, word for word.
+
+    With ``offers`` (click-to-confirm on) the email also carries the links to the times offered,
+    and an HTML part where they are buttons.
+    """
+    chosen, links, by_url = _with_links(
+        template or BUILT_IN[TemplateKind.REQUEST], [case], offers, settings
     )
+    subject, body = render(chosen, request_values([case], settings, profile, links=links))
     customer = customer_of(case, settings)
     return OutboundDraft(
         to_addr=case.contact_email or "",
@@ -514,6 +562,7 @@ def compose_request(
         subject=subject or "",
         body=body,
         from_addr=customer.sender,
+        html=html_body(body, by_url) if by_url else None,
     )
 
 
@@ -535,7 +584,8 @@ def draft_case(
     refused either way: a same-day ask needs a person.
     """
     profile = vendor_profile(Repository(session), case.facility_key) if case.facility_key else None
-    _check_draftable(case, settings, now=now or datetime.now(tz=UTC), profile=profile)
+    now = now or datetime.now(tz=UTC)
+    _check_draftable(case, settings, now=now, profile=profile)
     template = pick(
         session, TemplateKind.REQUEST, desk=case.contact_email, customer=_names(case, settings)
     )
@@ -543,6 +593,9 @@ def draft_case(
     if is_sender(mailer):
         trusted = profile.contact_email if profile and profile.can_email else None
         check_send_gate(session, case, draft, settings, trusted_desk=trusted)
+    offers = _offers(session, [case], settings, profile, now=now)
+    if offers:
+        draft = compose_request(case, settings, profile, template, offers)
     message = BookingMessage(
         case_id=case.id,
         direction="out",
@@ -554,6 +607,8 @@ def draft_case(
     )
     case.messages.append(message)
     session.flush()
+    for offer in offers.values():
+        offer.message_id = message.id
     result = dispatch(session, case, message, mailer, draft, actor=by)
     case.status = CaseStatus.PENDING.value if result.sent else CaseStatus.UNSCHEDULED.value
     case.reason = None
@@ -566,6 +621,7 @@ def draft_case(
         to=draft.to_addr,
         subject=draft.subject,
         template=template.source,
+        offered=offers[case.id].slots if offers else None,
     )
     return message
 
@@ -697,6 +753,7 @@ def reschedule_case(
     requested_local: str,
     by: str,
     note: str | None = None,
+    now: datetime | None = None,
 ) -> BookingMessage:
     """Ask the vendor for a new slot in the same thread (a Circle-side miss, most often).
 
@@ -740,11 +797,16 @@ def reschedule_case(
         from_addr=customer.sender,
     )
     if is_sender(mailer):
-        profile = (
-            vendor_profile(Repository(session), case.facility_key) if case.facility_key else None
-        )
         trusted = profile.contact_email if profile and profile.can_email else None
         check_send_gate(session, case, draft, settings, trusted_desk=trusted)
+    offers = _offers(session, [case], settings, profile, now=now or datetime.now(tz=UTC))
+    if offers:
+        chosen, links, by_url = _with_links(template, [case], offers, settings)
+        values = reschedule_values(
+            case, settings, profile, previous=previous, note=note, links=links
+        )
+        _, body = render(chosen, values)
+        draft = replace(draft, body=body, html=html_body(body, by_url))
     message = BookingMessage(
         case_id=case.id,
         direction="out",
@@ -757,6 +819,8 @@ def reschedule_case(
     )
     case.messages.append(message)
     session.flush()
+    for offer in offers.values():
+        offer.message_id = message.id
     result = dispatch(session, case, message, mailer, draft, actor=by)
     case.status = CaseStatus.PENDING.value
     case.reason = None
@@ -1473,6 +1537,7 @@ def _apply_customer_desk_message(
             requested_local=new_request,
             by="agent",
             note="Due to the receiver's availability, we will need to move this pickup.",
+            now=now,
         )
     else:
         # Nothing has gone out yet: the next request simply asks for the new day. A missing
@@ -1540,6 +1605,11 @@ def draft_batch(
             trusted = profile.contact_email if profile and profile.can_email else None
             for case in group:
                 check_send_gate(session, case, draft, settings, trusted_desk=trusted)
+        offers = _offers(session, group, settings, profile, now=now)
+        if offers:
+            chosen, links, by_url = _with_links(template, group, offers, settings)
+            _, body = render(chosen, request_values(group, settings, profile, links=links))
+            draft = replace(draft, body=body, html=html_body(body, by_url))
         result = deliver(mailer, draft)
         for case in group:
             message = BookingMessage(
@@ -1553,6 +1623,8 @@ def draft_batch(
             )
             case.messages.append(message)
             session.flush()
+            if case.id in offers:
+                offers[case.id].message_id = message.id
             record_delivery(session, case, message, draft, result, actor=by)
             case.status = CaseStatus.PENDING.value if result.sent else CaseStatus.UNSCHEDULED.value
             case.reason = None

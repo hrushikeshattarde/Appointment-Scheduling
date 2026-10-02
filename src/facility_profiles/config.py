@@ -125,6 +125,19 @@ class Settings(BaseSettings):
     )
     # The pod's own time zone: what "today" means in the daily summary (Fort Wayne).
     booking_timezone: str = "America/Indiana/Indianapolis"
+    # Click-to-confirm (booking/links.py). Off until both are set: the public address the
+    # vendor pages are served from, and the key the links are signed with.
+    booking_link_base_url: str | None = None
+    booking_link_secret: SecretStr | None = None
+    # The times offered around the one asked for, in minutes (all within the two-hour window
+    # a confirmation may move without being raised).
+    booking_link_offsets_minutes: Annotated[list[int], NoDecode] = Field(
+        default_factory=lambda: [-60, 0, 60, 120]
+    )
+    booking_link_valid_hours: int = Field(72, gt=0)  # and never past the last time offered
+    # A time the vendor picked is booked straight away; off, it waits for approval like an
+    # emailed confirmation.
+    booking_link_auto_schedule: bool = True
 
     # --- Group-mail archive in S3 (Pick Up Appointment threads) ---------------------------
     mail_archive_bucket: str | None = None
@@ -140,7 +153,22 @@ class Settings(BaseSettings):
     def _strip_trailing_slash(cls, value: str) -> str:
         return value.strip().rstrip("/")
 
-    @field_validator("pilot_terminal_ids", "pilot_customer_ids", mode="before")
+    @field_validator("booking_link_base_url")
+    @classmethod
+    def _public_https(cls, value: str | None) -> str | None:
+        """Vendor links must be HTTPS, except on this machine for testing."""
+        if value is None or not value.strip():
+            return None
+        url = value.strip().rstrip("/")
+        local = url.startswith(("http://127.0.0.1", "http://localhost"))
+        if not url.startswith("https://") and not local:
+            msg = "FP_BOOKING_LINK_BASE_URL must start with https:// (http only for localhost)"
+            raise ValueError(msg)
+        return url
+
+    @field_validator(
+        "pilot_terminal_ids", "pilot_customer_ids", "booking_link_offsets_minutes", mode="before"
+    )
     @classmethod
     def _split_int_ids(cls, value: object) -> list[int]:
         if value is None or value == "":

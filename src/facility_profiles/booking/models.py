@@ -111,6 +111,9 @@ class BookingCase(Base):
     references: Mapped[list[BookingReference]] = relationship(
         back_populates="case", cascade="all", order_by="BookingReference.id"
     )
+    offers: Mapped[list[SlotOffer]] = relationship(
+        back_populates="case", cascade="all", order_by="SlotOffer.id"
+    )
 
     @property
     def open_exceptions(self) -> list[CaseException]:
@@ -213,6 +216,31 @@ class BookingReference(Base):
     replaced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     case: Mapped[BookingCase] = relationship(back_populates="references")
+
+
+class SlotOffer(Base):
+    """The pickup times one request offered as one-click links (``booking/links.py``).
+
+    ``slots`` are vendor-local, "YYYY-MM-DD HH:MM" (or "YYYY-MM-DD" for a desk given dates
+    only). An offer is answered once (a time chosen, or ``proposed`` with the vendor's own in
+    ``answer_detail``), superseded when a later request offers new times, and dead after
+    ``expires_at``.
+    """
+
+    __tablename__ = "booking_slot_offers"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    case_id: Mapped[int] = mapped_column(ForeignKey("booking_cases.id"), index=True)
+    message_id: Mapped[int | None] = mapped_column(Integer)  # the request it went out in
+    slots: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    answer: Mapped[str | None] = mapped_column(String(32))
+    answer_detail: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+    case: Mapped[BookingCase] = relationship(back_populates="offers")
 
 
 class BookingTemplate(Base):

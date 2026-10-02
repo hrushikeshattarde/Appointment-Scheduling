@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from facility_profiles import __version__
 from facility_profiles.api import booking as booking_api
+from facility_profiles.api import links as links_api
 from facility_profiles.booking.timers import sweep
 from facility_profiles.config import Settings, get_settings
 from facility_profiles.logging import get_logger
@@ -98,6 +99,9 @@ def create_app(settings: Settings | None = None, *, timers_every: float | None =
     app.state.sessions = sessions
     app.state.settings = settings
     app.include_router(booking_api.router)
+    # The vendor pages too, for trying links on this machine; in public they run on their own
+    # (links_api.create_links_app), never with the board.
+    app.include_router(links_api.router)
     app.mount("/app", StaticFiles(directory=BOARD, html=True), name="board")
 
     @app.get("/", include_in_schema=False)
