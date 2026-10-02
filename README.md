@@ -123,7 +123,8 @@ Lidl store deliveries are tours planned by Lidl (nothing to book), so the bookab
 
 `facility-profiles booking ...` books vendor pickup appointments by email for customer-tendered
 inbound loads (built for the Lidl inbound pod). It never sends mail and never writes to
-Transport Pro: a person sends each draft and approves each confirmation.
+Transport Pro: a person sends each draft and approves each confirmation. To try it without
+touching real data, follow [TESTING.md](TESTING.md).
 
 ```powershell
 $env:FP_DATABASE_URL = 'sqlite:///./data/facility_profiles_pod-1089-lidl.db'
@@ -514,6 +515,9 @@ uv run pre-commit install
 
 Tests use synthetic Transport Pro payloads (`tests/conftest.py`), an in-memory SQLite store, a
 fake API client and a scripted extractor; the client is tested against mocked HTTP with respx.
+
+[TESTING.md](TESTING.md) walks through testing the booking agent by hand: the automated tests,
+the board on a demo store, the commands, and a pod's real cases on a copy of its store.
 
 ## Known gaps and next steps
 
