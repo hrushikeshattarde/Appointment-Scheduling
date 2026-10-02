@@ -367,6 +367,41 @@ a person too, at scan time and again at draft or send time, because a same-day a
 call. The inbound desk's delivery slots are read in every wording seen so far, including the
 two-line "9/30 at 1100" then "PYE_300926723".
 
+### Choosing the pickup time
+
+When the scan opens a case, `booking/recommend.py` chooses the time to ask for and keeps each step:
+
+1. **The day**: the tendered pickup date, else back from the delivery by the transit days. A
+   backed-off day that has already passed moves up to the earliest pickup a driver can still make.
+2. **The PO-date floor**: a desk in `FP_BOOKING_PO_DATE_FLOOR_DESKS` is never asked for a day
+   before the date inside the customer's PO.
+3. **The time**: the tendered time, else the time the facility usually gives, else
+   `FP_BOOKING_DEFAULT_PICKUP_TIME` (09:00). "Usually" means at least 3 of its confirmed
+   appointments, and at least half of them, were at one time. They come from Transport Pro's
+   confirmed stops in the harvest and the agent's own bookings. Tendered times are not evidence.
+4. **The hours**: with the facility's hours on its profile (`receiving_hours`), a time outside
+   them moves to the next opening, or to an hour before closing.
+5. **The delivery**: a time that would arrive after the delivery slot (miles at
+   `FP_BOOKING_AVG_MPH`, plus `FP_BOOKING_LOAD_HOURS`) moves earlier the same day, to the latest
+   that still makes it. It never moves before the facility opens, or, without hours, before
+   `FP_BOOKING_EARLIEST_PICKUP_TIME` (05:00).
+
+When no time that day makes the delivery, the case gets **"Cannot make the delivery"**. The to-do
+says when the pickup would arrive and the latest pickup that would have made it. It blocks the
+request until a person asks the customer to move the delivery, or the vendor for an earlier pickup.
+A delivery the customer's desk moves is planned the same way, without the old tender; a new slot
+that works clears the to-do.
+
+The board shows **"Why this time"** for each case. A move other than the plain tender is recorded
+as a "Pickup time chosen" event (the PO floor keeps its own event). `booking recommend ID` shows
+what the agent would ask for now, step by step, and the facility's usual time, without changing
+anything. The notice window, the desk's cut-off and how far ahead it books are checked after this,
+as before.
+
+On the 2026-10-02 stores: all seven Lidl cases ask for exactly what they did before. Lidl's vendor
+stops in Transport Pro carry tendered times only, and no vendor has hours on file. On pod 1160, 62
+facilities have confirmed pickup times and 9 have a usual one (Citrojugo 14:00, 16 of 23).
+
 ### Desk rules
 
 A vendor profile also carries the rules its booking desk stated, filed by a person (`profile

@@ -98,6 +98,8 @@ class Settings(BaseSettings):
     booking_send_daily_cap: int = Field(20, gt=0)  # outbound sends per rolling 24 hours
     booking_days_ahead: int = Field(7, gt=0)
     booking_default_pickup_time: str = "09:00"
+    # Without the facility's hours, a pickup is never moved earlier than this (no 00:30 asks).
+    booking_earliest_pickup_time: str = "05:00"
     booking_transit_miles_per_day: int = Field(550, gt=0)
     # Sender, cc, signature and customer desk for a customer that has no customer file. A
     # customer file (src/facility_profiles/customers/*.toml) sets its own; these never reach

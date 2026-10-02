@@ -1,9 +1,9 @@
 # Testing the booking agent
 
 How to check the six Phase 1 steps (statuses and to-dos, timers and the daily summary, desk
-rules, desk memory, email templates, reference numbers) and Phase 2's click-to-confirm links.
-There are three layers, quickest first. Everything here runs on throwaway stores: nothing reaches a vendor, the customer or
-Transport Pro.
+rules, desk memory, email templates, reference numbers) and Phase 2's click-to-confirm links and
+pickup-time choice. There are three layers, quickest first. Everything here runs on throwaway
+stores: nothing reaches a vendor, the customer or Transport Pro.
 
 ## Before you start
 
@@ -30,7 +30,7 @@ file: its own cc, sender, signature, desk and delivery references, and nothing o
 
 ## 2. The board with demo data (about 15 minutes)
 
-Build a demo store: 23 invented pickups, one per situation, on `.example` addresses. The seeder
+Build a demo store: 24 invented pickups, one per situation, on `.example` addresses. The seeder
 refuses a store that already has cases; delete the file to start again.
 
 ```powershell
@@ -61,6 +61,8 @@ recorded under it). Then check:
 | 6. Search | Appointments, search box | `44710` finds case 1 |
 | 7. Click-to-confirm | Case 22 Pinecrest Bakery | "Offered by link": four times, "picked" one; stage "Vendor picked ... from the link" |
 | 7. Click-to-confirm | Case 23 Orchard Valley Juice | "Offered by link: ... waiting for a click" |
+| 8. Pickup time | Case 24 Coastal Citrus Packers | "Cannot make the delivery", with the latest pickup that would have |
+| 8. Pickup time | Any case, "Why this time" | Why the time asked for was chosen (the tender, the PO date, the facility's usual time) |
 
 To click as the vendor (case 23), the board must know the demo signing key. Stop it, start it
 again like this, and open the "waiting link" the seeder printed:
@@ -124,6 +126,8 @@ Then, prefixed with `.\.venv\Scripts\facility-profiles.exe` as before:
   (the built-in template is the pod's wording word for word).
 - `booking find 20463798`: the Morgan Foods case.
 - `booking today`: the daily summary for the Lidl pod (`--customer lidl` gives the same here).
+- `booking recommend 1`: the time the agent would ask for now and each step that chose it; on
+  the 2026-10-02 copy every Lidl case asks for the tendered time, as before.
 - `customers show lidl --sample "10/6 730AM - PYE_061026919"`: what the agent reads from Lidl's
   customer file (no store needed); `customers list` shows every customer file.
 - The board on the copy, on a second port:

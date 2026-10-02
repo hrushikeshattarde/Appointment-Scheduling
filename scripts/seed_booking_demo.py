@@ -53,6 +53,7 @@ from facility_profiles.booking.service import (
     ingest,
     mark_booked,
     mark_sent,
+    plan_request,
 )
 from facility_profiles.booking.timers import sweep
 from facility_profiles.booking.worklist import flag, method_exception
@@ -299,7 +300,7 @@ def linked(settings: Settings, base: str = LINK_BASE) -> Settings:
 
 
 def build(demo: Demo) -> int:
-    """Twenty-three cases, one per situation the board has to show."""
+    """Twenty-four cases, one per situation the board has to show."""
     s, d = demo.session, demo
     made = 0
 
@@ -691,6 +692,19 @@ def build(demo: Demo) -> int:
         desk="appointments@orchardvalley.example",
     )
     d.send(c, d.ago(2), with_links)
+    made += 1
+
+    # A long haul no pickup time can get to the customer's dock in time.
+    c = d.case(
+        24,
+        "Coastal Citrus Packers",
+        "Vero Beach, FL",
+        pickup=(2, "09:00"),
+        desk="loads@coastalcitrus.example",
+    )
+    with d.step(c, c.created_at):
+        c.miles = 1450
+        plan_request(s, c, d.settings, now=c.created_at)
     made += 1
 
     # The timers run as they would on the server: what went silent, what slipped.

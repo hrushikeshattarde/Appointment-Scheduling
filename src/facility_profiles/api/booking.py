@@ -78,6 +78,7 @@ EVENTS: dict[str, str] = {
     "reference_added": "Reference added",
     "desk_remembered": "Desk remembered",
     "desk_learned": "Desk on file now",
+    "time_recommended": "Pickup time chosen",
     "confirmed_by_link": "Vendor picked a time from the link",
     "proposed_by_link": "Vendor proposed a time from the link",
 }
@@ -231,6 +232,20 @@ def timeline(case: BookingCase) -> list[dict[str, Any]]:
     return sorted(rows, key=lambda r: r["at"] or "")
 
 
+def requested_why(case: BookingCase) -> str | None:
+    """Why the case asks for the time it does, from the latest event that set it."""
+    for event in reversed(case.events):
+        detail = event.detail or {}
+        if event.action in ("time_recommended", "po_date_floor") and detail.get("reason"):
+            return str(detail["reason"])
+        if event.action == "reschedule":
+            note = f": {detail['note']}" if detail.get("note") else ""
+            return f"asked again by {event.actor}{note}"
+    if not case.requested_local:
+        return None
+    return "the tendered pickup" if case.tendered_pickup_utc else "backed off the delivery slot"
+
+
 def offer_view(offer: SlotOffer, *, now: datetime) -> dict[str, Any]:
     """The times one request offered by link, and what became of them."""
     detail = offer.answer_detail or {}
@@ -269,6 +284,7 @@ def case_detail(
         "desk_history": [desk_view(d) for d in desks or []],
         **case_summary(case, now=now),
         "requested_local": case.requested_local,
+        "requested_why": requested_why(case),
         "confirmed_local": case.confirmed_local,
         "tendered_pickup_at": _iso(case.tendered_pickup_utc),
         "miles": case.miles,

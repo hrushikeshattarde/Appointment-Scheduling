@@ -30,6 +30,7 @@ SILENCE = frozenset(k.value for k in UNANSWERED)
 # a desk missing from a profile.
 URGENCY: tuple[str, ...] = (
     ExceptionType.PICKUP_EXPIRED.value,
+    ExceptionType.LOAD_INFEASIBLE.value,
     ExceptionType.UNANSWERED_48H.value,
     ExceptionType.CONFIRMATION_REVIEW.value,
     ExceptionType.CONFIRMED_OUTSIDE_WINDOW.value,

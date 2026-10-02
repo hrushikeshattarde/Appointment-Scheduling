@@ -15,7 +15,7 @@ import math
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -59,6 +59,12 @@ from facility_profiles.booking.outbox import (
     is_sender,
     record_delivery,
 )
+from facility_profiles.booking.recommend import (
+    Recommendation,
+    facility_history,
+    infeasible_note,
+    recommend_time,
+)
 from facility_profiles.booking.references import (
     ReferenceSource,
     active,
@@ -69,7 +75,6 @@ from facility_profiles.booking.references import (
 from facility_profiles.booking.respond import (
     Responder,
     local_dt,
-    offer_is_feasible,
 )
 from facility_profiles.booking.rules import (
     REFERENCE_LABELS,
@@ -90,7 +95,6 @@ from facility_profiles.booking.templates import (
     render,
     request_values,
     reschedule_values,
-    short_vendor,
     with_links,
 )
 from facility_profiles.booking.timers import fmt_slot
@@ -221,58 +225,6 @@ def requested_local(
     while day.weekday() >= 5:  # vendors ship Monday to Friday
         day -= timedelta(days=1)
     return f"{day:%Y-%m-%d} {settings.booking_default_pickup_time}"
-
-
-def pickup_floor(case: BookingCase, settings: Settings) -> date | None:
-    """The earliest day the desk will load, for desks that read the PO date as the pickup date.
-
-    Only for a customer whose PO numbers carry a date (its file's ``[numbers] po_date``).
-    """
-    desk = (case.contact_email or "").lower()
-    if desk not in {d.lower() for d in settings.booking_po_date_floor_desks}:
-        return None
-    customer = customer_of(case, settings)
-    tz = ZoneInfo(case.vendor_timezone or "America/New_York")
-    anchor = as_utc(case.delivery_at_utc) or as_utc(case.tendered_pickup_utc)
-    near = (anchor or datetime.now(tz=UTC)).astimezone(tz).date()
-    found = [
-        d for d in (customer.po_embedded_date(str(p), near=near) for p in case.po_numbers) if d
-    ]
-    return max(found) if found else None
-
-
-def floor_requested(
-    case: BookingCase, requested: str | None, settings: Settings, *, now: datetime
-) -> tuple[str | None, str | None, bool]:
-    """Apply the desk's PO-date floor to a requested slot.
-
-    Returns the slot to use, why it moved (or None), and whether that slot can still make the
-    customer's delivery. A weekend floor rolls forward to Monday.
-    """
-    floor = pickup_floor(case, settings)
-    if floor is None or not requested:
-        return requested, None, True
-    day_text, _, clock = requested.partition(" ")
-    try:
-        day = date.fromisoformat(day_text)
-    except ValueError:
-        return requested, None, True
-    if day >= floor:
-        return requested, None, True
-    target = floor
-    while target.weekday() >= 5:
-        target += timedelta(days=1)
-    moved = f"{target:%Y-%m-%d} {clock}".strip()
-    feasible, verdict = offer_is_feasible(
-        case, local_dt(f"{target:%Y-%m-%d}", clock or None, case.vendor_timezone), settings, now=now
-    )
-    why = (
-        f"moved from {requested} to {moved}: {short_vendor(case.vendor_name)} reads the PO date "
-        f"{floor:%m/%d} as the earliest pickup"
-    )
-    if not feasible:
-        why += f"; that {verdict}"
-    return moved, why, feasible
 
 
 def parse_delivery_slot(
@@ -466,6 +418,8 @@ def scan(
                 status=case.status,
                 reason=case.reason or (blocker[1] if blocker else None),
             )
+            if case.status == CaseStatus.UNSCHEDULED.value:
+                plan_request(session, case, settings, now=now, profile=profile)
             _check_requested_slot(session, case, settings, now=now, profile=profile)
             stats.created += 1
             stats.case_ids.append(case.id)
@@ -476,6 +430,74 @@ def scan(
     return stats
 
 
+def _recommend(
+    session: Session,
+    case: BookingCase,
+    settings: Settings,
+    profile: VendorProfile | None,
+    *,
+    now: datetime,
+    use_tender: bool = True,
+) -> Recommendation:
+    """The time to ask for, from the case, the desk and the facility's history."""
+    history = facility_history(session, case.facility_key)
+    return recommend_time(case, settings, profile, now=now, history=history, use_tender=use_tender)
+
+
+def _apply_recommendation(session: Session, case: BookingCase, rec: Recommendation) -> None:
+    """Ask for the recommended time, say why when it moved, and raise a load that cannot make it.
+
+    A PO-date floor is recorded as ``po_date_floor``, every other move as ``time_recommended``;
+    a time that is simply the tender (or the default) records nothing.
+    """
+    if rec.local is None:
+        return
+    case.requested_local = rec.local
+    for step in rec.moved:
+        if step.rule == "floor":
+            reason = step.note if rec.feasible else f"{step.note}; {rec.verdict}"
+            _event(session, case, "po_date_floor", reason=reason, feasible=rec.feasible)
+    others = [s for s in rec.moved if s.rule != "floor"]
+    if others:
+        _event(
+            session,
+            case,
+            "time_recommended",
+            local=rec.local,
+            reason="; ".join(s.note for s in others),
+            steps=[s.as_dict() for s in rec.steps],
+        )
+    if not rec.feasible:
+        flag(
+            session,
+            case,
+            ExceptionType.LOAD_INFEASIBLE,
+            infeasible_note(rec),
+            requested=rec.local,
+            latest=rec.latest,
+            steps=[s.as_dict() for s in rec.steps],
+        )
+
+
+def plan_request(
+    session: Session,
+    case: BookingCase,
+    settings: Settings,
+    *,
+    now: datetime,
+    profile: VendorProfile | None = None,
+) -> Recommendation:
+    """Choose the time an unscheduled case asks for, and raise it when no time makes the delivery.
+
+    What the scan does for every new case; see ``booking/recommend.py`` for the rules.
+    """
+    if profile is None and case.facility_key:
+        profile = vendor_profile(Repository(session), case.facility_key)
+    rec = _recommend(session, case, settings, profile, now=now)
+    _apply_recommendation(session, case, rec)
+    return rec
+
+
 def _check_requested_slot(
     session: Session,
     case: BookingCase,
@@ -484,22 +506,15 @@ def _check_requested_slot(
     now: datetime,
     profile: VendorProfile | None = None,
 ) -> None:
-    """Apply the PO-date floor, the notice window and the desk's rules to a freshly scanned case.
+    """Apply the notice window and the desk's rules to a freshly scanned case.
 
-    Only a case the agent could email is affected. A floor that still makes the delivery just
-    moves the ask; one that does not, a slot already inside the notice window or past the desk's
-    cut-off, or a number the desk needs that the load lacks, is raised for a person before any
-    email is written. A desk that does not book that far ahead yet makes the request wait.
+    Only a case the agent could email is affected, and only once the time asked for can make the
+    delivery (``_apply_recommendation``). A slot already inside the notice window or past the
+    desk's cut-off, or a number the desk needs that the load lacks, is raised for a person before
+    any email is written. A desk that does not book that far ahead yet makes the request wait.
     """
     if case.status != CaseStatus.UNSCHEDULED.value or case.open_exceptions:
         return
-    moved, why, feasible = floor_requested(case, case.requested_local, settings, now=now)
-    if why:
-        case.requested_local = moved
-        _event(session, case, "po_date_floor", reason=why, feasible=feasible)
-        if not feasible:
-            flag(session, case, ExceptionType.SLOT_UNWORKABLE, why, requested=moved)
-            return
     check_desk_rules(session, case, settings, now=now, profile=profile)
 
 
@@ -1503,32 +1518,20 @@ def _apply_customer_desk_message(
             delivery_at=start.isoformat(),
         )
         return True
-    new_request = requested_local(
-        tendered_pickup_utc=None,
-        delivery_at_utc=start,
-        timezone=case.vendor_timezone,
-        miles=case.miles,
-        settings=settings,
-    )
+    # The tender was for the old delivery: the new ask is backed off the new one.
+    profile = vendor_profile(Repository(session), case.facility_key) if case.facility_key else None
+    now = responder.now if responder is not None and responder.now else datetime.now(tz=UTC)
+    rec = _recommend(session, case, settings, profile, now=now, use_tender=False)
+    new_request = rec.local
     if new_request is None:
         return True
-    now = responder.now if responder is not None and responder.now else datetime.now(tz=UTC)
-    floored, why, feasible = floor_requested(case, new_request, settings, now=now)
-    new_request = floored or new_request
-    if why:
-        _event(session, case, "po_date_floor", reason=why, feasible=feasible)
-    if not feasible:
-        case.requested_local = new_request
-        flag(
-            session,
-            case,
-            ExceptionType.SLOT_UNWORKABLE,
-            why or f"delivery moved to {ref}; the pickup cannot be re-requested",
-            requested=new_request,
-            delivery_ref=ref,
-        )
+    if not rec.feasible:
+        _apply_recommendation(session, case, rec)
         return True
     if case.status != CaseStatus.UNSCHEDULED.value and responder is not None:
+        for step in rec.moved:
+            if step.rule == "floor":
+                _event(session, case, "po_date_floor", reason=step.note, feasible=True)
         reschedule_case(
             session,
             case,
@@ -1542,13 +1545,14 @@ def _apply_customer_desk_message(
     else:
         # Nothing has gone out yet: the next request simply asks for the new day. A missing
         # desk stays open; only what the old delivery made unworkable is cleared.
-        case.requested_local = new_request
+        _apply_recommendation(session, case, rec)
         case.reason = None
         resolve(
             session,
             case,
             [
                 ExceptionType.SLOT_UNWORKABLE,
+                ExceptionType.LOAD_INFEASIBLE,
                 ExceptionType.DELIVERY_MOVED,
                 ExceptionType.PICKUP_EXPIRED,
             ],

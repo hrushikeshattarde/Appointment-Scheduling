@@ -667,6 +667,7 @@ def test_draft_batch_writes_one_email_per_desk(settings, sessions):
     seed_vendor(sessions)
     loads = [lidl_load(9201, po="104419082630"), lidl_load(9202, po="104421082660")]
     loads[1]["waypoints"][0]["appointmentTime"]["open"] = "2026-10-03T15:00:00Z"
+    loads[1]["waypoints"][1]["appointmentTime"]["open"] = "2026-10-05T13:30:00Z"  # after it
     client = FakeTPro(loads, {})
     scan(client, sessions, settings, days_ahead=7, now=NOW)  # type: ignore[arg-type]
     mailer = RecordingMailer()

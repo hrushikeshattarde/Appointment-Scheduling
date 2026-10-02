@@ -965,6 +965,7 @@ function factsSection(d) {
   const rows = [
     ["Pickup", `${fmtSlot(d.pickup_local)} (${d.pickup_source}, vendor's time${d.timezone ? `, ${d.timezone}` : ""})`],
     ["Requested", d.requested_local ? fmtSlot(d.requested_local) : "-"],
+    ["Why this time", d.requested_why || "-"],
     ["Confirmed", d.confirmed_local ? fmtSlot(d.confirmed_local) : "-"],
     ...(offerText(d.offers) ? [["Offered by link", offerText(d.offers)]] : []),
     ["Pickup number", d.pickup_number || "-"],

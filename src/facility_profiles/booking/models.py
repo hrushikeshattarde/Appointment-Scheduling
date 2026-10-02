@@ -47,6 +47,8 @@ class ExceptionType(StrEnum):
     UNANSWERED_24H = "unanswered_24h"  # no reply for 24 weekday hours after we wrote
     UNANSWERED_48H = "unanswered_48h"  # still no reply after 48 weekday hours
     PICKUP_EXPIRED = "pickup_expired"  # the pickup time passed and the case is not booked
+    # No pickup the desk would take that day gets the load to the delivery in time.
+    LOAD_INFEASIBLE = "load_infeasible"
     # The vendor confirmed a different day, or a time more than two hours from the one asked for.
     CONFIRMED_OUTSIDE_WINDOW = "confirmed_outside_window"
 

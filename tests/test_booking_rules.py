@@ -100,12 +100,18 @@ def test_po_date_after_the_delivery_hands_the_case_to_a_person(settings, session
     with session_scope(sessions) as session:
         case = list_cases(session)[0]
         assert case.status == CaseStatus.UNSCHEDULED.value
-        assert open_kinds(case) == ["slot_unworkable"]
+        assert open_kinds(case) == ["load_infeasible"]
         assert case.requested_local == "2026-10-07 09:00"
-        unworkable = case.open_exceptions[0]
-        assert "PO date 10/07" in unworkable.description
-        assert "delivery slot" in unworkable.description
-        assert unworkable.detail["requested"] == "2026-10-07 09:00"
+        infeasible = case.open_exceptions[0]
+        assert infeasible.description.startswith(
+            "cannot make the delivery: the PO date 10/07 is the earliest pickup; "
+            "a pickup Wed 10/07 09:00 arrives"
+        )
+        assert "after the delivery slot" in infeasible.description
+        assert infeasible.detail["requested"] == "2026-10-07 09:00"
+        assert infeasible.detail["latest"] is not None
+        floor = next(e for e in case.events if e.action == "po_date_floor")
+        assert floor.detail["feasible"] is False
 
 
 def test_other_desks_keep_the_tendered_day(settings, sessions):

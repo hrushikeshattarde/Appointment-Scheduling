@@ -1281,6 +1281,33 @@ def template_preview(
     typer.echo(text)
 
 
+@booking_app.command("recommend")
+def booking_recommend(case_id: int) -> None:
+    """Which pickup time the agent would ask for now, and why (nothing is changed)."""
+    from facility_profiles.booking.recommend import facility_history, recommend_time, usual_time
+    from facility_profiles.booking.rules import vendor_profile
+    from facility_profiles.booking.timers import fmt_slot
+
+    settings = _settings()
+    with session_scope(_sessions(settings)) as session:
+        case = _booking_case(session, case_id)
+        profile = (
+            vendor_profile(Repository(session), case.facility_key) if case.facility_key else None
+        )
+        history = facility_history(session, case.facility_key)
+        rec = recommend_time(case, settings, profile, now=datetime.now(tz=UTC), history=history)
+        usual = usual_time(history)
+        typer.echo(f"#{case_id} asks for {fmt_slot(case.requested_local)} now")
+        typer.echo(f"recommended: {fmt_slot(rec.local)}  ({rec.verdict})")
+        for step in rec.steps:
+            typer.echo(f"  {'*' if step.moved else '-'} {step.rule:<8} {step.note}")
+        if rec.latest:
+            typer.echo(f"  latest pickup that makes the delivery: {fmt_slot(rec.latest)}")
+        shown = f"{usual.clock} ({usual.count} of {usual.total})" if usual else "none yet"
+        typer.echo(f"facility history: {len(history)} confirmed time(s); usual {shown}")
+        session.rollback()
+
+
 @booking_app.command("links")
 def booking_links(case_id: int) -> None:
     """The times a case's requests offered by link, the links, and what the vendor did."""

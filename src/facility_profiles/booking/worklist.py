@@ -50,6 +50,11 @@ KINDS: dict[str, tuple[str, str]] = {
         "The desk will not book without this number. Get it from the customer and add it to "
         "the case; the request is drafted with it.",
     ),
+    "load_infeasible": (
+        "Cannot make the delivery",
+        "No pickup the desk would take gets the load there in time. Ask the customer to move the "
+        "delivery, or the vendor for an earlier pickup, then reschedule or mark it booked.",
+    ),
     "slot_unworkable": (
         "Slot will not work",
         "Pick a new pickup slot with the vendor, or ask the customer to move the delivery.",

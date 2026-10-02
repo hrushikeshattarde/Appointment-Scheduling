@@ -74,6 +74,8 @@ class VendorProfile:
     cutoff_time: str | None = None
     max_days_ahead: int | None = None
     required_refs: list[str] = field(default_factory=list)
+    # The facility's opening spans: [{"days": ["mon", ...], "open": "HH:MM", "close": "HH:MM"}].
+    hours: list[dict[str, Any]] | None = None
 
     @property
     def date_only(self) -> bool:
@@ -111,7 +113,16 @@ def vendor_profile(repo: Repository, key: str) -> VendorProfile:
         cutoff_time=trusted("cutoff_time"),
         max_days_ahead=trusted("max_days_ahead"),
         required_refs=list(trusted("required_refs") or []),
+        hours=_spans(trusted("receiving_hours")),
     )
+
+
+def _spans(value: Any) -> list[dict[str, Any]] | None:
+    """Opening spans as stored on the profile; free text or anything else is not used."""
+    if not isinstance(value, list):
+        return None
+    spans = [s for s in value if isinstance(s, dict) and s.get("days") and s.get("open")]
+    return spans or None
 
 
 # ------------------------------------------------------------------ references

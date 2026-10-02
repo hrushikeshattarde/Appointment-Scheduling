@@ -334,7 +334,7 @@ def test_the_demo_seeder_builds_every_situation_and_refuses_a_used_store(
     assert module.main() == 0
     out = capsys.readouterr().out
     assert (
-        "23 demo cases" in out
+        "24 demo cases" in out
         and "waiting link (Orchard Valley Juice): http://127.0.0.1:8000/c/" in out
     )
     engine = make_engine(db)
@@ -347,7 +347,7 @@ def test_the_demo_seeder_builds_every_situation_and_refuses_a_used_store(
     assert sorted(offers) == ["Orchard Valley Juice", "Pinecrest Bakery"]
     assert offers["Orchard Valley Juice"] is None and offers["Pinecrest Bakery"].endswith(" 10:00")
     assert statuses.count("scheduled") == 3 and statuses.count("declined") == 1
-    assert statuses.count("canceled") == 1 and len(statuses) == 23
+    assert statuses.count("canceled") == 1 and len(statuses) == 24
     assert kinds == sorted(
         [
             "confirmation_review",
@@ -356,6 +356,7 @@ def test_the_demo_seeder_builds_every_situation_and_refuses_a_used_store(
             "confirmed_outside_window",
             "facility_question",
             "facility_declined",
+            "load_infeasible",  # a 1,450-mile haul with a next-morning delivery
             "missing_method",
             "missing_reference",  # the desk needs the customer's shipment number
             "method_not_supported",
