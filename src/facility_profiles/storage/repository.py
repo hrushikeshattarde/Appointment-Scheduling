@@ -650,7 +650,9 @@ class Repository:
         stmt = select(AuditEntry).where(AuditEntry.facility_key == key)
         if field_name:
             stmt = stmt.where(AuditEntry.field_name == field_name)
-        return list(self.session.scalars(stmt.order_by(AuditEntry.created_at.desc()).limit(limit)))
+        # Entries written in the same clock tick (Windows: about 15 ms) keep their write order.
+        stmt = stmt.order_by(AuditEntry.created_at.desc(), AuditEntry.id.desc())
+        return list(self.session.scalars(stmt.limit(limit)))
 
     def action_counts(self, run_id: str) -> dict[str, int]:
         """Number of audit entries per action for a run."""
