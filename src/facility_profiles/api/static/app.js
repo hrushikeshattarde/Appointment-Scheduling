@@ -957,6 +957,14 @@ function offerText(offers) {
   return `${times} · ${answer}`;
 }
 
+// What the agent planned for the request on its own: "planned: rule 'vendor pickups': draft at
+// Thu 10/01 10:00", "waiting: waiting for the delivery slot".
+function jobText(jobs) {
+  const job = (jobs || []).filter((j) => j.kind === "request").pop();
+  if (!job) return null;
+  return `${job.status}${job.reason ? `: ${job.reason}` : ""}`;
+}
+
 function factsSection(d) {
   const delivery = [d.delivery_site, d.delivery_ref, d.delivery_at ? `${fmtInstant(d.delivery_at)} your time` : null]
     .filter(Boolean)
@@ -968,6 +976,7 @@ function factsSection(d) {
     ["Why this time", d.requested_why || "-"],
     ["Confirmed", d.confirmed_local ? fmtSlot(d.confirmed_local) : "-"],
     ...(offerText(d.offers) ? [["Offered by link", offerText(d.offers)]] : []),
+    ...(jobText(d.jobs) ? [["Automation", jobText(d.jobs)]] : []),
     ["Pickup number", d.pickup_number || "-"],
     ["Numbers", numbersText(d.references, true)],
     ["Earlier numbers", numbersText(d.references, false)],

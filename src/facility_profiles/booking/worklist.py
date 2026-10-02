@@ -50,6 +50,11 @@ KINDS: dict[str, tuple[str, str]] = {
         "The desk will not book without this number. Get it from the customer and add it to "
         "the case; the request is drafted with it.",
     ),
+    "automation_failed": (
+        "Automation failed",
+        "The agent could not write this request on its own. Read the error, fix what it names, "
+        "then draft it with booking draft or resolve this to let the agent try again.",
+    ),
     "load_infeasible": (
         "Cannot make the delivery",
         "No pickup the desk would take gets the load there in time. Ask the customer to move the "

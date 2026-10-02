@@ -99,7 +99,7 @@ def test_send_moves_the_case_to_sent_with_the_ids_a_reply_will_carry(settings, s
         assert message.thread_id == "thread-1" and case.thread_id == "thread-1"
         assert message.draft_ref == "gmail:sent-1"
         actions = [(e.action, e.actor) for e in case.events]
-        assert ("sent", "megan") in actions and ("drafted", "agent") in actions
+        assert ("sent", "megan") in actions and ("drafted", "megan") in actions
         with_ids = message.rfc_message_id
     assert with_ids and sender.drafts[0].to_addr == DESK
     assert "PO# 226321092660 on 10/01 @ 0900" in sender.drafts[0].body

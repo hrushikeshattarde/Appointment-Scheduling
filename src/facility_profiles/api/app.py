@@ -54,6 +54,42 @@ def run_timers(sessions: sessionmaker[Session], settings: Settings | None = None
         sweep(session, now=datetime.now(tz=UTC), settings=settings)
 
 
+def run_autopilot(sessions: sessionmaker[Session], settings: Settings) -> None:
+    """One pass of the agent on its own (booking/automation.py), drafting into the drafts folder.
+
+    It sends only where a rule says send, FP_BOOKING_MODE is send and a Gmail sender is set.
+    """
+    from facility_profiles.booking.automation import run_once  # noqa: PLC0415 - optional loop
+    from facility_profiles.booking.mail import GmailSender, LocalDraftMailer  # noqa: PLC0415
+
+    mailer = LocalDraftMailer(
+        Path(settings.booking_drafts_dir), sender=settings.booking_sender or ""
+    )
+    sender = None
+    if (
+        settings.booking_mode == "send"
+        and settings.booking_gmail_key
+        and settings.booking_gmail_user
+    ):
+        user = settings.booking_gmail_user
+        sender = GmailSender(Path(settings.booking_gmail_key), user, user)
+    with session_scope(sessions) as session:
+        report = run_once(session, settings, now=datetime.now(tz=UTC), mailer=mailer, sender=sender)
+    log.info("booking.autopilot", **report.counts())
+
+
+async def _autopilot_loop(
+    sessions: sessionmaker[Session], minutes: float, settings: Settings
+) -> None:
+    """Run the agent's pass now and then every ``minutes``; a failed pass is logged, not fatal."""
+    while True:
+        try:
+            await run_in_threadpool(run_autopilot, sessions, settings)
+        except Exception:  # keep the board serving; the next pass retries
+            log.exception("booking.autopilot_failed")
+        await asyncio.sleep(minutes * 60)
+
+
 async def _timer_loop(sessions: sessionmaker[Session], minutes: float, settings: Settings) -> None:
     """Run the timers now and then every ``minutes``; a failed pass is logged, not fatal."""
     while True:
@@ -64,8 +100,17 @@ async def _timer_loop(sessions: sessionmaker[Session], minutes: float, settings:
         await asyncio.sleep(minutes * 60)
 
 
-def create_app(settings: Settings | None = None, *, timers_every: float | None = None) -> FastAPI:
-    """Build the application; with ``timers_every`` (minutes) it also runs the booking timers."""
+def create_app(
+    settings: Settings | None = None,
+    *,
+    timers_every: float | None = None,
+    autopilot_every: float | None = None,
+) -> FastAPI:
+    """Build the application.
+
+    With ``timers_every`` (minutes) it also runs the booking timers; with ``autopilot_every``,
+    the agent's own pass by each customer's rules (off unless asked for).
+    """
     settings = settings or get_settings()
     engine = make_engine(settings.database_url)
     init_db(engine)
@@ -73,13 +118,13 @@ def create_app(settings: Settings | None = None, *, timers_every: float | None =
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        task = (
-            asyncio.create_task(_timer_loop(sessions, timers_every, settings))
-            if timers_every
-            else None
-        )
+        tasks = []
+        if timers_every:
+            tasks.append(asyncio.create_task(_timer_loop(sessions, timers_every, settings)))
+        if autopilot_every:
+            tasks.append(asyncio.create_task(_autopilot_loop(sessions, autopilot_every, settings)))
         yield
-        if task is not None:
+        for task in tasks:
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task

@@ -152,6 +152,7 @@ class ScanStats:
     no_pickup_stop: int = 0
     needs_profile: int = 0
     already_booked: int = 0
+    skipped_by_rule: int = 0  # a customer rule says the agent does not book these
     case_ids: list[int] = field(default_factory=list)
 
 
@@ -406,6 +407,9 @@ def scan(
                 miles=case.miles,
                 settings=settings,
             )
+            if customer.rule_for(case).do == "skip":
+                stats.skipped_by_rule += 1
+                continue
             session.add(case)
             session.flush()
             record_load_numbers(session, case, at=now)
@@ -419,7 +423,10 @@ def scan(
                 reason=case.reason or (blocker[1] if blocker else None),
             )
             if case.status == CaseStatus.UNSCHEDULED.value:
-                plan_request(session, case, settings, now=now, profile=profile)
+                from_tender = customer.rule_for(case).pickup_from != "delivery"
+                plan_request(
+                    session, case, settings, now=now, profile=profile, use_tender=from_tender
+                )
             _check_requested_slot(session, case, settings, now=now, profile=profile)
             stats.created += 1
             stats.case_ids.append(case.id)
@@ -486,14 +493,17 @@ def plan_request(
     *,
     now: datetime,
     profile: VendorProfile | None = None,
+    use_tender: bool = True,
 ) -> Recommendation:
     """Choose the time an unscheduled case asks for, and raise it when no time makes the delivery.
 
-    What the scan does for every new case; see ``booking/recommend.py`` for the rules.
+    What the scan does for every new case; see ``booking/recommend.py`` for the rules. Without
+    the tender (a rule that plans the pickup back from the delivery) the day is backed off the
+    delivery slot.
     """
     if profile is None and case.facility_key:
         profile = vendor_profile(Repository(session), case.facility_key)
-    rec = _recommend(session, case, settings, profile, now=now)
+    rec = _recommend(session, case, settings, profile, now=now, use_tender=use_tender)
     _apply_recommendation(session, case, rec)
     return rec
 
@@ -632,6 +642,7 @@ def draft_case(
         session,
         case,
         "drafted",
+        actor=by,
         draft_ref=result.ref,
         to=draft.to_addr,
         subject=draft.subject,
@@ -1637,6 +1648,7 @@ def draft_batch(
                 session,
                 case,
                 "drafted",
+                actor=by,
                 draft_ref=result.ref,
                 to=desk,
                 subject=subject,

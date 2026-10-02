@@ -1,8 +1,8 @@
 # Testing the booking agent
 
 How to check the six Phase 1 steps (statuses and to-dos, timers and the daily summary, desk
-rules, desk memory, email templates, reference numbers) and Phase 2's click-to-confirm links and
-pickup-time choice. There are three layers, quickest first. Everything here runs on throwaway
+rules, desk memory, email templates, reference numbers) and Phase 2's click-to-confirm links,
+pickup-time choice and rules engine. There are three layers, quickest first. Everything here runs on throwaway
 stores: nothing reaches a vendor, the customer or Transport Pro.
 
 ## Before you start
@@ -126,6 +126,9 @@ Then, prefixed with `.\.venv\Scripts\facility-profiles.exe` as before:
   (the built-in template is the pod's wording word for word).
 - `booking find 20463798`: the Morgan Foods case.
 - `booking today`: the daily summary for the Lidl pod (`--customer lidl` gives the same here).
+- `booking run --dry-run`: what the agent would do on its own by Lidl's rules, changing nothing;
+  on the 2026-10-02 copy it closes the five drafted cases' jobs and holds the PYE store pickup.
+  `booking jobs` lists nothing afterwards, because the dry run rolls back.
 - `booking recommend 1`: the time the agent would ask for now and each step that chose it; on
   the 2026-10-02 copy every Lidl case asks for the tendered time, as before.
 - `customers show lidl --sample "10/6 730AM - PYE_061026919"`: what the agent reads from Lidl's
@@ -144,6 +147,8 @@ The same works for pod 1160: copy `data/facility_profiles.db` the same way, then
   pays for model calls. Section 4 tests the same logic on a copy.
 - `profile portals --apply`, `scripts/seed_lidl_*.py` or any command without a test store: they
   write to the real stores.
+- `booking run` without `--dry-run`, or `serve --autopilot-every`, on a real store: they write
+  drafts (and send, in send mode) by the customers' rules.
 - `serve-links --host 0.0.0.0`, or setting `FP_BOOKING_LINK_*` in `.env`: drafts would then carry
   links, and the pages would be reachable from outside this machine. Keep the link variables to
   the one terminal that serves the demo.

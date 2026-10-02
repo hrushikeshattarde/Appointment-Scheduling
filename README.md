@@ -402,6 +402,52 @@ On the 2026-10-02 stores: all seven Lidl cases ask for exactly what they did bef
 stops in Transport Pro carry tendered times only, and no vendor has hours on file. On pod 1160, 62
 facilities have confirmed pickup times and 9 have a usual one (Citrojugo 14:00, 16 of 23).
 
+### The agent on its own: rules
+
+`booking run` (or `serve --autopilot-every 15`; off unless asked for) is one pass of the agent
+working by itself, by the rules in each customer's file:
+
+```toml
+[[rules]]
+name = "vendor pickups by email"
+when = { methods = ["email"] }      # also desks, vendors (name contains), facilities, customer_ids
+do = "draft"                        # draft | send | hold | skip
+wait_for = "delivery_slot"          # ask only once the load has its delivery slot and reference
+# lead_days = 2                     # ask this many business days before the pickup
+# batch_at = "10:00"                # write at this time of day, one email per desk
+# pickup_from = "delivery"          # plan the pickup back from the delivery, not the tender
+# follow_up = false                 # no automatic nudge to a silent desk
+```
+
+The first rule that covers a pickup decides; without one, the agent drafts it as soon as it can.
+`skip` opens no case at scan (`skipped_by_rule`). `hold` raises it for a person ("a person books
+this", with the rule's `why`) and writes nothing.
+
+Each pass:
+
+1. **Timers**: the timers run first.
+2. **Planning**: every unscheduled case without a request gets a request job (table
+   `booking_jobs`). The job is waiting (for the delivery slot), blocked (something on the case
+   needs a person), held, or planned for its time.
+3. **Writing**: the jobs that are due are written, one email per desk. Each desk's rules are
+   checked first, exactly as for `booking draft`; a desk that does not book that far ahead moves
+   the job to the day it opens. They are drafts for a person to send, or sent where a rule says
+   `send` and `FP_BOOKING_MODE` is send.
+4. **Failures**: a batch that fails leaves nothing behind. It is retried an hour later, and after
+   three tries raised as "Automation failed".
+5. **Follow-ups**: a sent request with no reply gets its one follow-up, unless the rule says not
+   to.
+
+A request drafted, a booking made or a case canceled by a person closes the job: the agent never
+redoes it. Lidl's rule drafts its email desks once the DCT slot is known; the batch hour and lead
+days are left for the pod to set.
+
+`booking run --dry-run` shows what a pass would do and changes nothing. `booking jobs [ID]` lists
+the jobs with their rule, status, due time and why. `customers show KEY` lists the rules. The
+board shows "Automation" in each case. On a copy of the 2026-10-02 Lidl store a pass closes the
+five drafted cases' jobs (already requested) and holds the PYE store pickup (no desk). It writes
+nothing.
+
 ### Desk rules
 
 A vendor profile also carries the rules its booking desk stated, filed by a person (`profile

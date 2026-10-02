@@ -28,7 +28,7 @@ PO_DATE_WINDOW_DAYS = 60
 
 # Every key a file may hold, by table ("" is the top level). Anything else is a typo.
 ALLOWED: dict[str, frozenset[str]] = {
-    "": frozenset({"name", "description", "timezone"}),
+    "": frozenset({"name", "description", "timezone", "rules"}),
     "transport_pro": frozenset(
         {"customer_ids", "customer_names", "terminal_ids", "booking_customer_ids"}
     ),
@@ -53,6 +53,92 @@ _SLOT_AFTER_REF = (
 
 class CustomerFileError(ValueError):
     """A customer file that cannot be used, with every problem found in it."""
+
+
+# What a rule can tell the agent to do with a pickup when it runs on its own
+# (booking/automation.py).
+RULE_ACTIONS = ("draft", "send", "hold", "skip")
+RULE_KEYS = frozenset(
+    {"name", "when", "do", "why", "lead_days", "batch_at", "wait_for", "pickup_from", "follow_up"}
+)
+WHEN_KEYS = frozenset({"methods", "desks", "vendors", "facilities", "customer_ids"})
+METHODS = frozenset({"email", "phone", "web_portal", "fcfs", "preset_by_customer", "unknown"})
+WAIT_FOR = frozenset({"delivery_slot"})
+PICKUP_FROM = frozenset({"tender", "delivery"})
+_CLOCK_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
+
+@dataclass(frozen=True)
+class Rule:
+    """Which pickups a rule covers, and what the agent does with them on its own.
+
+    ``do``: ``draft`` (a person sends), ``send`` (sent, in send mode), ``hold`` (a person books;
+    the agent writes nothing) or ``skip`` (not the agent's to book; no case is opened). Every
+    ``when`` list narrows the rule; an empty one does not. The timing:
+
+    - ``lead_days``: ask this many business days before the pickup, not sooner;
+    - ``batch_at``: write at this time of day (the pod's), one email per desk;
+    - ``wait_for = "delivery_slot"``: ask only once the delivery has its slot and reference;
+    - ``pickup_from = "delivery"``: plan the pickup back from the delivery, not the tender;
+    - ``follow_up``: nudge a silent desk on its own (default true).
+    """
+
+    name: str
+    do: str
+    why: str | None = None
+    methods: frozenset[str] = frozenset()
+    desks: frozenset[str] = frozenset()
+    vendors: tuple[str, ...] = ()  # lower-case; a vendor whose name contains one matches
+    facilities: frozenset[str] = frozenset()
+    customer_ids: frozenset[int] = frozenset()
+    lead_days: int | None = None
+    batch_at: str | None = None
+    wait_for: str | None = None
+    pickup_from: str = "tender"
+    follow_up: bool = True
+
+    def matches(self, case: Any) -> bool:
+        """True when the case is one this rule covers (a booking case, or one being opened)."""
+        method = getattr(case, "booking_method", None) or "unknown"
+        desk = (getattr(case, "contact_email", None) or "").lower()
+        vendor = (getattr(case, "vendor_name", None) or "").lower()
+        return (
+            (not self.methods or method in self.methods)
+            and (not self.desks or desk in self.desks)
+            and (not self.vendors or any(v in vendor for v in self.vendors))
+            and (not self.facilities or getattr(case, "facility_key", None) in self.facilities)
+            and (not self.customer_ids or getattr(case, "customer_id", None) in self.customer_ids)
+        )
+
+    def describe(self) -> str:
+        """The rule in one line, for ``customers show`` and the board."""
+        when = [
+            f"{label} {', '.join(sorted(map(str, values)))}"
+            for label, values in (
+                ("method", self.methods),
+                ("desk", self.desks),
+                ("vendor", self.vendors),
+                ("facility", self.facilities),
+                ("customer", self.customer_ids),
+            )
+            if values
+        ]
+        how = [
+            text
+            for text in (
+                f"{self.lead_days} business day(s) ahead" if self.lead_days is not None else None,
+                f"at {self.batch_at}" if self.batch_at else None,
+                "once the delivery has its slot" if self.wait_for == "delivery_slot" else None,
+                "planned back from the delivery" if self.pickup_from == "delivery" else None,
+                None if self.follow_up else "no follow-ups",
+            )
+            if text
+        ]
+        scope = "; ".join(when) or "every pickup"
+        return f"{self.name}: {scope} -> {self.do}" + (f" ({', '.join(how)})" if how else "")
+
+
+DEFAULT_RULE = Rule(name="default", do="draft", why="no rule in the customer file matched")
 
 
 @dataclass(frozen=True)
@@ -93,6 +179,12 @@ class Customer:
     archive_drop: tuple[re.Pattern[str], ...] = ()
     archive_desks: frozenset[str] = frozenset()
     archive_desk_domains: frozenset[str] = frozenset()
+    # What the agent does on its own with this customer's pickups; the first that matches wins.
+    rules: tuple[Rule, ...] = ()
+
+    def rule_for(self, case: Any) -> Rule:
+        """The first rule that covers the case, else the default (draft)."""
+        return next((rule for rule in self.rules if rule.matches(case)), DEFAULT_RULE)
 
     @property
     def is_fallback(self) -> bool:
@@ -345,6 +437,92 @@ def _archive(
     return tuple(keep), drop, desks, tuple(domains)
 
 
+def _rule(r: _Reader, index: int, raw: Any, seen: set[str]) -> Rule | None:
+    """One ``[[rules]]`` entry, checked; None (with the problems noted) when it cannot be used."""
+    where = f"rules[{index}]"
+    if not isinstance(raw, dict):
+        r.problems.append(f"{where} must be a table")
+        return None
+    for unknown in sorted(set(raw) - RULE_KEYS):
+        r.problems.append(f"{where} has no setting {unknown!r}")
+    name = r.text(where, raw, "name") or f"rule {index + 1}"
+    if name in seen:
+        r.problems.append(f"{where}: two rules are named {name!r}")
+    seen.add(name)
+    where = f"rule {name!r}"
+    do = raw.get("do")
+    if do not in RULE_ACTIONS:
+        r.problems.append(f"{where}: do must be one of {', '.join(RULE_ACTIONS)}")
+        return None
+    when = raw.get("when", {})
+    if not isinstance(when, dict):
+        r.problems.append(f"{where}: when must be a table")
+        when = {}
+    for unknown in sorted(set(when) - WHEN_KEYS):
+        r.problems.append(f"{where}: when has no filter {unknown!r}")
+    methods = r.texts(where, when, "methods") or ()
+    for method in methods:
+        if method not in METHODS:
+            r.problems.append(
+                f"{where}: method {method!r} is not one of {', '.join(sorted(METHODS))}"
+            )
+    return Rule(
+        name=name,
+        do=str(do),
+        why=r.text(where, raw, "why"),
+        methods=frozenset(methods),
+        desks=frozenset(r.emails(f"{where} desks", r.texts(where, when, "desks") or ())),
+        vendors=tuple(v.lower() for v in r.texts(where, when, "vendors") or ()),
+        facilities=frozenset(r.texts(where, when, "facilities") or ()),
+        customer_ids=frozenset(r.ints(where, when, "customer_ids")),
+        **_timing(r, where, raw),
+    )
+
+
+def _timing(r: _Reader, where: str, raw: dict[str, Any]) -> dict[str, Any]:
+    """A rule's lead days, batch hour, what it waits for, where the pickup is planned from."""
+    lead = raw.get("lead_days")
+    if lead is not None and (
+        isinstance(lead, bool) or not isinstance(lead, int) or not 0 <= lead <= 30
+    ):
+        r.problems.append(f"{where}: lead_days must be a whole number from 0 to 30")
+        lead = None
+    batch_at = r.text(where, raw, "batch_at")
+    if batch_at is not None and not _CLOCK_RE.match(batch_at):
+        r.problems.append(f"{where}: batch_at must be HH:MM")
+        batch_at = None
+    wait_for = r.text(where, raw, "wait_for")
+    if wait_for is not None and wait_for not in WAIT_FOR:
+        r.problems.append(f"{where}: wait_for can only be {', '.join(sorted(WAIT_FOR))}")
+        wait_for = None
+    pickup_from = r.text(where, raw, "pickup_from") or "tender"
+    if pickup_from not in PICKUP_FROM:
+        r.problems.append(f"{where}: pickup_from must be tender or delivery")
+        pickup_from = "tender"
+    follow_up = raw.get("follow_up", True)
+    if not isinstance(follow_up, bool):
+        r.problems.append(f"{where}: follow_up must be true or false")
+        follow_up = True
+    return {
+        "lead_days": lead,
+        "batch_at": batch_at,
+        "wait_for": wait_for,
+        "pickup_from": pickup_from,
+        "follow_up": follow_up,
+    }
+
+
+def _rules(r: _Reader, raw: Any) -> tuple[Rule, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        r.problems.append("rules must be written as [[rules]] tables")
+        return ()
+    seen: set[str] = set()
+    found = [_rule(r, i, entry, seen) for i, entry in enumerate(raw)]
+    return tuple(rule for rule in found if rule is not None)
+
+
 def parse_customer(data: dict[str, Any], *, key: str, source: str) -> Customer:
     """Build a customer from a parsed file; raises :class:`CustomerFileError` listing problems."""
     r = _Reader(data)
@@ -386,6 +564,7 @@ def parse_customer(data: dict[str, Any], *, key: str, source: str) -> Customer:
 
     po, po_date, delivery_ref = _numbers(r, r.table("numbers"))
     keep, drop, desks, domains = _archive(r, r.table("mail_archive"))
+    rules = _rules(r, data.get("rules"))
 
     if r.problems:
         raise CustomerFileError(f"{source}:\n  - " + "\n  - ".join(r.problems))
@@ -412,6 +591,7 @@ def parse_customer(data: dict[str, Any], *, key: str, source: str) -> Customer:
         archive_drop=drop,
         archive_desks=frozenset(desks),
         archive_desk_domains=frozenset(domains),
+        rules=rules,
     )
 
 

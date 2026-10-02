@@ -159,6 +159,13 @@ def serve(
             "0 turns them off"
         ),
     ] = 15,
+    autopilot_every: Annotated[
+        float,
+        typer.Option(
+            help="Run the agent on its own every this many minutes, by each customer's rules "
+            "(drafts; sends only where a rule and send mode say so); 0, the default, is off"
+        ),
+    ] = 0,
 ) -> None:
     """Run the appointments board (/app/) and the HTTP API. Needs the api extra."""
     try:
@@ -174,7 +181,13 @@ def serve(
     typer.echo(f"appointments board: http://{host}:{port}/app/  (store {settings.database_url})")
     if timers_every > 0:
         typer.echo(f"booking timers run every {timers_every:g} min")
-    app_ = create_app(settings, timers_every=timers_every if timers_every > 0 else None)
+    if autopilot_every > 0:
+        typer.echo(f"the agent runs on its own every {autopilot_every:g} min (booking run)")
+    app_ = create_app(
+        settings,
+        timers_every=timers_every if timers_every > 0 else None,
+        autopilot_every=autopilot_every if autopilot_every > 0 else None,
+    )
     uvicorn.run(app_, host=host, port=port, log_level="warning")
 
 
@@ -1281,6 +1294,78 @@ def template_preview(
     typer.echo(text)
 
 
+@booking_app.command("run")
+def booking_run(
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Show what the pass would do; change and write nothing"),
+    ] = False,
+) -> None:
+    """One pass of the agent on its own, by each customer's rules.
+
+    Every open request is planned by its customer's rules and the ones that are due are written:
+    drafts, sent only where a rule and send mode say so.
+    """
+    from facility_profiles.booking.automation import run_once
+    from facility_profiles.booking.mail import GmailSender, LocalDraftMailer, RecordingMailer
+
+    settings = _settings()
+    mailer = (
+        RecordingMailer()
+        if dry_run
+        else LocalDraftMailer(
+            Path(settings.booking_drafts_dir), sender=settings.booking_sender or ""
+        )
+    )
+    sender = None
+    if (
+        not dry_run
+        and settings.booking_mode == "send"
+        and settings.booking_gmail_key
+        and settings.booking_gmail_user
+    ):
+        user = settings.booking_gmail_user
+        sender = GmailSender(Path(settings.booking_gmail_key), user, user)
+    with session_scope(_sessions(settings)) as session:
+        report = run_once(session, settings, now=datetime.now(tz=UTC), mailer=mailer, sender=sender)
+        for line in report.lines:
+            typer.echo(line)
+        typer.echo(json.dumps(report.counts()))
+        if dry_run:
+            session.rollback()
+            typer.echo("dry run: nothing was changed and no draft was written")
+
+
+@booking_app.command("jobs")
+def booking_jobs(
+    case_id: Annotated[int | None, typer.Argument(help="One case only")] = None,
+    status: Annotated[str | None, typer.Option(help="Only jobs in this status")] = None,
+) -> None:
+    """What the agent planned and did on its own: each job, its rule, status and why."""
+    from sqlalchemy import select
+
+    from facility_profiles.booking.models import AutomationJob
+
+    settings = _settings()
+    with session_scope(_sessions(settings)) as session:
+        stmt = select(AutomationJob).order_by(AutomationJob.case_id, AutomationJob.id)
+        if case_id is not None:
+            stmt = stmt.where(AutomationJob.case_id == case_id)
+        if status:
+            stmt = stmt.where(AutomationJob.status == status)
+        jobs = list(session.scalars(stmt))
+        if not jobs:
+            typer.echo("no jobs")
+            return
+        for job in jobs:
+            due = f"{job.due_at:%m/%d %H:%M}Z" if job.due_at else "-"
+            tries = f" tries {job.attempts}" if job.attempts else ""
+            typer.echo(
+                f"#{job.case_id:<4} {job.kind:<9} {job.status:<9} {job.action:<5} "
+                f"{job.rule[:28]:<28} due {due}{tries}  {job.reason or ''}"
+            )
+
+
 @booking_app.command("recommend")
 def booking_recommend(case_id: int) -> None:
     """Which pickup time the agent would ask for now, and why (nothing is changed)."""
@@ -1766,6 +1851,10 @@ def customers_show(
         "archive desks",
         f"{len(rules.desks)} address(es), domains {', '.join(sorted(rules.desk_domains))}",
     )
+    for i, rule in enumerate(c.rules, 1):
+        line(f"rule {i}", rule.describe())
+    if not c.rules:
+        line("rules", "none: the agent drafts every pickup when it runs on its own")
     gaps = [
         what
         for what, missing in (

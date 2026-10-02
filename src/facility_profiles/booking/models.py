@@ -49,6 +49,8 @@ class ExceptionType(StrEnum):
     PICKUP_EXPIRED = "pickup_expired"  # the pickup time passed and the case is not booked
     # No pickup the desk would take that day gets the load to the delivery in time.
     LOAD_INFEASIBLE = "load_infeasible"
+    # The agent tried to write a request on its own and failed three times (booking/automation.py).
+    AUTOMATION_FAILED = "automation_failed"
     # The vendor confirmed a different day, or a time more than two hours from the one asked for.
     CONFIRMED_OUTSIDE_WINDOW = "confirmed_outside_window"
 
@@ -115,6 +117,9 @@ class BookingCase(Base):
     )
     offers: Mapped[list[SlotOffer]] = relationship(
         back_populates="case", cascade="all", order_by="SlotOffer.id"
+    )
+    jobs: Mapped[list[AutomationJob]] = relationship(
+        back_populates="case", cascade="all", order_by="AutomationJob.id"
     )
 
     @property
@@ -243,6 +248,48 @@ class SlotOffer(Base):
     answer_detail: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
     case: Mapped[BookingCase] = relationship(back_populates="offers")
+
+
+class JobStatus(StrEnum):
+    """Where one thing the agent does on its own stands."""
+
+    WAITING = "waiting"  # for something to happen first (the delivery slot)
+    PLANNED = "planned"  # will run at due_at
+    BLOCKED = "blocked"  # something on the case needs a person first
+    HELD = "held"  # a rule says a person books this
+    DONE = "done"
+    FAILED = "failed"  # tried and failed; retried until it gives up
+    CANCELED = "canceled"  # no longer needed (booked or canceled some other way)
+
+
+class AutomationJob(Base):
+    """One thing the agent does on its own for a case: a request, a follow-up.
+
+    The rule that planned it (from the customer file), when it is due, why it waits, how many
+    times it was tried and what it produced.
+    """
+
+    __tablename__ = "booking_jobs"
+    __table_args__ = (Index("ix_booking_jobs_due", "status", "due_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    case_id: Mapped[int] = mapped_column(ForeignKey("booking_cases.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(24))  # request | follow_up
+    rule: Mapped[str] = mapped_column(String(64))
+    action: Mapped[str] = mapped_column(String(8))  # draft | send | hold | skip
+    status: Mapped[str] = mapped_column(String(16), default=JobStatus.PLANNED.value)
+    due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reason: Mapped[str | None] = mapped_column(String(255))
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    last_error: Mapped[str | None] = mapped_column(Text)
+    result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+    done_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    case: Mapped[BookingCase] = relationship(back_populates="jobs")
 
 
 class BookingTemplate(Base):

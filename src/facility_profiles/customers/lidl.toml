@@ -64,3 +64,15 @@ desks = [
 ]
 # The DCT portal's notifier.
 desk_domains = ["softhouse.nl"]
+
+# What the agent does with Lidl's pickups when it runs on its own (`booking run`, or
+# `serve --autopilot-every`). The first rule that covers a pickup decides; without one, it drafts.
+[[rules]]
+name = "vendor pickups by email"
+when = { methods = ["email"] }
+do = "draft"
+# The pod books the RDC delivery slot in DCT first, then asks the vendor for the pickup: a request
+# waits until the load has its DCT reference and delivery time.
+wait_for = "delivery_slot"
+# batch_at = "10:00"   # one email per desk, written at this time of day (not set: as soon as due)
+# lead_days = 2        # ask this many business days before the pickup (not set: straight away)

@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session, selectinload
 from facility_profiles.booking.links import offer_state
 from facility_profiles.booking.memory import desk_history
 from facility_profiles.booking.models import (
+    AutomationJob,
     BookingCase,
     BookingEvent,
     BookingMessage,
@@ -79,6 +80,7 @@ EVENTS: dict[str, str] = {
     "desk_remembered": "Desk remembered",
     "desk_learned": "Desk on file now",
     "time_recommended": "Pickup time chosen",
+    "request_waiting": "Request waits for the delivery slot",
     "confirmed_by_link": "Vendor picked a time from the link",
     "proposed_by_link": "Vendor proposed a time from the link",
 }
@@ -246,6 +248,21 @@ def requested_why(case: BookingCase) -> str | None:
     return "the tendered pickup" if case.tendered_pickup_utc else "backed off the delivery slot"
 
 
+def job_view(job: AutomationJob) -> dict[str, Any]:
+    """One thing the agent planned or did on its own for the case."""
+    return {
+        "id": job.id,
+        "kind": job.kind,
+        "rule": job.rule,
+        "action": job.action,
+        "status": job.status,
+        "due_at": _iso(job.due_at),
+        "reason": job.reason,
+        "attempts": job.attempts or 0,
+        "done_at": _iso(job.done_at),
+    }
+
+
 def offer_view(offer: SlotOffer, *, now: datetime) -> dict[str, Any]:
     """The times one request offered by link, and what became of them."""
     detail = offer.answer_detail or {}
@@ -294,6 +311,7 @@ def case_detail(
         "exceptions": [exception_view(e) for e in case.exceptions],
         "messages": [_message_view(m) for m in case.messages],
         "offers": [offer_view(o, now=now) for o in case.offers],
+        "jobs": [job_view(j) for j in case.jobs],
         "timeline": timeline(case),
         "can_approve": case.status == CaseStatus.PENDING.value
         and any(e.kind == ExceptionType.CONFIRMATION_REVIEW for e in case.open_exceptions),
