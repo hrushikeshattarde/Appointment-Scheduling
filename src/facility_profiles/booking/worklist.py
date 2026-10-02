@@ -50,6 +50,12 @@ KINDS: dict[str, tuple[str, str]] = {
         "The desk will not book without this number. Get it from the customer and add it to "
         "the case; the request is drafted with it.",
     ),
+    "tpro_mismatch": (
+        "Transport Pro has another time",
+        "Transport Pro already shows a different confirmed appointment for this pickup, and the "
+        "agent does not overwrite it. Check with the vendor which is right, then fix Transport Pro "
+        "or update the booking.",
+    ),
     "automation_failed": (
         "Automation failed",
         "The agent could not write this request on its own. Read the error, fix what it names, "

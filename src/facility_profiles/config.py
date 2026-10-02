@@ -140,6 +140,9 @@ class Settings(BaseSettings):
     # A time the vendor picked is booked straight away; off, it waits for approval like an
     # emailed confirmation.
     booking_link_auto_schedule: bool = True
+    # Write booked pickups to Transport Pro (POST /load/{id}/set_appointment; booking/writeback.py).
+    # Off: each booking waits, and the board says to enter it there by hand.
+    booking_tpro_writeback: bool = False
 
     # --- Group-mail archive in S3 (Pick Up Appointment threads) ---------------------------
     mail_archive_bucket: str | None = None

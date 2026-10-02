@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import atexit
 import json
+from contextlib import ExitStack
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Annotated
@@ -982,7 +983,8 @@ def booking_approve(
 ) -> None:
     """Approve the vendor's confirmation: the case becomes scheduled.
 
-    Written to Transport Pro only when writes are enabled.
+    The slot is queued for Transport Pro; ``booking writeback`` writes it while
+    FP_BOOKING_TPRO_WRITEBACK is on.
     """
     from facility_profiles.booking.service import approve
 
@@ -990,14 +992,16 @@ def booking_approve(
     with session_scope(_sessions(settings)) as session:
         case = _booking_case(session, case_id)
         try:
-            payload, written = approve(session, case, by=by, client=None)
+            payload, _written = approve(session, case, by=by)
         except ValueError as exc:
             typer.echo(str(exc))
             raise typer.Exit(code=1) from exc
-    typer.echo(
-        f"#{case_id} approved; Transport Pro appointment payload: {json.dumps(payload)} "
-        + ("(written)" if written else "(not written: draft mode)")
+    state = (
+        "queued; booking writeback sends it"
+        if settings.booking_tpro_writeback
+        else "write-back is off: enter it in Transport Pro by hand"
     )
+    typer.echo(f"#{case_id} approved; Transport Pro appointment {json.dumps(payload)} ({state})")
 
 
 @booking_app.command("close")
@@ -1326,14 +1330,56 @@ def booking_run(
     ):
         user = settings.booking_gmail_user
         sender = GmailSender(Path(settings.booking_gmail_key), user, user)
-    with session_scope(_sessions(settings)) as session:
-        report = run_once(session, settings, now=datetime.now(tz=UTC), mailer=mailer, sender=sender)
+    with ExitStack() as stack:
+        session = stack.enter_context(session_scope(_sessions(settings)))
+        client = None
+        if settings.booking_tpro_writeback and not dry_run:
+            client = stack.enter_context(_client(settings, allow_writes=True))
+        report = run_once(
+            session, settings, now=datetime.now(tz=UTC), mailer=mailer, sender=sender, client=client
+        )
         for line in report.lines:
             typer.echo(line)
         typer.echo(json.dumps(report.counts()))
         if dry_run:
             session.rollback()
             typer.echo("dry run: nothing was changed and no draft was written")
+
+
+@booking_app.command("writeback")
+def booking_writeback(
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run", help="Read the loads and say what would be written; write nothing"
+        ),
+    ] = False,
+) -> None:
+    """Write booked pickups to Transport Pro (FP_BOOKING_TPRO_WRITEBACK must be on).
+
+    Each load is read first: the same time already there is not sent again, a different
+    confirmed time is never overwritten (a to-do instead), and every write is read back.
+    """
+    from facility_profiles.booking.writeback import write_appointments
+
+    settings = _settings()
+    live = settings.booking_tpro_writeback and not dry_run
+    if not settings.booking_tpro_writeback and not dry_run:
+        typer.echo("FP_BOOKING_TPRO_WRITEBACK is off: nothing is written (--dry-run reads only)")
+    with session_scope(_sessions(settings)) as session:
+        if settings.booking_tpro_writeback or dry_run:
+            with _client(settings, allow_writes=live) as client:
+                report = write_appointments(
+                    session, settings, client, now=datetime.now(tz=UTC), dry_run=dry_run
+                )
+        else:
+            report = write_appointments(session, settings, None, now=datetime.now(tz=UTC))
+        for line in report.lines:
+            typer.echo(line)
+        typer.echo(json.dumps(report.counts()))
+        if dry_run:
+            session.rollback()
+            typer.echo("dry run: nothing was written to Transport Pro or changed here")
 
 
 @booking_app.command("jobs")

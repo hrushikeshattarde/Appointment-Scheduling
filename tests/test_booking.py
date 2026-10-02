@@ -279,10 +279,10 @@ def test_scan_draft_reply_and_approve_round_trip(settings, sessions):
         assert case.confirmed_local == "2026-10-01 11:00"
         assert as_utc(case.confirmed_start_utc) == datetime(2026, 10, 1, 15, 0, tzinfo=UTC)
         assert case.pickup_number == "CCI-9389"
-        payload, written = approve(session, case, by="megan", client=None)
+        payload, written = approve(session, case, by="megan")
         assert payload == {
             "load_id": 2001,
-            "waypoint_index": "0",
+            "waypoint_index": "SH",  # Transport Pro's name for the shipper stop
             "start_utc": "2026-10-01T15:00:00Z",
             "end_utc": "2026-10-01T15:00:00Z",
             "status": "Confirmed",
@@ -302,7 +302,7 @@ def test_scan_draft_reply_and_approve_round_trip(settings, sessions):
             "desk_remembered",
         ]
         with pytest.raises(ValueError, match="nothing to approve"):
-            approve(session, case, by="megan", client=None)
+            approve(session, case, by="megan")
 
 
 def test_questions_counter_offers_and_unbacked_values_go_to_a_person(settings, sessions):

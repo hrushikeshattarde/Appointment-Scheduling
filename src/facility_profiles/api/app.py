@@ -73,8 +73,26 @@ def run_autopilot(sessions: sessionmaker[Session], settings: Settings) -> None:
     ):
         user = settings.booking_gmail_user
         sender = GmailSender(Path(settings.booking_gmail_key), user, user)
-    with session_scope(sessions) as session:
-        report = run_once(session, settings, now=datetime.now(tz=UTC), mailer=mailer, sender=sender)
+    if settings.booking_tpro_writeback:
+        from facility_profiles.tpro.client import TransportProClient  # noqa: PLC0415
+
+        with (
+            TransportProClient.from_settings(settings, allow_writes=True) as client,
+            session_scope(sessions) as session,
+        ):
+            report = run_once(
+                session,
+                settings,
+                now=datetime.now(tz=UTC),
+                mailer=mailer,
+                sender=sender,
+                client=client,
+            )
+    else:
+        with session_scope(sessions) as session:
+            report = run_once(
+                session, settings, now=datetime.now(tz=UTC), mailer=mailer, sender=sender
+            )
     log.info("booking.autopilot", **report.counts())
 
 

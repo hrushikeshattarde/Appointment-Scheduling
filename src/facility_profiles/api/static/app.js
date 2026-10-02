@@ -959,8 +959,8 @@ function offerText(offers) {
 
 // What the agent planned for the request on its own: "planned: rule 'vendor pickups': draft at
 // Thu 10/01 10:00", "waiting: waiting for the delivery slot".
-function jobText(jobs) {
-  const job = (jobs || []).filter((j) => j.kind === "request").pop();
+function jobText(jobs, kind = "request") {
+  const job = (jobs || []).filter((j) => j.kind === kind).pop();
   if (!job) return null;
   return `${job.status}${job.reason ? `: ${job.reason}` : ""}`;
 }
@@ -977,6 +977,7 @@ function factsSection(d) {
     ["Confirmed", d.confirmed_local ? fmtSlot(d.confirmed_local) : "-"],
     ...(offerText(d.offers) ? [["Offered by link", offerText(d.offers)]] : []),
     ...(jobText(d.jobs) ? [["Automation", jobText(d.jobs)]] : []),
+    ...(jobText(d.jobs, "tpro_write") ? [["Transport Pro", jobText(d.jobs, "tpro_write")]] : []),
     ["Pickup number", d.pickup_number || "-"],
     ["Numbers", numbersText(d.references, true)],
     ["Earlier numbers", numbersText(d.references, false)],

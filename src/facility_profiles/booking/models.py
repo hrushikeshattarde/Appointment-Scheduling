@@ -51,6 +51,8 @@ class ExceptionType(StrEnum):
     LOAD_INFEASIBLE = "load_infeasible"
     # The agent tried to write a request on its own and failed three times (booking/automation.py).
     AUTOMATION_FAILED = "automation_failed"
+    # Transport Pro already has a different confirmed time for the stop (booking/writeback.py).
+    TPRO_MISMATCH = "tpro_mismatch"
     # The vendor confirmed a different day, or a time more than two hours from the one asked for.
     CONFIRMED_OUTSIDE_WINDOW = "confirmed_outside_window"
 

@@ -109,6 +109,7 @@ from facility_profiles.booking.worklist import (
     resolve,
     resolve_all,
 )
+from facility_profiles.booking.writeback import appointment_payload, queue_write
 from facility_profiles.config import Settings
 from facility_profiles.customers import Customer, built_in_customers, customer_of, customers
 from facility_profiles.domain.resolution import FacilityResolver
@@ -1662,31 +1663,14 @@ def draft_batch(
 # ------------------------------------------------------------------ decisions
 
 
-def appointment_payload(case: BookingCase) -> dict[str, Any]:
-    """What would be written to Transport Pro for the proposed slot."""
-    if case.confirmed_start_utc is None:
-        msg = f"case {case.id} has no confirmed slot"
-        raise ValueError(msg)
-    start = as_utc(case.confirmed_start_utc)
-    assert start is not None
-    end = as_utc(case.confirmed_end_utc) or start
-    return {
-        "load_id": case.load_id,
-        "waypoint_index": str(case.waypoint_index),
-        "start_utc": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "end_utc": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "status": "Confirmed",
-    }
-
-
-def approve(
-    session: Session, case: BookingCase, *, by: str, client: TransportProClient | None = None
-) -> tuple[dict[str, Any], bool]:
-    """A person approves the vendor's confirmation; write it only when the client allows writes.
+def approve(session: Session, case: BookingCase, *, by: str) -> tuple[dict[str, Any], bool]:
+    """A person approves the vendor's confirmation; the slot is queued for Transport Pro.
 
     The case becomes scheduled. Its confirmation review is resolved, with what approving settles
     too: a confirmation outside the window asked for, and the timers (the pickup is booked).
-    Anything else still open (a later question, say) stays open.
+    Anything else still open (a later question, say) stays open. Nothing is written here: the
+    writer (``booking/writeback.py``) sends the queued slot while write-back is on. Returns the
+    payload, and False (not written yet).
     """
     if case.status != CaseStatus.PENDING.value or not open_exceptions(
         case, ExceptionType.CONFIRMATION_REVIEW
@@ -1695,9 +1679,6 @@ def approve(
         raise ValueError(msg)
     payload = appointment_payload(case)
     written = False
-    if client is not None and client.allow_writes:
-        client.set_appointment(**payload)
-        written = True
     case.status = CaseStatus.SCHEDULED.value
     case.reason = None
     resolve(
@@ -1710,6 +1691,7 @@ def approve(
     _event(session, case, "approved", actor=by, payload=payload, written_to_tpro=written)
     # The vendor confirmed by email: the desk the request went to worked.
     remember_booking(session, case, method="email", desk=case.contact_email, by=by)
+    queue_write(session, case, by=by)
     return payload, written
 
 
@@ -1765,7 +1747,10 @@ def mark_booked(
     )
     method = VIA_METHODS.get(via.strip().lower())
     used = desk or (case.contact_email if method == "email" else None)
-    return remember_booking(session, case, method=method, desk=used, by=by)
+    learned = remember_booking(session, case, method=method, desk=used, by=by)
+    if local:
+        queue_write(session, case, by=by)
+    return learned
 
 
 def close_case(session: Session, case: BookingCase, *, by: str, reason: str) -> None:

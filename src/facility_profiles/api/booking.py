@@ -81,6 +81,8 @@ EVENTS: dict[str, str] = {
     "desk_learned": "Desk on file now",
     "time_recommended": "Pickup time chosen",
     "request_waiting": "Request waits for the delivery slot",
+    "written_to_tpro": "Written to Transport Pro",
+    "tpro_already_set": "Already in Transport Pro",
     "confirmed_by_link": "Vendor picked a time from the link",
     "proposed_by_link": "Vendor proposed a time from the link",
 }
@@ -577,10 +579,10 @@ def get_case_detail(case_id: int, session: SessionDep, now: NowDep) -> dict[str,
 
 @router.post("/cases/{case_id}/approve")
 def post_approve(case_id: int, body: Approval, session: SessionDep, now: NowDep) -> dict[str, Any]:
-    """Approve the vendor's confirmation (not written to Transport Pro from here)."""
+    """Approve the vendor's confirmation; the slot is queued for Transport Pro."""
     case = _get_case(session, case_id)
     try:
-        approve(session, case, by=body.by, client=None)
+        approve(session, case, by=body.by)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return _decided(session, case, now)

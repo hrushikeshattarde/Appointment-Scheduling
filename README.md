@@ -177,9 +177,10 @@ it applies only to customers whose file has a `po_date`).
 ## Booking agent prototype (draft mode)
 
 `facility-profiles booking ...` books vendor pickup appointments by email for customer-tendered
-inbound loads (built for the Lidl inbound pod). It never sends mail and never writes to
-Transport Pro: a person sends each draft and approves each confirmation. To try it without
-touching real data, follow [TESTING.md](TESTING.md).
+inbound loads (built for the Lidl inbound pod). By default it never sends mail and never
+writes to Transport Pro: a person sends each draft and approves each confirmation. Sending
+(`FP_BOOKING_MODE=send`) and Transport Pro write-back (`FP_BOOKING_TPRO_WRITEBACK`) are separate
+settings, both off. To try it without touching real data, follow [TESTING.md](TESTING.md).
 
 ```powershell
 $env:FP_DATABASE_URL = 'sqlite:///./data/facility_profiles_pod-1089-lidl.db'
@@ -218,8 +219,8 @@ same store the agent writes. Start it with `facility-profiles serve --db <store>
   with a note, mark a pickup booked another way (phone, portal, email), cancel. Each decision is
   recorded under the name entered in the page.
 
-The board never sends mail and never writes to Transport Pro; approving records the decision as
-`booking approve` does. It has no login of its own: keep it on `127.0.0.1`, or put it behind the
+The board never sends mail and never writes to Transport Pro itself; approving records the
+decision as `booking approve` does and queues the slot for write-back. It has no login of its own: keep it on `127.0.0.1`, or put it behind the
 company's single sign-on before anyone else can reach it. One server shows one store, so run one
 per pod (`--db`) until the stores move to Postgres. To show it without real data,
 `python scripts/seed_booking_demo.py --db sqlite:///./data/booking-demo.db` fills a new store with
@@ -314,8 +315,9 @@ requested slot; a time alone means the requested date), deferred ("check back Mo
 waiting, a counter-offer, a question or a decline raises its exception. A "confirmation" of a
 slot that had already passed when the vendor wrote ("latest is 9pm tonight" after a missed
 pickup) is raised as `stale_confirmation`, a work-in note for a person. A confirmation is
-answered once with the pod's "Thank you!". `approve` records the decision and prints the exact
-Transport Pro `set_appointment` payload; the write itself stays behind the client's write flag.
+answered once with the pod's "Thank you!". `approve` records the decision, prints the exact
+Transport Pro `set_appointment` payload and queues it for write-back (see "Writing booked pickups
+to Transport Pro").
 Mail that arrives on a scheduled or canceled case (driver ETAs, securement, "did this get
 resolved?") is kept on the case and never read as a new answer.
 
@@ -401,6 +403,31 @@ as before.
 On the 2026-10-02 stores: all seven Lidl cases ask for exactly what they did before. Lidl's vendor
 stops in Transport Pro carry tendered times only, and no vendor has hours on file. On pod 1160, 62
 facilities have confirmed pickup times and 9 have a usual one (Citrojugo 14:00, 16 of 23).
+
+### Writing booked pickups to Transport Pro
+
+When a pickup is booked (approved, picked from a click-to-confirm link, or marked booked with
+its time), its slot is queued for Transport Pro: `POST /load/{id}/set_appointment` with
+`waypointIndex=SH`, `startDate`, `endDate` and `appointmentStatus=Confirmed`. These are the field
+names of the Transport Pro connector's `tpro_load_set_appointment`. `SH` is Transport Pro's name
+for the load's shipper stop; the agent used to send the stop's position ("0"). The same slot is
+never queued twice; a new time replaces a queued one.
+
+`booking writeback` (and each `booking run` pass) writes the queue only while
+`FP_BOOKING_TPRO_WRITEBACK` is on. Until then each booking waits, and the board's "Transport Pro"
+row says to enter it there by hand. With it on, each load is read first:
+
+| Transport Pro shows | The writer |
+|---|---|
+| the same confirmed time | sends nothing ("Already in Transport Pro") |
+| a different confirmed time | overwrites nothing; raises "Transport Pro has another time" for a person |
+| a stop-off, not the load's shipper | writes nothing; a person enters it |
+| the tender, or no appointment | writes the booking, then reads the load back to confirm it |
+
+Every write is recorded on the case ("Written to Transport Pro", with what was there before). A
+failed write is retried after an hour and raised as "Automation failed" after three tries. An
+appointment whose time has passed, or a case canceled since, is never written.
+`booking writeback --dry-run` reads the loads and says what would be written, without writing.
 
 ### The agent on its own: rules
 

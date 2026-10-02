@@ -13,7 +13,9 @@ One pass (:func:`run_once`: ``booking run``, or ``serve --autopilot-every``):
    desk's rules are checked first, exactly as for ``booking draft``. A batch that fails leaves
    nothing behind; it is retried an hour later, and after three tries raised as
    ``automation_failed``;
-4. a sent request with no reply gets its one follow-up, unless the rule says not to.
+4. a sent request with no reply gets its one follow-up, unless the rule says not to;
+5. with a Transport Pro client (only while FP_BOOKING_TPRO_WRITEBACK is on), the booked pickups
+   are written back to their loads (``booking/writeback.py``).
 
 Nothing happens between passes, and a pass never redoes what a person did: a request drafted, a
 booking made or a case canceled by hand closes the job.
@@ -44,6 +46,7 @@ from facility_profiles.booking.rules import check_desk_rules, request_opens, ven
 from facility_profiles.booking.service import draft_batch, has_request, list_cases, plan_request
 from facility_profiles.booking.timers import fmt_slot, slot_at, sweep
 from facility_profiles.booking.worklist import flag, open_kinds
+from facility_profiles.booking.writeback import LoadWriter, write_appointments
 from facility_profiles.config import Settings
 from facility_profiles.customers import customers
 from facility_profiles.customers.profile import Customer, Rule
@@ -68,6 +71,7 @@ class RunReport:
     followed_up: int = 0
     failed: int = 0
     closed: int = 0
+    written_to_tpro: int = 0
     lines: list[str] = field(default_factory=list)
 
     def say(self, case: BookingCase, text: str) -> None:
@@ -366,8 +370,12 @@ def run_once(
     mailer: Mailer,
     sender: Sender | None = None,
     timers: bool = True,
+    client: LoadWriter | None = None,
 ) -> RunReport:
-    """One pass of the agent on its own: plan every open request, write what is due."""
+    """One pass of the agent on its own: plan every open request, write what is due.
+
+    ``client`` writes the booked pickups to Transport Pro; pass one only while write-back is on.
+    """
     report = RunReport()
     if timers:
         sweep(session, now=now, settings=settings)
@@ -409,4 +417,8 @@ def run_once(
     ]
     _execute(session, due, settings=settings, mailer=mailer, sender=sender, now=now, report=report)
     _follow_ups(session, settings=settings, mailer=mailer, sender=sender, now=now, report=report)
+    if client is not None and settings.booking_tpro_writeback:
+        written = write_appointments(session, settings, client, now=now)
+        report.written_to_tpro = written.written
+        report.lines.extend(written.lines)
     return report

@@ -2,7 +2,7 @@
 
 How to check the six Phase 1 steps (statuses and to-dos, timers and the daily summary, desk
 rules, desk memory, email templates, reference numbers) and Phase 2's click-to-confirm links,
-pickup-time choice and rules engine. There are three layers, quickest first. Everything here runs on throwaway
+pickup-time choice, rules engine and Transport Pro write-back. There are three layers, quickest first. Everything here runs on throwaway
 stores: nothing reaches a vendor, the customer or Transport Pro.
 
 ## Before you start
@@ -149,6 +149,9 @@ The same works for pod 1160: copy `data/facility_profiles.db` the same way, then
   write to the real stores.
 - `booking run` without `--dry-run`, or `serve --autopilot-every`, on a real store: they write
   drafts (and send, in send mode) by the customers' rules.
+- `booking writeback` with `FP_BOOKING_TPRO_WRITEBACK=true`: it writes appointments to real loads
+  in Transport Pro. `--dry-run` only reads them. The automated tests use an in-memory Transport
+  Pro.
 - `serve-links --host 0.0.0.0`, or setting `FP_BOOKING_LINK_*` in `.env`: drafts would then carry
   links, and the pages would be reachable from outside this machine. Keep the link variables to
   the one terminal that serves the demo.
