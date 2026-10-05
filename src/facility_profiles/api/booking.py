@@ -4,6 +4,10 @@ Read: an overview (what needs a person, what is past due, what is coming up), a 
 one case in full (open and resolved exceptions, messages, one timeline), and the daily summary.
 Write: the same decisions the CLI offers (approve, resolve, booked, cancel), each recorded with
 who made it. Nothing here sends mail or writes to Transport Pro.
+
+With sign-in on (api/auth.py), every route answers with the signed-in person's customers only:
+another customer's case is "not found", and a decision needs "act" access to its customer.
+Decisions are recorded under the signed-in name; without sign-in, under the ``by`` sent.
 """
 
 from __future__ import annotations
@@ -18,6 +22,8 @@ from pydantic import BaseModel, StringConstraints
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
+from facility_profiles.access import Viewer
+from facility_profiles.api.auth import ViewerDep, decided_by
 from facility_profiles.booking.links import offer_state
 from facility_profiles.booking.memory import desk_history
 from facility_profiles.booking.models import (
@@ -44,6 +50,7 @@ from facility_profiles.booking.timers import fmt_slot, pickup_passed
 from facility_profiles.booking.today import pickup_slot, render_today, stage, today_summary
 from facility_profiles.booking.worklist import KINDS, resolve
 from facility_profiles.config import Settings, get_settings
+from facility_profiles.customers import customers
 from facility_profiles.storage.repository import as_utc
 
 EVENTS: dict[str, str] = {
@@ -284,23 +291,38 @@ def offer_view(offer: SlotOffer, *, now: datetime) -> dict[str, Any]:
     }
 
 
-def desk_view(row: DeskMemory) -> dict[str, Any]:
-    """One way the facility was booked before."""
+def desk_view(row: DeskMemory, *, show_case: bool = True) -> dict[str, Any]:
+    """One way the facility was booked before (the last case only when the viewer may see it)."""
     return {
         "method": row.method,
         "desk": row.desk or None,
         "worked_count": row.worked_count,
         "last_worked_at": _iso(row.last_worked_at),
-        "last_case_id": row.last_case_id,
+        "last_case_id": row.last_case_id if show_case else None,
     }
 
 
 def case_detail(
-    case: BookingCase, *, now: datetime, desks: list[DeskMemory] | None = None
+    case: BookingCase,
+    *,
+    now: datetime,
+    desks: list[DeskMemory] | None = None,
+    shown_cases: Callable[[int], bool] | None = None,
 ) -> dict[str, Any]:
-    """Everything about one case; ``desks`` is how its facility was booked before."""
+    """Everything about one case; ``desks`` is how its facility was booked before.
+
+    ``shown_cases`` says which other cases the reader may see (all, when not given).
+    """
     return {
-        "desk_history": [desk_view(d) for d in desks or []],
+        "desk_history": [
+            desk_view(
+                d,
+                show_case=shown_cases is None
+                or d.last_case_id is None
+                or shown_cases(d.last_case_id),
+            )
+            for d in desks or []
+        ],
         **case_summary(case, now=now),
         "requested_local": case.requested_local,
         "requested_why": requested_why(case),
@@ -395,15 +417,15 @@ Clock = Annotated[str, StringConstraints(pattern=r"^\d{2}:\d{2}$")]
 
 
 class Approval(BaseModel):
-    """Who approves the vendor's confirmation."""
+    """Who approves the vendor's confirmation (the signed-in person, when there is sign-in)."""
 
-    by: Who
+    by: Who | None = None
 
 
 class Resolution(BaseModel):
     """Who resolved which exception, and how."""
 
-    by: Who
+    by: Who | None = None
     kind: ExceptionType
     note: Note
 
@@ -411,7 +433,7 @@ class Resolution(BaseModel):
 class Booking(BaseModel):
     """A pickup booked outside the agent."""
 
-    by: Who
+    by: Who | None = None
     via: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=32)]
     date: Day | None = None
     time: Clock | None = None
@@ -423,7 +445,7 @@ class Booking(BaseModel):
 class Reference(BaseModel):
     """A number the vendor's desk needs, added by a person."""
 
-    by: Who
+    by: Who | None = None
     kind: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=32)]
     value: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)]
 
@@ -431,7 +453,7 @@ class Reference(BaseModel):
 class Cancellation(BaseModel):
     """Who cancels the case, and why."""
 
-    by: Who
+    by: Who | None = None
     reason: Note
 
 
@@ -479,50 +501,108 @@ def _load_all(session: Session) -> list[BookingCase]:
     return list(session.scalars(stmt))
 
 
-def _get_case(session: Session, case_id: int) -> BookingCase:
+def _key(settings: Settings) -> Callable[[BookingCase], str]:
+    """The customer file's key for a case (``default`` when no file claims it)."""
+    known = customers(settings)
+    return lambda case: known.for_case(case).key
+
+
+def _visible(session: Session, viewer: Viewer, settings: Settings) -> list[BookingCase]:
+    """Every case the viewer may see: all for an admin, else their customers' only."""
+    cases = _load_all(session)
+    if viewer.admin:
+        return cases
+    key = _key(settings)
+    return [c for c in cases if viewer.sees(key(c))]
+
+
+def _get_case(
+    session: Session, case_id: int, viewer: Viewer, settings: Settings, *, act: bool = False
+) -> BookingCase:
+    """One case the viewer may see (404 for another customer's, as for none), or act on (403)."""
     case = session.get(BookingCase, case_id)
-    if case is None:
+    key = _key(settings)(case) if case is not None and not viewer.admin else ""
+    if case is None or not viewer.sees(key):
         raise HTTPException(status_code=404, detail=f"case {case_id} not found")
+    if act and not viewer.acts(key):
+        raise HTTPException(
+            status_code=403,
+            detail="you can see this customer's pickups but not act on them; ask an admin",
+        )
     return case
 
 
-def _detail(session: Session, case: BookingCase, now: datetime) -> dict[str, Any]:
-    return case_detail(case, now=now, desks=desk_history(session, case.facility_key))
+def _sees_case(session: Session, viewer: Viewer, settings: Settings) -> Callable[[int], bool]:
+    """Whether the viewer may see the case with this id."""
+    key = _key(settings)
+
+    def sees(case_id: int) -> bool:
+        other = session.get(BookingCase, case_id)
+        return other is not None and viewer.sees(key(other))
+
+    return sees
 
 
-def _decided(session: Session, case: BookingCase, now: datetime) -> dict[str, Any]:
+def _detail(
+    session: Session, case: BookingCase, now: datetime, viewer: Viewer, settings: Settings
+) -> dict[str, Any]:
+    shown = None if viewer.admin else _sees_case(session, viewer, settings)
+    detail = case_detail(
+        case, now=now, desks=desk_history(session, case.facility_key), shown_cases=shown
+    )
+    detail["can_act"] = viewer.admin or viewer.acts(_key(settings)(case))
+    return detail
+
+
+def _decided(
+    session: Session, case: BookingCase, now: datetime, viewer: Viewer, settings: Settings
+) -> dict[str, Any]:
     session.commit()  # the decision is stored before anyone is told it was made
-    return _detail(session, case, now)
+    return _detail(session, case, now, viewer, settings)
 
 
 @router.get("/overview")
 def get_overview(
     session: SessionDep,
     now: NowDep,
+    settings: SettingsDep,
+    viewer: ViewerDep,
+    *,
     customer: str | None = None,
     days: Annotated[int, Query(ge=1, le=60)] = 7,
 ) -> dict[str, Any]:
     """Counts, open to-dos, past-due pickups and the next days' pickups."""
-    cases = [c for c in _load_all(session) if not customer or c.customer_name == customer]
+    cases = [
+        c
+        for c in _visible(session, viewer, settings)
+        if not customer or c.customer_name == customer
+    ]
     return overview(cases, now=now, days=days)
 
 
 @router.get("/today")
 def get_today(
-    session: SessionDep, now: NowDep, settings: SettingsDep, customer: str | None = None
+    session: SessionDep,
+    now: NowDep,
+    settings: SettingsDep,
+    viewer: ViewerDep,
+    customer: str | None = None,
 ) -> dict[str, Any]:
     """The daily summary: what needs a person, today's pickups, drafts to send.
 
     ``text`` is the same summary as plain text, ready to paste into an email or a chat.
     """
     data = today_summary(
-        _load_all(session), now=now, timezone=settings.booking_timezone, customer=customer
+        _visible(session, viewer, settings),
+        now=now,
+        timezone=settings.booking_timezone,
+        customer=customer,
     )
     return {**data, "text": render_today(data)}
 
 
 @router.get("/kinds")
-def get_kinds() -> list[dict[str, str]]:
+def get_kinds(_viewer: ViewerDep) -> list[dict[str, str]]:
     """Every exception kind with its label and what to do about it, for the board's filter."""
     return [
         {"kind": kind.value, "label": KINDS[kind.value][0], "hint": KINDS[kind.value][1]}
@@ -531,9 +611,12 @@ def get_kinds() -> list[dict[str, str]]:
 
 
 @router.get("/customers")
-def get_customers(session: SessionDep) -> list[str]:
-    """Customer names on the cases, for the board's filter."""
-    names = session.scalars(select(BookingCase.customer_name).distinct())
+def get_customers(session: SessionDep, settings: SettingsDep, viewer: ViewerDep) -> list[str]:
+    """Customer names on the cases the viewer may see, for the board's filter."""
+    if viewer.admin:
+        names = set(session.scalars(select(BookingCase.customer_name).distinct()))
+    else:
+        names = {c.customer_name for c in _visible(session, viewer, settings)}
     return sorted(n for n in names if n)
 
 
@@ -541,6 +624,8 @@ def get_customers(session: SessionDep) -> list[str]:
 def get_cases(
     session: SessionDep,
     now: NowDep,
+    settings: SettingsDep,
+    viewer: ViewerDep,
     *,
     status: CaseStatus | None = None,
     exception: str | None = None,
@@ -551,7 +636,7 @@ def get_cases(
     past_due: bool = False,
 ) -> list[dict[str, Any]]:
     """Cases by pickup, filtered; ``exception`` is a kind or ``any``, ``q`` searches ids."""
-    rows = [case_summary(c, now=now) for c in _load_all(session)]
+    rows = [case_summary(c, now=now) for c in _visible(session, viewer, settings)]
     if status is not None:
         rows = [r for r in rows if r["status"] == status.value]
     if exception == "any":
@@ -572,45 +657,72 @@ def get_cases(
 
 
 @router.get("/cases/{case_id}")
-def get_case_detail(case_id: int, session: SessionDep, now: NowDep) -> dict[str, Any]:
+def get_case_detail(
+    case_id: int, session: SessionDep, now: NowDep, settings: SettingsDep, viewer: ViewerDep
+) -> dict[str, Any]:
     """One case in full, with how its facility was booked before."""
-    return _detail(session, _get_case(session, case_id), now)
+    return _detail(session, _get_case(session, case_id, viewer, settings), now, viewer, settings)
 
 
 @router.post("/cases/{case_id}/approve")
-def post_approve(case_id: int, body: Approval, session: SessionDep, now: NowDep) -> dict[str, Any]:
+def post_approve(
+    case_id: int,
+    body: Approval,
+    *,
+    session: SessionDep,
+    now: NowDep,
+    settings: SettingsDep,
+    viewer: ViewerDep,
+) -> dict[str, Any]:
     """Approve the vendor's confirmation; the slot is queued for Transport Pro."""
-    case = _get_case(session, case_id)
+    by = decided_by(viewer, body.by)
+    case = _get_case(session, case_id, viewer, settings, act=True)
     try:
-        approve(session, case, by=body.by)
+        approve(session, case, by=by)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return _decided(session, case, now)
+    return _decided(session, case, now, viewer, settings)
 
 
 @router.post("/cases/{case_id}/resolve")
 def post_resolve(
-    case_id: int, body: Resolution, session: SessionDep, now: NowDep
+    case_id: int,
+    body: Resolution,
+    *,
+    session: SessionDep,
+    now: NowDep,
+    settings: SettingsDep,
+    viewer: ViewerDep,
 ) -> dict[str, Any]:
     """Resolve one open exception with a note."""
-    case = _get_case(session, case_id)
-    if not resolve(session, case, [body.kind], resolution=body.note, by=body.by):
+    by = decided_by(viewer, body.by)
+    case = _get_case(session, case_id, viewer, settings, act=True)
+    if not resolve(session, case, [body.kind], resolution=body.note, by=by):
         raise HTTPException(status_code=409, detail=f"case {case_id} has no open {body.kind.value}")
-    return _decided(session, case, now)
+    return _decided(session, case, now, viewer, settings)
 
 
 @router.post("/cases/{case_id}/booked")
-def post_booked(case_id: int, body: Booking, session: SessionDep, now: NowDep) -> dict[str, Any]:
+def post_booked(
+    case_id: int,
+    body: Booking,
+    *,
+    session: SessionDep,
+    now: NowDep,
+    settings: SettingsDep,
+    viewer: ViewerDep,
+) -> dict[str, Any]:
     """Record a pickup booked outside the agent; the case becomes scheduled."""
+    by = decided_by(viewer, body.by)
     if body.time and not body.date:
         raise HTTPException(status_code=422, detail="a pickup time needs a date")
-    case = _get_case(session, case_id)
+    case = _get_case(session, case_id, viewer, settings, act=True)
     local = f"{body.date} {body.time}" if body.date and body.time else body.date
     try:
         mark_booked(
             session,
             case,
-            by=body.by,
+            by=by,
             via=body.via,
             local=local,
             pickup_number=(body.pickup_number or "").strip() or None,
@@ -619,24 +731,31 @@ def post_booked(case_id: int, body: Booking, session: SessionDep, now: NowDep) -
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return _decided(session, case, now)
+    return _decided(session, case, now, viewer, settings)
 
 
 @router.post("/cases/{case_id}/reference")
 def post_reference(
-    case_id: int, body: Reference, session: SessionDep, now: NowDep
+    case_id: int,
+    body: Reference,
+    *,
+    session: SessionDep,
+    now: NowDep,
+    settings: SettingsDep,
+    viewer: ViewerDep,
 ) -> dict[str, Any]:
     """Add a number the desk needs (the customer's shipment or SO number) to the case."""
-    case = _get_case(session, case_id)
+    by = decided_by(viewer, body.by)
+    case = _get_case(session, case_id, viewer, settings, act=True)
     try:
-        add_reference(session, case, body.kind, body.value, by=body.by)
+        add_reference(session, case, body.kind, body.value, by=by)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return _decided(session, case, now)
+    return _decided(session, case, now, viewer, settings)
 
 
 @router.get("/references")
-def get_references() -> list[dict[str, str]]:
+def get_references(_viewer: ViewerDep) -> list[dict[str, str]]:
     """Every reference type with how a request writes it and its plain name."""
     return [
         {"kind": kind, "label": label, "name": REFERENCE_NAMES.get(kind, kind)}
@@ -646,11 +765,18 @@ def get_references() -> list[dict[str, str]]:
 
 @router.post("/cases/{case_id}/cancel")
 def post_cancel(
-    case_id: int, body: Cancellation, session: SessionDep, now: NowDep
+    case_id: int,
+    body: Cancellation,
+    *,
+    session: SessionDep,
+    now: NowDep,
+    settings: SettingsDep,
+    viewer: ViewerDep,
 ) -> dict[str, Any]:
     """Cancel a case that is no longer needed."""
-    case = _get_case(session, case_id)
+    by = decided_by(viewer, body.by)
+    case = _get_case(session, case_id, viewer, settings, act=True)
     if case.status == CaseStatus.CANCELED.value:
         raise HTTPException(status_code=409, detail=f"case {case_id} is already canceled")
-    close_case(session, case, by=body.by, reason=body.reason)
-    return _decided(session, case, now)
+    close_case(session, case, by=by, reason=body.reason)
+    return _decided(session, case, now, viewer, settings)

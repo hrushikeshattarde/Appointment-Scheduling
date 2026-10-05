@@ -140,6 +140,29 @@ The same works for pod 1160: copy `data/facility_profiles.db` the same way, then
 `profile portals` (without `--apply`) lists the portal vendors the URLs correct (31 on the
 2026-10-01 store: Costco, UNFI, Ahold, Publix, Bozzuto's and NCR portals filed as "other").
 
+## 5. Sign-in and access, on the copy (about 10 minutes)
+
+Until Google lists the redirect address, test everything else with sign-in off for that run:
+`serve --no-sign-in` (sections 2 to 4 work the same way).
+
+This needs the Google client in `.env` (README, "Who sees which customer"), with
+`http://localhost:8000/auth/callback` among its authorized redirect URIs and your email in
+`FP_BOARD_ADMINS`.
+
+1. Start the board on the copy from section 4: `serve --db sqlite:///./data/lidl-test.db`.
+   It should print "Google sign-in on; admins ...". Open `http://localhost:8000/` (localhost,
+   not 127.0.0.1, so the address matches the redirect URI).
+2. Google asks for an account: pick your circledelivers.com one. The board opens with your name
+   and Sign out in the top bar, and an Access tab.
+3. On Access, add a colleague's email (or a second company account of yours), set Lidl to
+   View and click Save changes. The history shows the change under your name.
+4. Sign in as them in a private window. They see only Lidl's cases and no Access tab. A case
+   panel says to ask an admin for View and act. Set them to View and act, and the actions
+   appear on their next page.
+5. Someone you have not added sees whom to ask, and no cases.
+6. With `$env:FP_DATABASE_URL = "sqlite:///./data/lidl-test.db"`, `access list` and
+   `access history` show the same from the command line.
+
 ## Do not run while testing
 
 - `booking send`: it emails vendors. It is refused anyway while `FP_BOOKING_MODE` is `draft`.
@@ -152,6 +175,8 @@ The same works for pod 1160: copy `data/facility_profiles.db` the same way, then
 - `booking writeback` with `FP_BOOKING_TPRO_WRITEBACK=true`: it writes appointments to real loads
   in Transport Pro. `--dry-run` only reads them. The automated tests use an in-memory Transport
   Pro.
+- `serve --host 0.0.0.0` without the Google client in `.env`: with no sign-in, anyone who can
+  reach the address sees every customer.
 - `serve-links --host 0.0.0.0`, or setting `FP_BOOKING_LINK_*` in `.env`: drafts would then carry
   links, and the pages would be reachable from outside this machine. Keep the link variables to
   the one terminal that serves the demo.

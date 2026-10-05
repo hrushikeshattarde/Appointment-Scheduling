@@ -46,7 +46,8 @@ def make_engine(database_url: str, *, echo: bool = False) -> Engine:
 
 
 def init_db(engine: Engine) -> None:
-    """Create missing tables (the booking agent's too), add new columns, upgrade old rows."""
+    """Create missing tables (the agent's and the board's), add new columns, upgrade old rows."""
+    from facility_profiles.access import models as _access_models  # noqa: F401, PLC0415
     from facility_profiles.booking import models as _booking_models  # noqa: F401, PLC0415
     from facility_profiles.booking.references import backfill_references  # noqa: PLC0415
     from facility_profiles.booking.worklist import migrate_legacy_statuses  # noqa: PLC0415

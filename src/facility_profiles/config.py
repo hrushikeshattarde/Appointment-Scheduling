@@ -16,6 +16,18 @@ from pydantic import AliasChoices, Field, SecretStr, field_validator, model_vali
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
+def _csv(value: object) -> list[str]:
+    """A comma-separated setting (or a list) as its non-blank parts."""
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    if isinstance(value, list | tuple):
+        return [str(part).strip() for part in value if str(part).strip()]
+    msg = "expected a comma-separated string or a list"
+    raise TypeError(msg)
+
+
 class RunMode(StrEnum):
     """Whether the routine may write profiles or only recommend them."""
 
@@ -144,6 +156,24 @@ class Settings(BaseSettings):
     # Off: each booking waits, and the board says to enter it there by hand.
     booking_tpro_writeback: bool = False
 
+    # --- Board sign-in and who sees which customer (access/; README "Who sees which customer")
+    # Google sign-in is on when both are set. Without them the board has no login: everyone who
+    # opens it sees every customer, so it stays on this machine (127.0.0.1).
+    google_client_id: str | None = None
+    google_client_secret: SecretStr | None = None
+    # Who sees every customer and gives others access, by email.
+    board_admins: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    # The Google Workspace domains whose accounts may sign in.
+    board_domains: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["circledelivers.com"]
+    )
+    # Signs the sign-in cookie. Not set: one is made on the first start and kept in the store.
+    board_session_secret: SecretStr | None = None
+    board_session_hours: float = Field(8, gt=0, le=24 * 30)
+    # The board's address as people open it (https://...), when a proxy in front of the server
+    # changes what the server sees; Google sends people back to <this>/auth/callback.
+    board_public_url: str | None = None
+
     # --- Group-mail archive in S3 (Pick Up Appointment threads) ---------------------------
     mail_archive_bucket: str | None = None
     mail_archive_prefix: str = ""
@@ -171,6 +201,30 @@ class Settings(BaseSettings):
             raise ValueError(msg)
         return url
 
+    @field_validator("board_public_url")
+    @classmethod
+    def _board_https(cls, value: str | None) -> str | None:
+        """People sign in over HTTPS, except on this machine for testing."""
+        if value is None or not value.strip():
+            return None
+        url = value.strip().rstrip("/")
+        local = url.startswith(("http://127.0.0.1", "http://localhost"))
+        if not url.startswith("https://") and not local:
+            msg = "FP_BOARD_PUBLIC_URL must start with https:// (http only for localhost)"
+            raise ValueError(msg)
+        return url
+
+    @field_validator("google_client_id")
+    @classmethod
+    def _blank_is_unset(cls, value: str | None) -> str | None:
+        return value.strip() if value and value.strip() else None
+
+    @field_validator("board_admins", "board_domains", mode="before")
+    @classmethod
+    def _lower_csv(cls, value: object) -> list[str]:
+        """Emails and domains compare in lower case: Megan@X and megan@x are one person."""
+        return [part.lower() for part in _csv(value)]
+
     @field_validator(
         "pilot_terminal_ids", "pilot_customer_ids", "booking_link_offsets_minutes", mode="before"
     )
@@ -196,14 +250,7 @@ class Settings(BaseSettings):
     )
     @classmethod
     def _split_csv(cls, value: object) -> list[str]:
-        if value is None or value == "":
-            return []
-        if isinstance(value, str):
-            return [part.strip() for part in value.split(",") if part.strip()]
-        if isinstance(value, list | tuple):
-            return [str(part).strip() for part in value if str(part).strip()]
-        msg = "expected a comma-separated string or a list"
-        raise TypeError(msg)
+        return _csv(value)
 
     @model_validator(mode="after")
     def _openrouter_needs_key(self) -> Settings:

@@ -3,8 +3,11 @@
 Run with ``facility-profiles serve`` (or ``uvicorn facility_profiles.api.app:create_app
 --factory``); the board is at ``/app/`` and its API under ``/api/booking``. ``serve`` also runs
 the booking timers every few minutes, so the board shows a vendor's silence or a pickup that
-slipped without anyone running a command. Authentication is left to the reverse proxy / single
-sign-on in front of this service (see the NFR section of the PRD).
+slipped without anyone running a command.
+
+Sign-in: with FP_GOOGLE_CLIENT_ID and FP_GOOGLE_CLIENT_SECRET set, people sign in with their
+Google Workspace account and see only the customers an admin gave them (api/auth.py,
+api/access.py); without them there is no login, so the board must stay on this machine.
 """
 
 from __future__ import annotations
@@ -15,15 +18,20 @@ from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy.orm import Session, sessionmaker
 
 from facility_profiles import __version__
+from facility_profiles.access import Viewer, signin_enabled
+from facility_profiles.access.service import session_secret
+from facility_profiles.api import access as access_api
+from facility_profiles.api import auth as auth_api
 from facility_profiles.api import booking as booking_api
 from facility_profiles.api import links as links_api
 from facility_profiles.booking.timers import sweep
@@ -37,7 +45,21 @@ from facility_profiles.storage.db import init_db, make_engine, session_factory, 
 from facility_profiles.storage.repository import Repository, unwrap
 
 BOARD = Path(__file__).parent / "static"
+WRITES = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 log = get_logger(__name__)
+
+
+def same_origin(request: Request, settings: Settings) -> bool:
+    """True unless the browser says the request comes from another site (a forged form post)."""
+    if request.headers.get("sec-fetch-site") == "cross-site":
+        return False
+    origin = request.headers.get("origin")
+    if origin is None:
+        return True  # not sent by a browser page, or an old one; the cookie is SameSite=Lax
+    allowed = {request.headers.get("host", "")}
+    if settings.board_public_url:
+        allowed.add(urlsplit(settings.board_public_url).netloc)
+    return urlsplit(origin).netloc in allowed
 
 
 class Decision(BaseModel):
@@ -130,9 +152,17 @@ def create_app(
     the agent's own pass by each customer's rules (off unless asked for).
     """
     settings = settings or get_settings()
+    if signin_enabled(settings) and not settings.board_admins:
+        msg = (
+            "Google sign-in is on but FP_BOARD_ADMINS names nobody, so no one could give "
+            "access; set FP_BOARD_ADMINS to your email"
+        )
+        raise ValueError(msg)
     engine = make_engine(settings.database_url)
     init_db(engine)
     sessions = session_factory(engine)
+    with session_scope(sessions) as session:
+        secret = session_secret(session, settings) if signin_enabled(settings) else b""
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -161,6 +191,24 @@ def create_app(
     app = FastAPI(title="Facility scheduling profiles", version=__version__, lifespan=lifespan)
     app.state.sessions = sessions
     app.state.settings = settings
+    app.state.session_secret = secret
+    if signin_enabled(settings):
+
+        @app.middleware("http")
+        async def board_writes_from_the_board(request: Request, call_next: Any) -> Response:
+            """A change (approve, give access...) must come from the board's own pages."""
+            if (
+                request.method in WRITES
+                and not request.url.path.startswith("/c/")
+                and not same_origin(request, settings)
+            ):
+                detail = "changes can only be made from the board itself"
+                return JSONResponse({"detail": detail}, status_code=403)
+            response: Response = await call_next(request)
+            return response
+
+    app.include_router(auth_api.router)
+    app.include_router(access_api.router)
     app.include_router(booking_api.router)
     # The vendor pages too, for trying links on this machine; in public they run on their own
     # (links_api.create_links_app), never with the board.
@@ -175,8 +223,12 @@ def create_app(
     def health() -> dict[str, str]:
         return {"status": "ok", "version": __version__}
 
+    admin = Depends(auth_api.require_admin)
+
     @app.get("/facilities")
-    def search(name: str, session: Session = Depends(get_session)) -> list[dict[str, Any]]:
+    def search(
+        name: str, session: Session = Depends(get_session), _admin: Viewer = admin
+    ) -> list[dict[str, Any]]:
         repo = Repository(session)
         return [
             {
@@ -191,7 +243,9 @@ def create_app(
         ]
 
     @app.get("/facilities/{facility_id}")
-    def facility(facility_id: int, session: Session = Depends(get_session)) -> dict[str, Any]:
+    def facility(
+        facility_id: int, session: Session = Depends(get_session), _admin: Viewer = admin
+    ) -> dict[str, Any]:
         repo = Repository(session)
         records = repo.find_facility(facility_id=facility_id)
         if not records:
@@ -213,7 +267,9 @@ def create_app(
         }
 
     @app.get("/review")
-    def review(session: Session = Depends(get_session)) -> list[dict[str, Any]]:
+    def review(
+        session: Session = Depends(get_session), _admin: Viewer = admin
+    ) -> list[dict[str, Any]]:
         repo = Repository(session)
         return [
             {
@@ -232,16 +288,20 @@ def create_app(
 
     @app.post("/review/{item_id}")
     def decide(
-        item_id: int, body: Decision, session: Session = Depends(get_session)
+        item_id: int,
+        body: Decision,
+        session: Session = Depends(get_session),
+        viewer: Viewer = admin,
     ) -> dict[str, Any]:
         service = ReviewService(Repository(session))
+        by = auth_api.decided_by(viewer, body.by)
         try:
             if body.action == "accept":
-                item = service.accept(item_id, by=body.by)
+                item = service.accept(item_id, by=by)
             elif body.action == "edit":
-                item = service.edit(item_id, body.value or "", by=body.by)
+                item = service.edit(item_id, body.value or "", by=by)
             elif body.action == "reject":
-                item = service.reject(item_id, by=body.by)
+                item = service.reject(item_id, by=by)
             else:
                 raise HTTPException(status_code=400, detail="action must be accept, edit or reject")
         except ReviewError as exc:
@@ -249,7 +309,7 @@ def create_app(
         return {"id": item.id, "status": item.status}
 
     @app.get("/digest")
-    def digest(session: Session = Depends(get_session)) -> dict[str, str]:
+    def digest(session: Session = Depends(get_session), _admin: Viewer = admin) -> dict[str, str]:
         repo = Repository(session)
         return {"markdown": render_digest(repo, repo.latest_run(), now=datetime.now(tz=UTC))}
 

@@ -5,6 +5,7 @@ facility-profiles check-tpro
 facility-profiles harvest --terminal 1160 --days 90
 facility-profiles harvest --customer lidl --days 90     (or --customer 7211 --terminal 1089)
 facility-profiles customers list | show lidl | new acme --name Acme --tpro-customer 1234
+facility-profiles access list | grant am@circledelivers.com lidl --act --by name | revoke ...
 facility-profiles run --no-harvest --cap 50
 facility-profiles lookup 196508
 facility-profiles review list | accept 12 --by name | edit 12 --value ... | reject 12
@@ -16,12 +17,14 @@ from __future__ import annotations
 
 import atexit
 import json
+from collections.abc import Callable
 from contextlib import ExitStack
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Annotated
 
 import typer
+from sqlalchemy.orm import Session
 
 from facility_profiles import __version__
 from facility_profiles.booking.models import CaseStatus, ExceptionType
@@ -64,6 +67,11 @@ customers_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(customers_app, name="customers")
+access_app = typer.Typer(
+    help="Who sees which customer on the appointments board (admins: FP_BOARD_ADMINS).",
+    no_args_is_help=True,
+)
+app.add_typer(access_app, name="access")
 
 log = get_logger(__name__)
 
@@ -167,6 +175,14 @@ def serve(
             "(drafts; sends only where a rule and send mode say so); 0, the default, is off"
         ),
     ] = 0,
+    no_sign_in: Annotated[
+        bool,
+        typer.Option(
+            "--no-sign-in",
+            help="Leave Google sign-in off for this run, though .env sets it up (for testing "
+            "on this machine only; refused with another --host)",
+        ),
+    ] = False,
 ) -> None:
     """Run the appointments board (/app/) and the HTTP API. Needs the api extra."""
     try:
@@ -174,12 +190,35 @@ def serve(
     except ImportError as exc:
         typer.echo("the board needs the api extra: uv sync --extra api")
         raise typer.Exit(code=2) from exc
+    from facility_profiles.access import signin_enabled
     from facility_profiles.api.app import create_app
 
     settings = _settings()
     if db:
         settings = settings.model_copy(update={"database_url": db})
+    local = host in {"127.0.0.1", "localhost", "::1"}
+    if no_sign_in:
+        if not local:
+            typer.echo("--no-sign-in is for this machine only: leave --host at 127.0.0.1")
+            raise typer.Exit(code=2)
+        settings = settings.model_copy(update={"google_client_id": None})
+    if signin_enabled(settings) and not settings.board_admins:
+        typer.echo("Google sign-in is on: set FP_BOARD_ADMINS to your email first")
+        raise typer.Exit(code=2)
     typer.echo(f"appointments board: http://{host}:{port}/app/  (store {settings.database_url})")
+    if no_sign_in:
+        typer.echo("sign-in off for this run (--no-sign-in): this machine only, every customer")
+    if signin_enabled(settings):
+        base = settings.board_public_url or f"http://{'localhost' if local else host}:{port}"
+        typer.echo(
+            f"Google sign-in on; admins {', '.join(settings.board_admins)}; "
+            f"Google sends people back to {base}/auth/callback"
+        )
+    elif not local:
+        typer.echo(
+            "warning: no sign-in (FP_GOOGLE_CLIENT_ID and FP_GOOGLE_CLIENT_SECRET unset), so "
+            "anyone who can reach this address sees every customer"
+        )
     if timers_every > 0:
         typer.echo(f"booking timers run every {timers_every:g} min")
     if autopilot_every > 0:
@@ -1999,6 +2038,133 @@ def customers_new(
         typer.echo(f"still to fill in:\n{exc}")
         return
     typer.echo(f"it reads cleanly; next: facility-profiles customers show {key}")
+
+
+# ------------------------------------------------------------------ access
+
+
+def _access_change(action: str, run: Callable[[Session, Settings], str | None]) -> None:
+    """Run one access change in a transaction, saying what happened or why it could not be."""
+    from facility_profiles.access import AccessError
+
+    settings = _settings()
+    try:
+        with session_scope(_sessions(settings)) as session:
+            said = run(session, settings)
+    except AccessError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+    typer.echo(said or f"nothing to {action}")
+
+
+@access_app.command("list")
+def access_list() -> None:
+    """Admins, and everyone on the board with what they see for each customer."""
+    from facility_profiles.access import access_grid
+
+    settings = _settings()
+    with session_scope(_sessions(settings)) as session:
+        grid = access_grid(session, settings, now=datetime.now(tz=UTC))
+    for email in grid["admins"]:
+        typer.echo(f"{email:<40} admin: every customer")
+    names = {c["key"]: c["name"] for c in grid["customers"]}
+    for person in grid["people"]:
+        held = [
+            f"{names.get(k, k)} {a['level']}"
+            + (f" until {a['until']}" if a["until"] else "")
+            + (" (ended)" if a["ended"] else "")
+            for k, a in person["access"].items()
+        ]
+        typer.echo(f"{person['email']:<40} {', '.join(held) or 'no customer yet'}")
+    if not grid["admins"] and not grid["people"]:
+        typer.echo("nobody yet: set FP_BOARD_ADMINS, then grant access")
+
+
+@access_app.command("grant")
+def access_grant(
+    email: Annotated[str, typer.Argument(help="Their Google Workspace email")],
+    customer: Annotated[str, typer.Argument(help="The customer file's key, e.g. lidl")],
+    by: Annotated[str, typer.Option(help="Who is giving it (kept in the history)")],
+    act: Annotated[
+        bool, typer.Option("--act/--view", help="Also approve, book and cancel, or only view")
+    ] = False,
+    until: Annotated[
+        str | None, typer.Option(help="Last day it holds, YYYY-MM-DD (default: no end)")
+    ] = None,
+    note: Annotated[str | None, typer.Option(help="Why, for the history")] = None,
+) -> None:
+    """Give someone a customer (adding them to the board), or change what they have."""
+    from facility_profiles.access import AccessLevel, set_access
+
+    end = date.fromisoformat(until) if until else None
+    level = AccessLevel.ACT if act else AccessLevel.VIEW
+
+    def run(session: Session, settings: Settings) -> str | None:
+        done = set_access(
+            session,
+            settings,
+            email,
+            customer,
+            level,
+            by=by,
+            until=end,
+            note=note,
+            now=datetime.now(tz=UTC),
+        )
+        return f"{done}: {email.strip().lower()} {level.value} on {customer}" if done else None
+
+    _access_change("change", run)
+
+
+@access_app.command("revoke")
+def access_revoke(
+    email: Annotated[str, typer.Argument(help="Their email")],
+    customer: Annotated[str, typer.Argument(help="The customer file's key, e.g. lidl")],
+    by: Annotated[str, typer.Option(help="Who is taking it back (kept in the history)")],
+) -> None:
+    """Take back one customer from someone."""
+    from facility_profiles.access import set_access
+
+    def run(session: Session, settings: Settings) -> str | None:
+        done = set_access(session, settings, email, customer, None, by=by, now=datetime.now(tz=UTC))
+        return f"revoked: {email.strip().lower()} on {customer}" if done else None
+
+    _access_change("revoke", run)
+
+
+@access_app.command("remove")
+def access_remove(
+    email: Annotated[str, typer.Argument(help="Their email")],
+    by: Annotated[str, typer.Option(help="Who is removing them (kept in the history)")],
+) -> None:
+    """Take someone off the board, with every customer they had."""
+    from facility_profiles.access import remove_person
+
+    def run(session: Session, _settings: Settings) -> str | None:
+        n = remove_person(session, email, by=by, now=datetime.now(tz=UTC))
+        return f"removed: {email.strip().lower()} ({n} customer{'' if n == 1 else 's'} taken back)"
+
+    _access_change("remove", run)
+
+
+@access_app.command("history")
+def access_history(
+    email: Annotated[str | None, typer.Option(help="Only this person's")] = None,
+    limit: Annotated[int, typer.Option(help="How many, latest first")] = 50,
+) -> None:
+    """Who gave, changed or took back what, latest first."""
+    from facility_profiles.access import history
+
+    settings = _settings()
+    with session_scope(_sessions(settings)) as session:
+        rows = history(session, limit=limit, email=email)
+        for c in rows:
+            parts = [c.customer_key, c.level, f"until {c.until.isoformat()}" if c.until else None]
+            what = " ".join(part for part in parts if part)
+            when = c.at.strftime("%Y-%m-%d %H:%M")
+            typer.echo(f"{when}  {c.by}: {c.action} {c.email} {what}".rstrip())
+    if not rows:
+        typer.echo("no changes yet")
 
 
 if __name__ == "__main__":  # pragma: no cover

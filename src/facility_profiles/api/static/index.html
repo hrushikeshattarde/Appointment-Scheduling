@@ -9,20 +9,28 @@
   </head>
   <body>
     <header class="topbar">
-      <div class="brand"><span class="logo" aria-hidden="true">&#9638;</span> Pickup appointments</div>
-      <nav class="tabs" aria-label="Views">
-        <a href="#overview" data-tab="overview">Overview</a>
-        <a href="#appointments" data-tab="appointments">Appointments</a>
-        <a href="#week" data-tab="week">This week</a>
+      <a class="brand" href="#overview" aria-label="Pickup appointments, home">
+        <span class="mark" aria-hidden="true"></span>
+        <span class="words"><span class="company">Circle Logistics</span><span class="product">Pickup appointments</span></span>
+      </a>
+      <nav class="tabs" aria-label="Pages">
+        <a href="#overview" data-tab="overview" data-icon="home">Home <span id="attention-count" class="count" hidden></span></a>
+        <a href="#appointments" data-tab="appointments" data-icon="list">All pickups</a>
+        <a href="#week" data-tab="week" data-icon="calendar">Calendar</a>
+        <a href="#access" data-tab="access" data-icon="users" id="access-tab" hidden>Access</a>
       </nav>
       <div class="tools">
         <label>Customer
           <select id="customer"><option value="">All customers</option></select>
         </label>
-        <label>You
-          <input id="me" type="text" placeholder="your name" autocomplete="name" size="11" />
+        <label id="me-label">Your name
+          <input id="me" type="text" placeholder="for the record" autocomplete="name" size="12" />
         </label>
-        <button id="refresh" class="btn" type="button">Refresh</button>
+        <span id="who" class="who-chip" hidden></span>
+        <form id="signout" method="post" action="/auth/logout" hidden>
+          <button class="btn small" type="submit">Sign out</button>
+        </form>
+        <button id="refresh" class="btn small" type="button" title="Load the latest">Refresh</button>
         <span id="stamp" class="stamp" aria-live="polite"></span>
       </div>
     </header>

@@ -207,24 +207,94 @@ A web page for account managers and the pod to keep track of every pickup appoin
 same store the agent writes. Start it with `facility-profiles serve --db <store>` and open
 `http://127.0.0.1:8000/app/`.
 
-- **Overview**: what needs a person (with what to do about it), pickups whose time passed without
-  a booking, what is coming up in the next seven days, totals, and to-dos by type. Every tile and
-  bar opens the matching list.
-- **Appointments**: every case by pickup time, filtered by status, to-do, customer, pickup dates
-  and past due, and searched by PO, load, vendor, pickup number or delivery reference.
-- **This week**: a calendar of pickups by day, coloured by status, with to-do counts.
-- **One case** (a side panel): progress (not requested, requested, booked), the open to-dos with
-  a hint each, the appointment's facts, the email thread with how the agent read each reply, and
-  a timeline of events and to-dos. Actions: approve the vendor's confirmation, resolve a to-do
-  with a note, mark a pickup booked another way (phone, portal, email), cancel. Each decision is
-  recorded under the name entered in the page.
+It is written for account managers, in plain words, with one colour per meaning on every page:
+green booked, blue asked the vendor, amber needs a person, red missed, grey not booked yet
+(Circle Logistics colours; light and dark follow the computer's setting).
+
+- **Home**: a greeting, a four-step "how booking works" strip (dismissable), totals (needs your
+  attention, missed pickups, not asked yet, waiting on vendor, booked), what needs a person with
+  what to do about it, the next seven days by day, missed pickups and to-dos by type. Every
+  total and bar opens the matching list; the Home tab shows how many pickups need attention.
+- **All pickups**: every pickup by time, with a search box (PO, load, vendor, pickup number,
+  delivery reference), status tabs with counts, and more filters (to-do, pickup dates, missed
+  only). On a phone the rows become cards.
+- **Calendar**: the week by day, each pickup coloured by where it stands, with to-do counts.
+- **One pickup** (a side panel): what is happening in one sentence, the steps (not asked yet,
+  asked the vendor, booked), the to-dos with a hint each, what you can do (approve the vendor's
+  time, I booked it myself, cancel), the pickup details, the emails with how the agent read each
+  reply, the history, and more details folded away. Each decision is recorded under the
+  signed-in name (without sign-in, the name typed in the page).
+- **Access** (admins only): who sees which customer; see [Who sees which customer](#who-sees-which-customer).
 
 The board never sends mail and never writes to Transport Pro itself; approving records the
-decision as `booking approve` does and queues the slot for write-back. It has no login of its own: keep it on `127.0.0.1`, or put it behind the
-company's single sign-on before anyone else can reach it. One server shows one store, so run one
+decision as `booking approve` does and queues the slot for write-back. Without Google sign-in
+(below) it has no login: keep it on `127.0.0.1`. One server shows one store, so run one
 per pod (`--db`) until the stores move to Postgres. To show it without real data,
 `python scripts/seed_booking_demo.py --db sqlite:///./data/booking-demo.db` fills a new store with
 20 invented cases, one per situation, built through the agent's own code and the timers.
+
+### Who sees which customer
+
+With Google sign-in on, people sign in with their circledelivers.com Google Workspace account and
+see only the customers an admin gave them. Admins see every customer and give access on the
+board's **Access** tab: one row per person, one column per customer file, and each cell is
+**No access**, **View** (watch the bookings: cases, to-dos, emails, timeline) or **View and act**
+(also approve, mark booked, add a number, resolve, cancel), with an optional last day. Every
+add, grant, change, revoke and removal is kept in the history under the admin who made it.
+
+Turn it on in `.env` (git-ignored; never in the repository, which is public):
+
+```
+FP_GOOGLE_CLIENT_ID=...apps.googleusercontent.com
+FP_GOOGLE_CLIENT_SECRET=...
+FP_BOARD_ADMINS=you@circledelivers.com        # comma-separated; they see everything
+# FP_BOARD_DOMAINS=circledelivers.com         # Workspace domains that may sign in (default)
+# FP_BOARD_SESSION_HOURS=8                    # how long a sign-in lasts
+# FP_BOARD_PUBLIC_URL=https://board.example   # when a proxy in front changes the address
+# FP_BOARD_SESSION_SECRET=                    # unset: made on first start, kept in the store
+```
+
+In Google Cloud Console the OAuth client must be a **Web application** whose authorized redirect
+URIs include `<board address>/auth/callback`: `http://localhost:8000/auth/callback` for a try on
+this machine (open the board as `localhost`, not `127.0.0.1`), and the real `https://` address
+once it is hosted. `serve` prints the address it expects. A consent screen of type **Internal**
+keeps other Google accounts out before they reach the board; the board checks anyway.
+
+How it holds:
+
+- Signing in uses Google's code flow: a one-time state and nonce, the code traded for the ID
+  token with the client secret, and the token's issuer, audience, expiry, nonce, verified email
+  and Workspace domain (`hd`) checked. A personal Google account made with a work address has no
+  `hd` and is turned away.
+- The sign-in cookie is signed (HMAC-SHA256), HttpOnly and SameSite=Lax, and lasts
+  `FP_BOARD_SESSION_HOURS`. Access is read from the store on every request, so a change holds
+  from the person's next page; nobody has to sign out.
+- The server does the filtering: every `/api/booking` route answers with the person's customers
+  only, another customer's case is "not found", and a decision on a View customer is refused.
+  The facility, review and digest pages are for admins. A change (POST) from another site is
+  refused.
+- A case belongs to the customer file that claims its Transport Pro customer (`customers
+  show`); a case no file claims is shown to admins only.
+- Someone who signs in before being given a customer sees whom to ask.
+- Without `FP_GOOGLE_CLIENT_ID` and `FP_GOOGLE_CLIENT_SECRET` nothing changes: no login,
+  everyone at the machine is an admin, decisions take the typed name. The Access tab still works
+  then, so access can be set up before sign-in is switched on. With sign-in on and no
+  `FP_BOARD_ADMINS`, `serve` refuses to start.
+- `serve --no-sign-in` leaves sign-in off for one run even with the Google client in `.env`,
+  for testing on this machine (it refuses any `--host` but this machine's).
+
+The same from the command line, for scripts or when the board is not running:
+
+```
+facility-profiles access list
+facility-profiles access grant am@circledelivers.com lidl --view --by "Your Name"
+facility-profiles access grant am@circledelivers.com lidl --act --until 2026-12-31 --by "Your Name"
+facility-profiles access revoke am@circledelivers.com lidl --by "Your Name"
+facility-profiles access remove am@circledelivers.com --by "Your Name"
+facility-profiles access history [--email am@circledelivers.com]
+```
+
+A new customer is a new column: `customers new <key>`, then give the account manager access.
 
 ### Status and exceptions
 
@@ -733,11 +803,11 @@ the board on a demo store, the commands, and a pod's real cases on a copy of its
   the allowed `appointments.method` values, the `needsAppointment` filter definition.
 - Receiving-hours inference from actual arrival and departure times (`/voiceai/load/{id}`) is
   modelled but not yet wired into collect.
-- Digest delivery (email or Slack) and single sign-on in front of the API are deployment
-  concerns not included here.
+- Digest delivery (email or Slack) is a deployment concern not included here. Google sign-in
+  is built in; hosting the board (HTTPS, a shared Postgres store) is still to do.
 - Alembic migrations before Postgres.
-- Customers: the board and `GET /api/booking/today` still filter by Transport Pro customer name,
-  not by customer key; the S3 collector's deploy script still deploys Lidl's function only
+- Customers: the board's Customer filter and `GET /api/booking/today?customer=` still take the
+  Transport Pro customer name, not the customer key (who sees what goes by key); the S3 collector's deploy script still deploys Lidl's function only
   (`circle-lidl-mail-collector`), so a second customer's collector needs its own function name,
   bucket or prefix and `ARCHIVE_CUSTOMER`. The vendor-desk lists (`FP_BOOKING_SHARED_DESKS`,
   `FP_BOOKING_PO_DATE_FLOOR_DESKS`) belong on the vendor profiles as desk rules.
