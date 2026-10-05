@@ -55,6 +55,9 @@ class ExceptionType(StrEnum):
     TPRO_MISMATCH = "tpro_mismatch"
     # The vendor confirmed a different day, or a time more than two hours from the one asked for.
     CONFIRMED_OUTSIDE_WINDOW = "confirmed_outside_window"
+    # Transport Pro shows the load canceled after a request was written or the pickup booked
+    # (booking/service.py refresh): the vendor still holds the slot.
+    LOAD_CANCELED = "load_canceled"
 
 
 class BookingCase(Base):
@@ -93,6 +96,10 @@ class BookingCase(Base):
     reference_numbers: Mapped[dict[str, Any]] = mapped_column(
         JSON, default=dict, server_default="{}"
     )
+    # What Transport Pro said about the load at the last scan (load status, the stop's
+    # appointment, tender, pickup number, delivery slot, POs). A rescan applies only what changed
+    # there since, so it never undoes a slot a person or the customer's desk gave the case.
+    tpro_seen: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     thread_id: Mapped[str | None] = mapped_column(String(128), index=True)
     status: Mapped[str] = mapped_column(String(24), default=CaseStatus.UNSCHEDULED.value)
     # Why the case has its status (a deferral, a decline, a closure, an earlier booking). What a

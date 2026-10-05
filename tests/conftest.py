@@ -236,10 +236,16 @@ class FakeTPro:
         self.calls: list[str] = []
 
     def iter_loads(self, **filters: Any) -> Iterator[Load]:
+        """Loads in the pickup window. Like Transport Pro, a canceled load only when asked for
+        with ``load_status``."""
         self.calls.append(f"iter_loads {sorted(filters)}")
         start = filters.get("pickup_date_start")
         end = filters.get("pickup_date_end")
+        wanted = str(filters.get("load_status") or "").lower()
         for load in self._loads:
+            status = ((load.status.load_status if load.status else None) or "").lower()
+            if (wanted and status != wanted) or (not wanted and status == "canceled"):
+                continue
             first = load.waypoints[0].appointment_time if load.waypoints else None
             pickup = (first.open or "")[:10] if first else ""
             if (start and pickup < start) or (end and pickup > end):

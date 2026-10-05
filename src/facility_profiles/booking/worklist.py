@@ -50,6 +50,12 @@ KINDS: dict[str, tuple[str, str]] = {
         "The desk will not book without this number. Get it from the customer and add it to "
         "the case; the request is drafted with it.",
     ),
+    "load_canceled": (
+        "Load canceled",
+        "Transport Pro shows this load canceled, but a request was already written or the pickup "
+        "booked. Tell the vendor the pickup is no longer needed (or delete the draft if it was "
+        "never sent), then cancel the pickup here.",
+    ),
     "tpro_mismatch": (
         "Transport Pro has another time",
         "Transport Pro already shows a different confirmed appointment for this pickup, and the "

@@ -29,6 +29,7 @@ SILENCE = frozenset(k.value for k in UNANSWERED)
 # Most urgent first. A pickup that already slipped, or a vendor silent for two days, comes before
 # a desk missing from a profile.
 URGENCY: tuple[str, ...] = (
+    ExceptionType.LOAD_CANCELED.value,
     ExceptionType.PICKUP_EXPIRED.value,
     ExceptionType.LOAD_INFEASIBLE.value,
     ExceptionType.UNANSWERED_48H.value,

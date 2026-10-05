@@ -15,7 +15,7 @@ import math
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -125,6 +125,12 @@ from facility_profiles.tpro.models import Load, Waypoint
 log = get_logger(__name__)
 
 PO_RE = re.compile(r"\b\d{9,15}\b")
+# A PO field can list several, the way the pod writes them: "115806102630 & 115806102631".
+PO_LIST_RE = re.compile(r"^\d+(?:\s*[&,;/+]\s*\d+)*$")
+REFRESH_ACTOR = "agent"
+# Transport Pro's load search leaves canceled loads out unless asked for this status (checked
+# live on 2026-10-05: pod 1089, Lidl inbound), so the scan asks for them separately.
+CANCELED_STATUS = "Canceled"
 OPEN_STATUSES = (
     CaseStatus.UNSCHEDULED.value,
     CaseStatus.PENDING.value,
@@ -154,6 +160,11 @@ class ScanStats:
     needs_profile: int = 0
     already_booked: int = 0
     skipped_by_rule: int = 0  # a customer rule says the agent does not book these
+    canceled_loads: int = 0  # canceled in Transport Pro before any case was opened
+    refreshed: int = 0  # existing cases that took a change from Transport Pro
+    cases_canceled: int = 0  # load canceled before anything was written: case canceled
+    load_canceled: int = 0  # load canceled after a request or a booking: raised for a person
+    booked_in_tpro: int = 0  # a pickup number or a confirmed stop appeared in Transport Pro
     case_ids: list[int] = field(default_factory=list)
 
 
@@ -195,14 +206,48 @@ def delivery_waypoint(load: Load) -> Waypoint | None:
 
 
 def po_numbers(load: Load) -> list[str]:
-    """Customer order numbers on the load (PO and reference number)."""
+    """Customer order numbers on the load (PO and reference number).
+
+    A field may list several ("115806102630 & 115806102631"); a value with anything but digits
+    and those separators is not a PO.
+    """
     ref = load.reference or {}
     seen: list[str] = []
     for name in ("poNumber", "referenceNumber"):
         value = str(ref.get(name) or "").strip()
-        if value and value.isdigit() and value not in seen:
-            seen.append(value)
+        if not PO_LIST_RE.match(value):
+            continue
+        for part in re.findall(r"\d+", value):
+            if part not in seen:
+                seen.append(part)
     return seen
+
+
+def load_canceled(load: Load) -> bool:
+    """True when Transport Pro shows the load canceled (its load status "Canceled")."""
+    status = (load.status.load_status if load.status else None) or ""
+    return status.strip().lower().startswith("cancel")
+
+
+def _iso_utc(value: datetime | None) -> str | None:
+    aware = as_utc(value)
+    return aware.astimezone(UTC).isoformat() if aware else None
+
+
+def tpro_view(load: Load, wp: Waypoint, customer: Customer) -> dict[str, Any]:
+    """What Transport Pro says about the load and its pickup now, as a case keeps it."""
+    appt = wp.appointment_time
+    drop = delivery_waypoint(load)
+    delivery_at = drop.appointment_time.open_at if drop and drop.appointment_time else None
+    return {
+        "load_status": load.status.load_status if load.status else None,
+        "appointment_status": appt.appointment_status if appt else None,
+        "tender": _iso_utc(appt.open_at if appt else None),
+        "pickup_number": str((load.reference or {}).get("pickupNumber") or "").strip() or None,
+        "delivery_ref": customer.find_delivery_ref(drop.notes) if drop else None,
+        "delivery_at": _iso_utc(delivery_at),
+        "po_numbers": po_numbers(load),
+    }
 
 
 def requested_local(
@@ -309,7 +354,7 @@ def _event(
 # ------------------------------------------------------------------ scan
 
 
-def scan(
+def scan(  # noqa: PLR0912 - one branch per kind of load
     client: TransportProClient,
     sessions: sessionmaker[Session],
     settings: Settings,
@@ -330,31 +375,42 @@ def scan(
     known = customers(settings)
     with session_scope(sessions) as session:
         repo = Repository(session)
+        seen_loads: set[int] = set()
         for load in iter_terminal_loads(
             client, terminal_ids=terminals, customer_ids=billed_to, start=start, end=end
         ):
             stats.loads += 1
+            seen_loads.add(load.id)
             found = pickup_waypoint(load)
             if found is None:
                 stats.no_pickup_stop += 1
                 continue
             index, wp = found
+            customer_id = load.billing_info.customer_id if load.billing_info else None
+            customer = known.for_customer(customer_id, load.customer_name)
+            existing = _case_for_stop(session, load.id, index)
+            if existing is not None:
+                stats.existing += 1
+                refresh_case(
+                    session,
+                    existing,
+                    load,
+                    wp,
+                    customer=customer,
+                    settings=settings,
+                    now=now,
+                    stats=stats,
+                )
+                continue
+            if load_canceled(load):
+                stats.canceled_loads += 1
+                continue
             appt = wp.appointment_time
             if appt and (appt.appointment_status or "").lower() == "confirmed":
                 stats.already_confirmed += 1
                 continue
-            existing = session.scalar(
-                select(BookingCase).where(
-                    BookingCase.load_id == load.id, BookingCase.waypoint_index == index
-                )
-            )
-            if existing is not None:
-                stats.existing += 1
-                continue
             key = resolver.resolve(stop_identity(wp)).key
             profile = vendor_profile(repo, key)
-            customer_id = load.billing_info.customer_id if load.billing_info else None
-            customer = known.for_customer(customer_id, load.customer_name)
             drop = delivery_waypoint(load)
             delivery_at = drop.appointment_time.open_at if drop and drop.appointment_time else None
             delivery_ref = customer.find_delivery_ref(drop.notes) if drop else None
@@ -400,6 +456,7 @@ def scan(
                 pickup_number=pickup_no or None,
                 status=status,
                 reason=reason,
+                tpro_seen=tpro_view(load, wp, customer),
             )
             case.requested_local = requested_local(
                 tendered_pickup_utc=case.tendered_pickup_utc,
@@ -435,7 +492,344 @@ def scan(
                 stats.already_booked += 1
             elif blocker is not None:
                 stats.needs_profile += 1
+        _canceled_pass(
+            client,
+            session,
+            settings,
+            terminals=terminals,
+            billed_to=billed_to,
+            start=start,
+            end=end,
+            skip=seen_loads,
+            now=now,
+            stats=stats,
+        )
     return stats
+
+
+def _case_for_stop(session: Session, load_id: int, index: int) -> BookingCase | None:
+    """The case already open for this pickup stop, if any."""
+    return session.scalar(
+        select(BookingCase).where(
+            BookingCase.load_id == load_id, BookingCase.waypoint_index == index
+        )
+    )
+
+
+def _canceled_pass(
+    client: TransportProClient,
+    session: Session,
+    settings: Settings,
+    *,
+    terminals: list[int | None],
+    billed_to: list[int | None],
+    start: date,
+    end: date,
+    skip: set[int],
+    now: datetime,
+    stats: ScanStats,
+) -> None:
+    """The canceled loads in the window: their cases are canceled or raised, nothing is opened.
+
+    Transport Pro only returns canceled loads when asked for them (:data:`CANCELED_STATUS`).
+    """
+    known = customers(settings)
+    for load in iter_terminal_loads(
+        client,
+        terminal_ids=terminals,
+        customer_ids=billed_to,
+        start=start,
+        end=end,
+        extra_filters={"load_status": CANCELED_STATUS},
+    ):
+        if load.id in skip or not load_canceled(load):
+            continue
+        found = pickup_waypoint(load)
+        existing = _case_for_stop(session, load.id, found[0]) if found else None
+        if found is None or existing is None:
+            stats.canceled_loads += 1
+            continue
+        customer_id = load.billing_info.customer_id if load.billing_info else None
+        refresh_case(
+            session,
+            existing,
+            load,
+            found[1],
+            customer=known.for_customer(customer_id, load.customer_name),
+            settings=settings,
+            now=now,
+            stats=stats,
+        )
+
+
+# ------------------------------------------------------------------ refresh
+
+
+@dataclass
+class _Seen:
+    """Transport Pro now (``view``) against the last scan (``before``, None for an older case)."""
+
+    view: dict[str, Any]
+    before: dict[str, Any] | None
+
+    def changed(self, key: str, on_case: Any) -> bool:
+        """True when Transport Pro has a new value for ``key`` to put on the case.
+
+        Something cleared in Transport Pro is not taken off the case. An older case, from before
+        the scans kept what they saw, takes only what it lacks.
+        """
+        value = self.view[key]
+        if value in (None, []):
+            return False
+        if self.before is None:
+            return on_case in (None, [], "")
+        return bool(value != self.before.get(key))
+
+
+def refresh_case(
+    session: Session,
+    case: BookingCase,
+    load: Load,
+    wp: Waypoint,
+    *,
+    customer: Customer,
+    settings: Settings,
+    now: datetime,
+    stats: ScanStats | None = None,
+) -> list[str]:
+    """Bring a case up to date with its load in Transport Pro; return what changed.
+
+    Only what changed in Transport Pro since the last scan is taken (``tpro_seen``), so a slot a
+    person or the customer's desk gave the case stands. A rescan:
+
+    - load canceled: a case nothing was written for is canceled; one with a request written or
+      a booking made raises ``load_canceled`` (once) for a person to tell the vendor;
+    - a vendor pickup number, or the stop confirmed, in Transport Pro: the pickup was booked
+      there; the case is scheduled and nothing is queued to write back (it is there already);
+    - a new or moved delivery slot (the delivery reference in the delivery stop's notes, the
+      stop's time): kept on the case. Once a request is out, a moved slot raises
+      ``delivery_moved``;
+    - a new tender time, and new POs while no request is written: kept on the case. Before any
+      request, the pickup time is chosen again from what changed, and the desk's rules rechecked.
+    """
+    stats = stats if stats is not None else ScanStats()
+    if case.status == CaseStatus.CANCELED.value:
+        return []
+    seen = _Seen(tpro_view(load, wp, customer), case.tpro_seen)
+    if load_canceled(load):
+        done = _refresh_canceled(session, case, seen, now=now, stats=stats)
+    else:
+        booked = _refresh_booking(session, case, wp, seen, now=now, stats=stats)
+        delivery = _refresh_delivery(session, case, seen, now=now)
+        request = _refresh_request(
+            session, case, seen, customer, settings, now=now, replan=bool(delivery)
+        )
+        done = [*booked, *delivery, *request]
+    case.tpro_seen = seen.view
+    if done:
+        stats.refreshed += 1
+    return done
+
+
+def _refresh_canceled(
+    session: Session, case: BookingCase, seen: _Seen, *, now: datetime, stats: ScanStats
+) -> list[str]:
+    """The load was canceled: cancel a case nothing went out for, else tell a person once."""
+    if case.status == CaseStatus.UNSCHEDULED.value and not has_request(case):
+        close_case(session, case, by=REFRESH_ACTOR, reason="the load was canceled in Transport Pro")
+        stats.cases_canceled += 1
+        return ["canceled"]
+    if any(e.kind == ExceptionType.LOAD_CANCELED.value for e in case.exceptions):
+        return []  # raised before; a person's resolution stands
+    what = (
+        "delete the drafted request (it was not sent), then cancel the pickup"
+        if case.status == CaseStatus.UNSCHEDULED.value
+        else "tell the vendor the pickup is no longer needed, then cancel it"
+    )
+    flag(
+        session,
+        case,
+        ExceptionType.LOAD_CANCELED,
+        f"the load was canceled in Transport Pro; {what}",
+        at=now,
+        load_status=seen.view["load_status"],
+    )
+    stats.load_canceled += 1
+    return ["load_canceled"]
+
+
+def _refresh_booking(
+    session: Session,
+    case: BookingCase,
+    wp: Waypoint,
+    seen: _Seen,
+    *,
+    now: datetime,
+    stats: ScanStats,
+) -> list[str]:
+    """A pickup number or a confirmed stop in Transport Pro: keep it, and book an open case."""
+    done: list[str] = []
+    if seen.changed("pickup_number", case.pickup_number):
+        record_reference(
+            session,
+            case,
+            ReferenceType.PICKUP_NUMBER.value,
+            seen.view["pickup_number"],
+            source=ReferenceSource.LOAD,
+            at=now,
+        )
+        done.append("pickup_number")
+    confirmed = (seen.view["appointment_status"] or "").lower() == "confirmed"
+    before = (seen.before or {}).get("appointment_status") or ""
+    newly_confirmed = confirmed and before.lower() != "confirmed"
+    if case.status in OPEN_STATUSES and (done or newly_confirmed):
+        _booked_in_tpro(session, case, wp, confirmed=confirmed)
+        stats.booked_in_tpro += 1
+        done.append("booked")
+    return done
+
+
+def _refresh_delivery(
+    session: Session, case: BookingCase, seen: _Seen, *, now: datetime
+) -> list[str]:
+    """A new or moved delivery slot in Transport Pro; once a request is out, a move is raised."""
+    new_ref = seen.changed("delivery_ref", case.delivery_ref)
+    new_at = seen.changed("delivery_at", _iso_utc(case.delivery_at_utc))
+    if not (new_ref or new_at):
+        return []
+    had_slot = bool(case.delivery_ref or case.delivery_at_utc)
+    previous_ref, previous_at = case.delivery_ref, _iso_utc(case.delivery_at_utc)
+    if new_ref:
+        record_reference(
+            session,
+            case,
+            ReferenceType.DELIVERY_NUMBER.value,
+            seen.view["delivery_ref"],
+            source=ReferenceSource.LOAD,
+            at=now,
+        )
+    if new_at:
+        case.delivery_at_utc = datetime.fromisoformat(seen.view["delivery_at"])
+    tz = ZoneInfo(case.vendor_timezone or "America/New_York")
+    at = as_utc(case.delivery_at_utc)
+    when = f"{at.astimezone(tz):%m/%d %H:%M}" if at else ""
+    shown = " ".join(p for p in (case.delivery_ref, when) if p)
+    _event(
+        session,
+        case,
+        "delivery_from_tpro",
+        previous_ref=previous_ref,
+        previous_at=previous_at,
+        delivery_ref=case.delivery_ref,
+        delivery_at=_iso_utc(case.delivery_at_utc),
+        reason=f"Transport Pro: delivery {shown}",
+    )
+    asked = case.status in (CaseStatus.PENDING.value, CaseStatus.DECLINED.value) or (
+        case.status == CaseStatus.UNSCHEDULED.value and has_request(case)
+    )
+    if asked and had_slot:
+        flag(
+            session,
+            case,
+            ExceptionType.DELIVERY_MOVED,
+            f"Transport Pro moved the delivery to {shown}; check the pickup still makes it",
+            at=now,
+            delivery_ref=case.delivery_ref,
+            delivery_at=_iso_utc(case.delivery_at_utc),
+        )
+    return ["delivery"]
+
+
+def _refresh_request(
+    session: Session,
+    case: BookingCase,
+    seen: _Seen,
+    customer: Customer,
+    settings: Settings,
+    *,
+    now: datetime,
+    replan: bool = False,
+) -> list[str]:
+    """A new tender time, and new POs before any request; then choose the time again.
+
+    ``replan``: the delivery changed, so the time is chosen again even when nothing else did.
+    """
+    done: list[str] = []
+    if seen.changed("tender", _iso_utc(case.tendered_pickup_utc)):
+        previous = _iso_utc(case.tendered_pickup_utc)
+        case.tendered_pickup_utc = datetime.fromisoformat(seen.view["tender"])
+        tz = ZoneInfo(case.vendor_timezone or "America/New_York")
+        tender = case.tendered_pickup_utc.astimezone(tz)
+        _event(
+            session,
+            case,
+            "tender_changed",
+            previous=previous,
+            tender=seen.view["tender"],
+            reason=f"Transport Pro's tender is now {tender:%m/%d %H:%M}",
+        )
+        done.append("tender")
+    waiting = case.status == CaseStatus.UNSCHEDULED.value and not has_request(case)
+    pos = list(seen.view["po_numbers"])
+    if (
+        waiting
+        and seen.changed("po_numbers", case.po_numbers)
+        and pos != [str(p) for p in case.po_numbers]
+    ):
+        case.po_numbers = pos
+        record_load_numbers(session, case, at=now)
+        done.append("po_numbers")
+    if waiting and (done or replan):
+        resolve(
+            session,
+            case,
+            [
+                ExceptionType.LOAD_INFEASIBLE,
+                ExceptionType.SLOT_UNWORKABLE,
+                ExceptionType.DELIVERY_MOVED,
+                ExceptionType.PICKUP_EXPIRED,
+            ],
+            resolution="Transport Pro changed the load; the pickup time was chosen again",
+            by=REFRESH_ACTOR,
+            at=now,
+        )
+        profile = (
+            vendor_profile(Repository(session), case.facility_key) if case.facility_key else None
+        )
+        use_tender = customer.rule_for(case).pickup_from != "delivery"
+        plan_request(session, case, settings, now=now, profile=profile, use_tender=use_tender)
+        _check_requested_slot(session, case, settings, now=now, profile=profile)
+    return done
+
+
+def _booked_in_tpro(session: Session, case: BookingCase, wp: Waypoint, *, confirmed: bool) -> None:
+    """The pickup was booked in Transport Pro: schedule the case with the stop's time."""
+    appt = wp.appointment_time
+    start = appt.open_at if confirmed and appt else None
+    if start is not None and appt is not None:
+        local = start.astimezone(ZoneInfo(case.vendor_timezone or "America/New_York"))
+        clock = f"{local:%H:%M}"
+        case.confirmed_local = (
+            f"{local:%Y-%m-%d}" if clock == "00:00" else f"{local:%Y-%m-%d} {clock}"
+        )
+        case.confirmed_start_utc = start
+        case.confirmed_end_utc = appt.close_at or start
+    how = (
+        f"vendor pickup number {case.pickup_number}"
+        if case.pickup_number
+        else "the stop's appointment is confirmed there"
+    )
+    case.status = CaseStatus.SCHEDULED.value
+    case.reason = f"booked in Transport Pro: {how}"[:255]
+    resolve_all(session, case, resolution="booked in Transport Pro", by=REFRESH_ACTOR)
+    _event(
+        session,
+        case,
+        "booked_in_tpro",
+        local=case.confirmed_local,
+        pickup_number=case.pickup_number,
+        reason=case.reason,
+    )
 
 
 def _recommend(

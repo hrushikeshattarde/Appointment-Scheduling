@@ -372,7 +372,25 @@ changed in the last 24 hours. "Today" is in `FP_BOOKING_TIMEZONE` (Fort Wayne by
 How a case moves: `scan` opens a case for every pickup stop whose appointment is not
 confirmed, keyed to the vendor profile (`missing_method` or `method_not_supported` when the
 profile has no verified email desk, `scheduled` when the load already carries a vendor pickup
-number). `draft` composes the request in the pod's own wording (`PO# X on MM/DD @ HHMM`, the
+number). A load Transport Pro shows canceled opens no case. A field listing several POs
+(`115806102630 & 115806102631`) gives the case all of them.
+
+Each scan also brings the cases it already has up to date with their loads. A case keeps what
+Transport Pro said at the last scan (`tpro_seen`) and takes only what changed there since, so a
+slot a person or the customer's desk gave it stands:
+
+- load canceled: a case nothing was written for is canceled; one whose request was drafted or
+  sent, or that is booked, raises `load_canceled` once (delete the draft, or tell the vendor);
+- a vendor pickup number or a confirmed stop entered in Transport Pro: the case is booked
+  there (`booked_in_tpro`), with the stop's time; nothing is queued to write back;
+- the DCT slot booked after the scan (its reference in the delivery stop's notes, its time):
+  kept on the case, so Lidl's "wait for the delivery slot" rule lets the request go; a slot
+  that moves once the vendor was asked raises `delivery_moved`;
+- a new tender time or new POs before any request: the request asks for them, and the time
+  and the desk's rules are checked again.
+
+A case from before scans kept that record takes only what it lacks on its first rescan.
+`draft` composes the request in the pod's own wording (`PO# X on MM/DD @ HHMM`, the
 requested time from the tender or backed off the Lidl delivery slot, and nothing else, exactly
 as the pod writes it) and saves it as a draft. `sent` records that a person sent it. `inbox`
 matches replies to cases by thread, PO number or sender, classifies each reply with a
