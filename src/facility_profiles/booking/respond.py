@@ -6,11 +6,14 @@ The policy is deliberately narrow. The agent only ever does five things in a thr
 2. ask for alternatives inside a stated window when it does not,
 3. answer a factual question from data already on the case,
 4. nudge once when a request goes unanswered,
-5. draft a note to the customer's inbound desk when the vendor cannot ship as planned.
+5. draft a note to the customer's inbound desk when the vendor cannot ship on the day asked
+   (the order is not ready, no slots, closed): moving the delivery fixes that, and nothing else.
 
 Everything else, and anything that mentions money, is handed to a person: the exception the
-reply raised stays open with the agent's reason added to it. A move that settles the reply
-resolves its exception (an answered question, an offer accepted or declined).
+reply raised stays open with the agent's reason added to it. So is any change to a pickup that
+was already booked, and an offer from a facility off Eastern time that named no time zone. A
+move that settles the reply resolves its exception (an answered question, an offer accepted or
+declined). Every time the agent writes is Eastern.
 
 Whether an answer is sent or drafted is the customer's rule (``replies``, ``customer_notes``)
 with FP_BOOKING_MODE=send and a sender given; every send passes the send gate first (the desk on
@@ -50,14 +53,27 @@ from facility_profiles.booking.outbox import (
     is_sender,
 )
 from facility_profiles.booking.rules import vendor_profile
-from facility_profiles.booking.schema import ReplyClassification, ReplyStatus
+from facility_profiles.booking.schema import (
+    TIMING_REASONS,
+    RejectReason,
+    ReplyClassification,
+    ReplyStatus,
+)
 from facility_profiles.booking.templates import (
     TemplateKind,
     case_values,
     pick,
     render,
+    vendor_when,
 )
-from facility_profiles.booking.worklist import UNANSWERED, annotate, flag, resolve
+from facility_profiles.booking.worklist import (
+    UNANSWERED,
+    annotate,
+    flag,
+    open_exceptions,
+    resolve,
+)
+from facility_profiles.clock import local_to_eastern, slot_text, stamp, to_eastern
 from facility_profiles.config import Settings
 from facility_profiles.customers import customer_of
 from facility_profiles.extraction.llm import ExtractionError
@@ -74,6 +90,17 @@ FORBIDDEN_TOPICS = re.compile(
     r"claim|damage|lumper)\b|\$\s?\d",
     re.I,
 )
+# A facility that cannot book for a reason other than the day: moving the delivery would not help,
+# so nothing goes to the customer's desk and a person reads the reply.
+NOT_THE_DAY: dict[RejectReason, str] = {
+    RejectReason.PO_NOT_FOUND: (
+        "the facility does not have this PO in its system; check the PO with the customer"
+    ),
+    RejectReason.ORDER_CANCELED: (
+        "the facility says the order was canceled; check with the customer"
+    ),
+    RejectReason.OTHER: "the facility cannot book, and not because of the day; read their reply",
+}
 ANSWER_FACT_KEYS = (
     "po_numbers",
     "carrier",
@@ -82,7 +109,7 @@ ANSWER_FACT_KEYS = (
     "delivery_site",
     "delivery_date",
     "delivery_ref",
-    "requested_local",
+    "requested_pickup",
     "load_id",
     "pickup_number",
 )
@@ -116,18 +143,18 @@ class ResponsePlan:
 
 
 def case_facts(case: BookingCase, settings: Settings) -> dict[str, Any]:
-    """The only facts an answer may contain."""
-    tz = ZoneInfo(case.vendor_timezone or "America/New_York")
+    """The only facts an answer may contain. Every date and time is Eastern."""
     delivery = as_utc(case.delivery_at_utc)
+    requested = local_to_eastern(case.requested_local, case.vendor_timezone)
     return {
         "po_numbers": [str(p) for p in case.po_numbers],
         "carrier": settings.booking_carrier_name,
         "equipment": None,
         "customer": customer_of(case, settings).label(case.customer_name),
         "delivery_site": case.delivery_site,
-        "delivery_date": delivery.astimezone(tz).strftime("%m/%d") if delivery else None,
+        "delivery_date": to_eastern(delivery).strftime("%m/%d") if delivery else None,
         "delivery_ref": case.delivery_ref,
-        "requested_local": case.requested_local,
+        "requested_pickup": f"{requested} ET" if requested and " " in requested else requested,
         "load_id": case.load_id,
         "pickup_number": case.pickup_number,
     }
@@ -158,9 +185,7 @@ def offer_is_feasible(
         return True, "no delivery slot on the load to check against"
     arrival = pickup_local.astimezone(UTC) + timedelta(hours=transit_hours(case, settings))
     if arrival > delivery:
-        return False, (
-            f"would arrive {arrival:%m/%d %H:%M}Z, after the delivery slot {delivery:%m/%d %H:%M}Z"
-        )
+        return False, (f"would arrive {stamp(arrival)}, after the delivery slot {stamp(delivery)}")
     return True, "makes the delivery slot"
 
 
@@ -206,13 +231,98 @@ class AnswerComposer(Protocol):
         ...
 
 
+# The questions the case itself answers. Each is narrow on purpose: a question that only looks
+# like one ("What is the delivery number for this PO?" names a PO but does not ask which PO) must
+# not get its answer. Anything else goes to the model, which may use only the facts, or a person.
+_DELIVERY_NUMBER = re.compile(
+    r"\b(?:delivery|dct|receiving)\s*(?:appointment\s*|appt\.?\s*)?"
+    r"(?:number|#|no\.?|ref\w*|confirmation)",
+    re.I,
+)
+_LOAD_NUMBER = re.compile(r"\bload\s*(?:number|#|no\.?)", re.I)
+_WHICH_CARRIER = re.compile(
+    r"\b(?:which|what|who)(?:'s|\s+is|\s+are)?\s+(?:the\s+|your\s+)?"
+    r"(?:carrier|trucking\s+company)\b|\bcarrier\s*(?:name)?\s*\?",
+    re.I,
+)
+_WHICH_CUSTOMER = re.compile(
+    r"\bwho(?:'s|\s+is)\s+(?:the\s+)?(?:customer|consignee|receiver)\b|"
+    r"\bwho\s+is\s+this\s+(?:for|going\s+to)\b|\bfor\s+whom\b|\b(?:what|which)\s+customer\b",
+    re.I,
+)
+_WHERE_DELIVERING = re.compile(
+    r"\b(?:where|which)\b[^?]*\b(?:deliver\w*|going|destination)\b", re.I
+)
+_WHICH_PO = re.compile(
+    r"\bboth\b[^?]*\b(?:orders?|pos?)\b|"
+    r"\b(?:which|what)\s+(?:orders?|pos?|po\s*numbers?|po#|purchase\s+orders?)\b|"
+    r"\b(?:po|order)\s*(?:numbers?|#)",
+    re.I,
+)
+# A question about anything else is not one of these, whatever else it mentions.
+_ABOUT_TIME = re.compile(r"\b(?:time|when|eta|arriv\w*|late|early|hours?|today|tomorrow)\b", re.I)
+_ABOUT_OTHER_NUMBER = re.compile(
+    r"\b(?:deliver\w*|appointment|appt|pick\s*-?\s*up|pu|load|reference|ref|confirmation|"
+    r"trailer|seal|bol|mc|driver|phone|cell|weight|pallets?|cases|temp\w*|live|drop|dock|door)\b",
+    re.I,
+)
+_ABOUT_CARRIER_DETAIL = re.compile(
+    r"\b(?:mc|dot|scac|number|phone|insurance|driver|truck|trailer)\b|#", re.I
+)
+_ABOUT_PAPERWORK = re.compile(
+    r"\b(?:driver|paperwork|bol|park|dock|door|check\s*-?\s*in|gate)\b", re.I
+)
+
+
 def answer_from_rules(question: str, facts: dict[str, Any]) -> AnswerDraft | None:
-    """Deterministic answers for the questions vendors actually ask."""
-    q = question.lower()
+    """Deterministic answers for the questions vendors actually ask; None when none fits."""
+    q = question.strip()
     pos = facts.get("po_numbers") or []
-    if re.search(r"\b(both|which|what)\b.*\b(order|orders|po|pos|po#|po number)", q) or re.search(
-        r"\b(order|po)\s*(number|#)", q
+    if _DELIVERY_NUMBER.search(q):
+        if not facts.get("delivery_ref"):
+            return None
+        return AnswerDraft(
+            answerable=True,
+            message=f"The delivery number is {facts['delivery_ref']}.",
+            facts_used=["delivery_ref"],
+        )
+    if _LOAD_NUMBER.search(q) and not _ABOUT_TIME.search(q):
+        return AnswerDraft(
+            answerable=True,
+            message=f"Our load number is {facts['load_id']}.",
+            facts_used=["load_id"],
+        )
+    if (
+        _WHICH_CARRIER.search(q)
+        and not _ABOUT_TIME.search(q)
+        and not _ABOUT_CARRIER_DETAIL.search(q)
     ):
+        carrier = str(facts["carrier"])
+        return AnswerDraft(
+            answerable=True,
+            message=f"The carrier is {carrier}" + ("" if carrier.endswith(".") else "."),
+            facts_used=["carrier"],
+        )
+    if _WHICH_CUSTOMER.search(q):
+        return AnswerDraft(
+            answerable=True,
+            message=f"This is a {facts['customer']} order.",
+            facts_used=["customer"],
+        )
+    if (
+        _WHERE_DELIVERING.search(q)
+        and facts.get("delivery_site")
+        and not _ABOUT_PAPERWORK.search(q)
+        and not _ABOUT_TIME.search(q)
+    ):
+        ref = f" ({facts['delivery_ref']})" if facts.get("delivery_ref") else ""
+        when = f" on {facts['delivery_date']}" if facts.get("delivery_date") else ""
+        return AnswerDraft(
+            answerable=True,
+            message=f"This is delivering to {facts['delivery_site']}{when}{ref}.",
+            facts_used=["delivery_site", "delivery_date", "delivery_ref"],
+        )
+    if _WHICH_PO.search(q) and not _ABOUT_OTHER_NUMBER.search(q) and not _ABOUT_TIME.search(q):
         if not pos:
             return None
         if len(pos) > 1:
@@ -223,43 +333,6 @@ def answer_from_rules(question: str, facts: dict[str, Any]) -> AnswerDraft | Non
             )
         return AnswerDraft(
             answerable=True, message=f"Just PO# {pos[0]}.", facts_used=["po_numbers"]
-        )
-    if re.search(r"\b(which|what|who)\b.*\bcarrier\b|\bcarrier\b.*\?", q):
-        carrier = str(facts["carrier"])
-        return AnswerDraft(
-            answerable=True,
-            message=f"The carrier is {carrier}" + ("" if carrier.endswith(".") else "."),
-            facts_used=["carrier"],
-        )
-    if re.search(r"\bdelivery\s*(number|#|ref\w*|appointment\s*number)", q) and facts.get(
-        "delivery_ref"
-    ):
-        return AnswerDraft(
-            answerable=True,
-            message=f"The delivery number is {facts['delivery_ref']}.",
-            facts_used=["delivery_ref"],
-        )
-    if re.search(r"\b(where|which)\b.*\b(deliver\w*|going|destination)\b", q) and facts.get(
-        "delivery_site"
-    ):
-        ref = f" ({facts['delivery_ref']})" if facts.get("delivery_ref") else ""
-        when = f" on {facts['delivery_date']}" if facts.get("delivery_date") else ""
-        return AnswerDraft(
-            answerable=True,
-            message=f"This is delivering to {facts['delivery_site']}{when}{ref}.",
-            facts_used=["delivery_site", "delivery_date", "delivery_ref"],
-        )
-    if re.search(r"\b(customer|who is this for|for whom|consignee)\b", q):
-        return AnswerDraft(
-            answerable=True,
-            message=f"This is a {facts['customer']} order.",
-            facts_used=["customer"],
-        )
-    if re.search(r"\b(load|reference|ref)\s*(number|#)", q):
-        return AnswerDraft(
-            answerable=True,
-            message=f"Our load number is {facts['load_id']}.",
-            facts_used=["load_id"],
         )
     return None
 
@@ -404,6 +477,21 @@ class Responder:
             return ResponsePlan(
                 ResponseIntent.HANDOFF, f"{self.settings.booking_max_rounds} rounds reached"
             )
+        if result.status != ReplyStatus.QUESTION and open_exceptions(
+            case, ExceptionType.BOOKED_SLOT_CHANGED
+        ):
+            return ResponsePlan(
+                ResponseIntent.HANDOFF,
+                "the pickup was already booked; a person agrees any change with the facility "
+                "and the carrier",
+            )
+        if result.status == ReplyStatus.COUNTER_OFFER and open_exceptions(
+            case, ExceptionType.TIME_ZONE_UNCLEAR
+        ):
+            return ResponsePlan(
+                ResponseIntent.HANDOFF,
+                "the facility named no time zone; a person checks which clock they meant",
+            )
         if result.status == ReplyStatus.COUNTER_OFFER:
             return self._plan_counter_offer(case, result)
         if result.status == ReplyStatus.QUESTION:
@@ -419,7 +507,10 @@ class Responder:
         offered = local_dt(result.pickup_date, clock, case.vendor_timezone)
         feasible, why = offer_is_feasible(case, offered, self.settings, now=self._now())
         if feasible:
-            when = _fmt(result.pickup_date, clock)
+            mmdd, hhmm = vendor_when(
+                f"{result.pickup_date} {clock or ''}".strip(), case.vendor_timezone
+            )
+            when = mmdd + (f" @ {hhmm}" if hhmm else "")
             return ResponsePlan(
                 ResponseIntent.ACCEPT_OFFER,
                 f"offer {when} {why}",
@@ -431,8 +522,7 @@ class Responder:
         if not days:
             return ResponsePlan(ResponseIntent.HANDOFF, f"offer {why}; no workable day left")
         delivery = as_utc(case.delivery_at_utc)
-        tz = ZoneInfo(case.vendor_timezone or "America/New_York")
-        deliver_on = delivery.astimezone(tz).strftime("%m/%d") if delivery else "our delivery"
+        deliver_on = to_eastern(delivery).strftime("%m/%d") if delivery else "our delivery"
         ref = f" ({case.delivery_ref})" if case.delivery_ref else ""
         body = (
             f"That would not make our delivery appointment on {deliver_on}{ref}. "
@@ -470,6 +560,9 @@ class Responder:
     def _plan_rejection(
         self, case: BookingCase, result: ReplyClassification, text: str
     ) -> ResponsePlan:
+        reason = result.reject_reason or RejectReason.OTHER
+        if reason not in TIMING_REASONS:
+            return ResponsePlan(ResponseIntent.HANDOFF, NOT_THE_DAY[reason])
         customer = customer_of(case, self.settings)
         desk = customer.customer_desk
         if not desk:
@@ -519,6 +612,7 @@ class Responder:
             to_addr=plan.to_addr,
             cc_addr=customer.cc_header,
             from_addr=customer.sender,
+            reply_to=customer.group,
             subject=subject,
             body=plan.body if escalation or plan.signed else f"{plan.body}\n\n{signature}",
             thread_id=None if escalation else case.thread_id,
@@ -589,7 +683,8 @@ class Responder:
                 session,
                 case,
                 ExceptionType.CONFIRMATION_REVIEW,
-                f"vendor offered {plan.proposed_local}{pickup}; the agent accepted it, approve "
+                f"vendor offered {slot_text(plan.proposed_local, case.vendor_timezone)}{pickup}; "
+                "the agent accepted it, approve "
                 "to accept",
                 local=plan.proposed_local,
                 pickup_number=case.pickup_number,

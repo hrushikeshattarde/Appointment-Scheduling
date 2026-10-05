@@ -138,7 +138,8 @@ def test_the_page_is_served_and_home_goes_to_it(board):  # type: ignore[no-untyp
     assert home.status_code in (302, 307) and home.headers["location"] == "/app/"
     page = client.get("/app/")
     assert page.status_code == 200 and '<script type="module" src="app.js">' in page.text
-    assert client.get("/app/app.js").status_code == 200
+    script = client.get("/app/app.js")
+    assert script.status_code == 200 and script.headers["cache-control"] == "no-cache"
     assert client.get("/app/app.css").status_code == 200
     labels = {k["kind"]: k["label"] for k in client.get("/api/booking/kinds").json()}
     assert len(labels) == len(ExceptionType)
@@ -160,6 +161,7 @@ def test_overview_counts_what_needs_a_person_what_slipped_and_what_is_coming(boa
         "booked": 1,
         "declined": 1,
         "upcoming": 5,
+        "unmatched_mail": 0,
     }
     # To-dos by the pickup they hold up, soonest first.
     assert [t["kind"] for t in data["todos"]] == [
@@ -334,7 +336,7 @@ def test_the_demo_seeder_builds_every_situation_and_refuses_a_used_store(
     assert module.main() == 0
     out = capsys.readouterr().out
     assert (
-        "24 demo cases" in out
+        "26 demo cases" in out
         and "waiting link (Orchard Valley Juice): http://127.0.0.1:8000/c/" in out
     )
     engine = make_engine(db)
@@ -347,12 +349,16 @@ def test_the_demo_seeder_builds_every_situation_and_refuses_a_used_store(
     assert sorted(offers) == ["Orchard Valley Juice", "Pinecrest Bakery"]
     assert offers["Orchard Valley Juice"] is None and offers["Pinecrest Bakery"].endswith(" 10:00")
     assert statuses.count("scheduled") == 3 and statuses.count("declined") == 1
-    assert statuses.count("canceled") == 1 and len(statuses) == 24
+    assert statuses.count("canceled") == 1 and len(statuses) == 26
     assert kinds == sorted(
         [
             "confirmation_review",
             "confirmation_review",
             "confirmation_review",
+            "confirmation_review",  # a Central desk's bare 0900: whose 09:00?
+            "time_zone_unclear",
+            "booked_slot_changed",  # the vendor moved a booked pickup: a person settles it
+            "proposed_time_review",
             "confirmed_outside_window",
             "facility_question",
             "facility_declined",

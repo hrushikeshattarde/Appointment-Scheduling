@@ -144,6 +144,9 @@ class OutboundDraft:
     # Drafts only: the customer's group the draft is from. A send is always from the sending
     # mailbox (a group cannot send through the API).
     from_addr: str | None = None
+    # Where the facility's answer goes: the customer's group, so a plain Reply (not only Reply
+    # All) reaches the group, where the agent and the pod read the thread.
+    reply_to: str | None = None
     # An HTML part beside the text, when the request carries one-click times (booking/links.py).
     html: str | None = None
 
@@ -199,6 +202,8 @@ def build_mime(
     if draft.cc_addr:
         msg["Cc"] = draft.cc_addr
     msg["Subject"] = draft.subject
+    if draft.reply_to:
+        msg["Reply-To"] = draft.reply_to
     msg["Message-ID"] = message_id or new_message_id(sender)
     if draft.in_reply_to:
         msg["In-Reply-To"] = draft.in_reply_to

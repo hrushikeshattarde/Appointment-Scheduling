@@ -137,7 +137,7 @@ def test_no_reply_raises_24_then_48_hours_once_each_and_a_resolution_sticks(sett
         assert [(k, d) for _, k, d in first.raised] == [
             (
                 "unanswered_24h",
-                "no reply from cci@udfinc.com to the request sent Tue 09/29 08:00 EDT "
+                "no reply from cci@udfinc.com to the request sent Tue 09/29 08:00 ET "
                 "(24 weekday hours)",
             )
         ]
@@ -231,7 +231,7 @@ def test_a_pickup_that_passes_unbooked_expires_once_and_replaces_the_silence(set
 
         result = sweep(session, now=PICKUP + timedelta(minutes=1))
         assert [(k, d) for _, k, d in result.raised] == [
-            ("pickup_expired", "pickup Thu 10/01 09:00 passed with no booking from the vendor")
+            ("pickup_expired", "pickup Thu 10/01 09:00 ET passed with no booking from the vendor")
         ]
         assert [(k, why) for _, k, why in result.resolved] == [
             ("unanswered_48h", "superseded: the pickup time passed")
@@ -260,9 +260,9 @@ def test_expiry_says_what_happened_and_leaves_the_other_to_dos(session):
     sweep(session, now=NOW)
     first_open = {c.id: c.open_exceptions[0].description for c in (drafted, never, stale, review)}
     assert first_open == {
-        drafted.id: "pickup Mon 09/28 09:00 passed; the request was drafted but never sent",
+        drafted.id: "pickup Mon 09/28 09:00 ET passed; the request was drafted but never sent",
         never.id: "no verified email booking desk",
-        stale.id: "pickup Mon 09/28 09:00 passed; it was never requested",
+        stale.id: "pickup Mon 09/28 09:00 ET passed; it was never requested",
         review.id: "vendor confirmed 2026-09-28 10:00",
     }
     assert open_kinds(never) == ["missing_method", "pickup_expired"]
@@ -270,7 +270,7 @@ def test_expiry_says_what_happened_and_leaves_the_other_to_dos(session):
     assert stale.exceptions[0].resolution == "superseded: the pickup time passed"
     assert open_kinds(review) == ["confirmation_review", "pickup_expired"]
     assert review.open_exceptions[1].description == (
-        "pickup Mon 09/28 10:00 passed while the vendor's confirmation waited for approval"
+        "pickup Mon 09/28 10:00 ET passed while the vendor's confirmation waited for approval"
     )
     assert open_kinds(declined) == ["facility_declined"]  # it already says the slot is off
     assert open_kinds(ahead) == [] and open_kinds(date_only) == []  # a date counts all day
@@ -298,7 +298,7 @@ def test_a_later_offer_or_a_new_slot_clears_the_expiry(session):
     assert target_slot(case) == ("2026-10-02 13:00", "offered")
     result = check_case(session, case, now=NOW)
     assert [(k, why) for _, k, why in result.resolved] == [
-        ("pickup_expired", "the pickup is now Fri 10/02 13:00 (offered)")
+        ("pickup_expired", "the pickup is now Fri 10/02 13:00 ET (offered)")
     ]
     assert open_kinds(case) == ["proposed_time_review"]
     # The offer itself goes stale too if nobody acts on it.
@@ -326,10 +326,10 @@ def test_a_confirmation_on_another_day_or_far_from_the_time_is_raised(session):
     assert outside_request(case, "2026-10-01", None) is None
     assert outside_request(case, "2026-10-01", "14:00", date_only=True) is None
     assert outside_request(case, "2026-10-01", "06:00") == (
-        "vendor confirmed Thu 10/01 06:00; we asked for Thu 10/01 09:00 (3 h earlier)"
+        "vendor confirmed Thu 10/01 06:00 ET; we asked for Thu 10/01 09:00 ET (3 h earlier)"
     )
     assert outside_request(case, "2026-10-02", "09:00") == (
-        "vendor confirmed Fri 10/02 09:00; we asked for Thu 10/01 09:00"
+        "vendor confirmed Fri 10/02 09:00 ET; we asked for Thu 10/01 09:00 ET"
     )
 
 
@@ -435,7 +435,7 @@ def test_the_daily_summary_puts_the_most_urgent_first(session):
     assert render_today(data) == "\n".join(
         [
             "Pickup appointments: what needs you today",
-            "Thursday 10/01/2026, 07:00 EDT · all customers",
+            "Thursday 10/01/2026, 07:00 ET · all customers",
             "",
             "3 pickups need you (3 to-dos) · 2 pickups today or next business day, 1 not booked "
             "· 1 draft waiting to be sent · 0 waiting on the vendor",
@@ -446,33 +446,33 @@ def test_the_daily_summary_puts_the_most_urgent_first(session):
             "Pickup time passed (1)",
             "  What to do: If the truck picked up, mark it booked; if it still has to move, agree "
             "a new day with the vendor; if it is no longer needed, cancel it.",
-            f"  - Polar Corporation, PO 118830092663, Wed 09/30 06:00 (case #{ids['expired']}): "
-            "Pickup Wed 09/30 06:00 passed; the request was drafted but never sent. Just raised.",
+            f"  - Polar Corporation, PO 118830092663, Wed 09/30 06:00 ET (case #{ids['expired']}): "
+            "Pickup Wed 09/30 06:00 ET passed; the request was drafted but never sent. Just raised.",
             "",
             "No reply in 48 h (1)",
             "  What to do: Call the vendor's desk; if they book by phone, mark it booked with the "
             "slot.",
-            f"  - Koch Foods, PO 118830092663, Fri 10/02 09:00 (case #{ids['silent']}): No reply "
-            "from csr@polar.example to the request sent Mon 09/28 10:00 EDT (48 weekday hours). "
+            f"  - Koch Foods, PO 118830092663, Fri 10/02 09:00 ET (case #{ids['silent']}): No reply "
+            "from csr@polar.example to the request sent Mon 09/28 10:00 ET (48 weekday hours). "
             "Just raised.",
             "",
             "No booking desk (1)",
             "  What to do: Find the vendor's appointment desk, or book by phone and mark it booked.",
-            f"  - Lidl PYE Store, PO 118830092663, Tue 10/06 08:00 (case #{ids['no_desk']}): "
+            f"  - Lidl PYE Store, PO 118830092663, Tue 10/06 08:00 ET (case #{ids['no_desk']}): "
             "No verified email booking desk. Open 2 h.",
             "",
             "PICKUPS THU 10/01 AND FRI 10/02 (2)",
             "",
             "Thu 10/01",
-            f"  - 10:00 Seneca Foods, PO 118830092663: Booked, pickup# 20463798 "
+            f"  - 10:00 ET Seneca Foods, PO 118830092663: Booked, pickup# 20463798 "
             f"(case #{ids['booked']})",
             "",
             "Fri 10/02",
-            f"  - 09:00 Koch Foods, PO 118830092663: Waiting on the vendor: no reply in 48 h "
+            f"  - 09:00 ET Koch Foods, PO 118830092663: Waiting on the vendor: no reply in 48 h "
             f"(case #{ids['silent']})",
             "",
             "DRAFTS WAITING TO BE SENT (1)",
-            f"  - Morgan Foods, PO 118830092663, Mon 10/05 09:00 (case #{ids['draft']})",
+            f"  - Morgan Foods, PO 118830092663, Mon 10/05 09:00 ET (case #{ids['draft']})",
             "",
         ]
     )
@@ -519,7 +519,7 @@ def test_booking_timers_and_today_from_the_command_line(
     try:
         result = runner.invoke(app, ["booking", "timers"])
         assert result.exit_code == 0, result.output
-        assert "#1    raised   pickup_expired   pickup Mon 01/06 09:00 passed;" in result.output
+        assert "#1    raised   pickup_expired   pickup Mon 01/06 09:00 ET passed;" in result.output
         assert "1 case(s) checked: 1 raised, 0 resolved" in result.output
         assert "0 raised" in runner.invoke(app, ["booking", "timers"]).output
 
@@ -571,7 +571,7 @@ def test_the_board_serves_the_summary_and_the_server_runs_the_timers(settings, t
         # A live offer for a later day is not past due, though the slot asked for has passed.
         assert rows[old_id]["past_due"] and not rows[offered_id]["past_due"]
         today = client.get("/api/booking/today").json()
-        assert today["timezone"] == "America/Indiana/Indianapolis"
+        assert today["timezone"] == "America/New_York"
         assert today["counts"]["cases_need_you"] == 2
         assert "\nPickup time passed (1)\n" in today["text"]
         kinds_listed = {k["kind"]: k["label"] for k in client.get("/api/booking/kinds").json()}

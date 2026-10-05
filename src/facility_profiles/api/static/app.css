@@ -511,3 +511,13 @@ table.access .until input { padding: 3px 6px; font-size: 12.5px; min-height: 30p
   }
   table.pickups td.first::before { display: none; }
 }
+
+/* Emails no pickup matched (Home). */
+.mail-item { padding: 10px 16px; border-top: 1px solid var(--border); display: grid;
+  grid-template-columns: minmax(0, 1fr); gap: 4px; }
+.mail-item > * { min-width: 0; }
+.mail-item:first-child { border-top: 0; }
+.mail-item .title { font-weight: 600; overflow-wrap: anywhere; }
+.mail-item .meta, .mail-item .snippet { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+.mail-item .acts { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 4px; }
+.mail-item select { width: 100%; max-width: 100%; min-width: 0; flex: 1 1 220px; }

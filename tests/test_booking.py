@@ -274,7 +274,7 @@ def test_scan_draft_reply_and_approve_round_trip(settings, sessions):
         assert case is not None and case.status == CaseStatus.PENDING.value
         assert open_kinds(case) == ["confirmation_review"]
         assert case.open_exceptions[0].description == (
-            "vendor confirmed 2026-10-01 11:00, pickup# CCI-9389; approve to accept"
+            "vendor confirmed Thu 10/01 11:00 ET, pickup# CCI-9389; approve to accept"
         )
         assert case.confirmed_local == "2026-10-01 11:00"
         assert as_utc(case.confirmed_start_utc) == datetime(2026, 10, 1, 15, 0, tzinfo=UTC)
@@ -370,7 +370,7 @@ def test_questions_counter_offers_and_unbacked_values_go_to_a_person(settings, s
         assert case.status == CaseStatus.PENDING.value
         assert open_kinds(case) == ["proposed_time_review"]
         offer = case.open_exceptions[0]
-        assert offer.description == "vendor offered 2026-10-03 16:00"
+        assert offer.description == "vendor offered Sat 10/03 16:00 ET"
         assert (offer.detail["date"], offer.detail["time"]) == ("2026-10-03", "16:00")
         assert case.exceptions[0].resolution == "superseded by a later reply (counter_offer)"
 
@@ -629,7 +629,7 @@ def test_customer_desk_slot_moves_the_pickup_and_redrafts_in_thread(settings, se
         # The pickup was re-requested in the vendor thread, backed off the new delivery; asking
         # again answers the decline.
         assert case.status == CaseStatus.PENDING.value and open_kinds(case) == []
-        assert case.exceptions[0].resolution == "pickup asked for again: 2026-10-02 09:00"
+        assert case.exceptions[0].resolution == "pickup asked for again: Fri 10/02 09:00 ET"
         assert case.requested_local == "2026-10-02 09:00"
         assert mailer.drafts[-1].to_addr == "cci@udfinc.com" and mailer.drafts[-1].thread_id == "tv"
         assert (

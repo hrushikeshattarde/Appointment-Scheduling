@@ -5,8 +5,9 @@
 
 name = "Lidl"
 description = "Inbound vendor pickups to the Lidl RDCs (PYE, FRG, GRM), pod 1089"
-# The pod's own time zone: what "today" means for this customer's daily summary.
-timezone = "America/Indiana/Indianapolis"
+# The pod's own time zone: what "today" means for this customer's daily summary. Every time
+# the agent shows or writes is Eastern.
+timezone = "America/New_York"
 
 [transport_pro]
 # "Lidl - Inbound" and "Lidl-Outbound". A load billed to either is Lidl's.

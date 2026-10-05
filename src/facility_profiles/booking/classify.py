@@ -6,7 +6,7 @@ import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 import httpx
@@ -14,6 +14,17 @@ from pydantic import ValidationError
 
 from facility_profiles import __version__
 from facility_profiles.booking.schema import ReplyClassification, ReplyStatus
+from facility_profiles.clock import (
+    EASTERN_ZONE,
+    LOCAL_WORDS,
+    between,
+    is_eastern,
+    local_to_eastern,
+    to_eastern,
+    zone,
+    zone_name,
+    zone_named,
+)
 from facility_profiles.domain.normalize import quote_in_source
 from facility_profiles.extraction.llm import ExtractionError, LLMUsage
 from facility_profiles.extraction.openrouter import (
@@ -23,7 +34,7 @@ from facility_profiles.extraction.openrouter import (
     strict_json_schema,
 )
 
-PROMPT_VERSION = "reply-v3"
+PROMPT_VERSION = "reply-v4"
 
 SYSTEM_PROMPT = """You read one email reply from a shipping facility to a freight broker's pickup \
 appointment request and return a JSON object describing it.
@@ -37,20 +48,32 @@ edited times); "deferred" when they ask you to check back later because the orde
 released or ready yet (put the day to check back in pickup_date); "question" when they need \
 something before booking (order number, PO, carrier name, driver info); "rejected" when they \
 cannot book (order not ready, not in their system, closed that day); "unrelated" otherwise.
+- A reply about a pickup that was already booked uses the same statuses: moving it to another \
+time is a "counter_offer" (or "confirmed" when they state the new time as set), and no longer \
+being able to ship it is "rejected".
 - A reply written after the requested time has passed that gives a latest arrival time, offers \
 to work the driver in, or asks for the driver's ETA is a "question" (put their ask in question), \
 not a confirmation.
-- pickup_date is YYYY-MM-DD and pickup_time is HH:MM in 24-hour local time. Resolve relative \
-dates ("tomorrow", "Monday") from the reply date given to you. Use null when not stated.
+- pickup_date is YYYY-MM-DD and pickup_time is HH:MM in 24-hour time, exactly as the reply \
+states them: never convert between time zones. Resolve relative dates ("tomorrow", "Monday") \
+from the date the reply was written at the facility, given to you. Use null when not stated.
+- time_zone is the time zone the reply names for its times, as written ("ET", "EST", "CT", \
+"Central", "PT" ...), or "local" when it says the time is the facility's own; null when it \
+names none.
 - pickup_number is the vendor's pickup, confirmation or appointment number, if given.
 - quotes are short verbatim snippets copied from the reply's own words (the text above any \
 quoted earlier messages) that contain each date, time and number you report. Never paraphrase \
 inside quotes. Only for a counter_offer where the vendor edited dates or times inside the \
 quoted text may a quote come from that quoted text.
+- reject_reason, only when the status is "rejected": "not_ready" (the order or product is not \
+ready or released for that day), "no_capacity" (no appointments left that day), "closed" (the \
+facility is closed that day), "po_not_found" (the PO or order is not in their system, or is \
+wrong), "order_canceled", or "other". Null for every other status.
 - conditions are rules the vendor states (arrive early, bring load bars, register at gate).
 - When the reply answers several PO lines separately (one line per PO or PO pair, each with \
 its own date, time, pickup number or verdict), fill items with one entry per line: that line's \
-PO numbers as written, its status, date, time and pickup number, and quotes from that line. \
+PO numbers as written, its status, date, time, pickup number and reject_reason, and quotes from \
+that line. \
 Set the top-level fields to the line about the POs marked as ours, or to the overall reading. \
 Leave items empty when the reply has one reading for everything.
 - Only use the reply text. Do not invent values that are not written there."""
@@ -68,7 +91,11 @@ _RELATIVE_DAY_RE = re.compile(
 
 @dataclass(frozen=True)
 class ReplyContext:
-    """What the classifier is told about the request the reply answers."""
+    """What the classifier is told about the request the reply answers.
+
+    ``requested_local`` and the slots in ``requests`` are on the facility's clock, in
+    ``timezone``; the model is told them on the Eastern clock, as our emails give them.
+    """
 
     vendor_name: str
     po_numbers: list[str]
@@ -79,6 +106,7 @@ class ReplyContext:
     quoted: str = ""
     # Every request in the thread when a batched email covered several cases: (POs, slot).
     requests: list[tuple[list[str], str | None]] = field(default_factory=list)
+    timezone: str | None = None  # the facility's time zone
 
 
 @dataclass(frozen=True)
@@ -108,12 +136,37 @@ class ReplyClassifier(Protocol):
         ...
 
 
+def _asked(local: str | None, timezone: str | None) -> str:
+    """A requested slot as our email gave it: on the Eastern clock."""
+    eastern = local_to_eastern(local, timezone)
+    if not eastern:
+        return "not stated"
+    return f"{eastern} ET" if " " in eastern else eastern
+
+
+def _written(context: ReplyContext) -> str:
+    """When the reply was written, on the facility's clock (what "tomorrow" is counted from)."""
+    sent = context.reply_sent_at
+    sent = sent if sent.tzinfo else sent.replace(tzinfo=UTC)
+    eastern = to_eastern(sent)
+    if is_eastern(context.timezone):
+        return f"{eastern:%Y-%m-%d %A %H:%M} ET (the facility's local time)"
+    _, label = zone_name(context.timezone)
+    local = sent.astimezone(zone(context.timezone))
+    return f"{local:%Y-%m-%d %A %H:%M} {label} at the facility ({eastern:%Y-%m-%d %A %H:%M} ET)"
+
+
 def render_user_message(context: ReplyContext) -> str:
-    """The user turn: the request being answered and the reply itself."""
-    requested = context.requested_local or "not stated"
+    """The user turn: the request being answered and the reply itself.
+
+    Times are given as our emails give them, on the Eastern clock; when the reply was written is
+    given on the facility's own clock, because that is the day its "tomorrow" counts from.
+    """
+    tz = context.timezone
+    requested = _asked(context.requested_local, tz)
     if len(context.requests) > 1:
         lines = "\n".join(
-            f"- PO {' & '.join(pos) or 'unknown'}, requested {slot or 'not stated'}"
+            f"- PO {' & '.join(pos) or 'unknown'}, requested {_asked(slot, tz)}"
             for pos, slot in context.requests
         )
         ours = ", ".join(context.po_numbers) or "unknown"
@@ -126,8 +179,14 @@ def render_user_message(context: ReplyContext) -> str:
             f"Our request: pickup at {context.vendor_name} for PO "
             f"{', '.join(context.po_numbers) or 'unknown'}, requested {requested}.\n"
         )
+    if not is_eastern(tz):
+        words, label = zone_name(tz)
+        head += (
+            f"The facility is on {words} time ({label}); our emails give times in Eastern "
+            "Time (ET).\n"
+        )
     return (
-        head + f"Reply date: {context.reply_sent_at:%Y-%m-%d %A %H:%M}\n"
+        head + f"Reply written: {_written(context)}\n"
         f"Subject: {context.subject}\n\n"
         f'Reply text:\n"""\n{context.body.strip()}\n"""'
         + (
@@ -298,7 +357,86 @@ def validate_classification(
         item.pop("question", None)
         kept_items.append(item)
     data["items"] = kept_items
+    named = data.get("time_zone")
+    if named and not _zone_in_text(str(named), everything):
+        issues.append(ClassificationIssue("time_zone", "zone not in the message", named))
+        data["time_zone"] = None
+    for reading in (data, *kept_items):  # a reason belongs to a decline, and a decline has one
+        if reading["status"] != ReplyStatus.REJECTED:
+            reading["reject_reason"] = None
+        elif not reading.get("reject_reason"):
+            reading["reject_reason"] = "other"
     return ReplyClassification.model_validate(data), issues
+
+
+def _zone_in_text(word: str, text: str) -> bool:
+    """The zone the model names is written in the message ("CT", "central", "local")."""
+    lowered = word.strip().lower().rstrip(".")
+    candidates = {lowered} | ({"local", "our time"} if lowered in LOCAL_WORDS else set())
+    return any(
+        re.search(rf"(?<![a-z]){re.escape(c)}(?![a-z])", text, re.I) for c in candidates if c
+    )
+
+
+def _moved(reading: dict[str, Any], source: str, timezone: str | None, day: str | None) -> None:
+    """Move one reading's times from ``source``'s clock onto the facility's, in place."""
+    clock = reading.get("pickup_time")
+    on = reading.get("pickup_date") or day
+    if not clock or not on:
+        return
+    new_day, _, new_clock = (between(f"{on} {clock}", source, timezone) or "").partition(" ")
+    if reading.get("pickup_date"):
+        reading["pickup_date"] = new_day
+    reading["pickup_time"] = new_clock or clock
+    end = reading.get("pickup_time_end")
+    if end:
+        moved_end = (between(f"{on} {end}", source, timezone) or "").partition(" ")[2]
+        reading["pickup_time_end"] = moved_end or end
+
+
+def to_facility_clock(
+    result: ReplyClassification, timezone: str | None, *, day: str | None = None
+) -> ReplyClassification:
+    """The reading with its times moved onto the facility's own clock, where the store keeps them.
+
+    A time the reply gives with a zone ("10am CT") is that zone's; one without is Eastern, the
+    clock our emails give times in. ``day`` dates a time the reply gave without one (the day
+    asked for). For a facility on Eastern time nothing moves.
+    """
+    source = zone_named(result.time_zone, timezone) or EASTERN_ZONE
+    data = result.model_dump()
+    for reading in (data, *data["items"]):
+        _moved(reading, source, timezone, day)
+    return ReplyClassification.model_validate(data)
+
+
+def zone_doubt(
+    reading: ReplyClassification, *, timezone: str | None, requested_local: str | None
+) -> ClassificationIssue | None:
+    """Why a time cannot be trusted as Eastern: a facility off Eastern time named no zone.
+
+    Its desk may have answered on its own clock or on ours. A time that is the one we asked for
+    is ours repeated back; anything else is left for a person to check. ``reading`` is on the
+    facility's clock already (read as Eastern), like ``requested_local``.
+    """
+    if reading.time_zone or is_eastern(timezone) or not reading.pickup_time:
+        return None
+    asked_day, _, asked_clock = (requested_local or "").partition(" ")
+    day = reading.pickup_date or asked_day
+    if day == asked_day and reading.pickup_time == asked_clock:
+        return None
+    words, label = zone_name(timezone)
+    read_as = local_to_eastern(f"{day} {reading.pickup_time}", timezone) or ""
+    written = read_as.partition(" ")[2]
+    if_theirs = (local_to_eastern(f"{day} {written}", timezone) or "").partition(" ")[2]
+    return ClassificationIssue(
+        "time_zone",
+        (
+            f"the facility is on {words} time and wrote {written} with no zone: {written} ET, "
+            f"or {written} {label} ({if_theirs} ET)?"
+        ),
+        {"written": written, "read_as": read_as, "if_theirs": if_theirs},
+    )
 
 
 def for_case(result: ReplyClassification, po_numbers: list[str]) -> ReplyClassification | None:
@@ -322,6 +460,8 @@ def for_case(result: ReplyClassification, po_numbers: list[str]) -> ReplyClassif
         pickup_time=chosen.pickup_time,
         pickup_time_end=chosen.pickup_time_end,
         pickup_number=chosen.pickup_number,
+        time_zone=result.time_zone,
+        reject_reason=chosen.reject_reason or result.reject_reason,
         conditions=list(chosen.conditions)
         + [c for c in result.conditions if c not in chosen.conditions],
         question=result.question,

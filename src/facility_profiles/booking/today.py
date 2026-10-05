@@ -8,7 +8,8 @@ The summary is one page a pod lead reads in the morning (``booking today``, or `
 - the drafts nobody has sent yet (in draft mode the agent writes, a person sends);
 - how many requests are out and waiting on the vendor, and what changed in the last 24 hours.
 
-It is plain text, so it reads the same in a terminal, a file, an email or a chat.
+It is plain text, so it reads the same in a terminal, a file, an email or a chat. Every time
+in it is Eastern.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from facility_profiles.booking.models import BookingCase, CaseStatus, ExceptionT
 from facility_profiles.booking.service import has_request
 from facility_profiles.booking.timers import fmt_slot, pickup_passed
 from facility_profiles.booking.worklist import KINDS, UNANSWERED
+from facility_profiles.clock import LABEL, local_to_eastern, stamp
 from facility_profiles.storage.repository import as_utc
 
 SILENCE = frozenset(k.value for k in UNANSWERED)
@@ -30,9 +32,12 @@ SILENCE = frozenset(k.value for k in UNANSWERED)
 # a desk missing from a profile.
 URGENCY: tuple[str, ...] = (
     ExceptionType.LOAD_CANCELED.value,
+    ExceptionType.BOOKED_SLOT_CHANGED.value,
     ExceptionType.PICKUP_EXPIRED.value,
     ExceptionType.LOAD_INFEASIBLE.value,
+    ExceptionType.CHECK_BACK_TOO_LATE.value,
     ExceptionType.UNANSWERED_48H.value,
+    ExceptionType.TIME_ZONE_UNCLEAR.value,
     ExceptionType.CONFIRMATION_REVIEW.value,
     ExceptionType.CONFIRMED_OUTSIDE_WINDOW.value,
     ExceptionType.STALE_CONFIRMATION.value,
@@ -57,10 +62,10 @@ def label(kind: str) -> str:
 
 
 def pickup_slot(case: BookingCase) -> tuple[str | None, str]:
-    """The pickup to show: the confirmed slot when there is one, else the requested one."""
+    """The pickup to show, on the Eastern clock: the confirmed slot, else the requested one."""
     if case.confirmed_local:
-        return case.confirmed_local, "confirmed"
-    return case.requested_local, "requested"
+        return local_to_eastern(case.confirmed_local, case.vendor_timezone), "confirmed"
+    return local_to_eastern(case.requested_local, case.vendor_timezone), "requested"
 
 
 def _sentence(text: str) -> str:
@@ -212,7 +217,7 @@ def today_summary(
     exceptions = [e for c in cases for e in c.exceptions]
     return {
         "generated_at": now.isoformat(),
-        "local_time": local_now.strftime("%A %m/%d/%Y, %H:%M %Z"),
+        "local_time": stamp(now, "%A %m/%d/%Y, %H:%M"),
         "timezone": timezone,
         "customer": customer,
         "today": today.isoformat(),
@@ -296,7 +301,8 @@ def render_today(data: dict[str, Any]) -> str:
             continue
         lines += ["", fmt_slot(day)]
         for row in rows:
-            clock = (row["pickup_local"] or "").partition(" ")[2] or "any time"
+            clock = (row["pickup_local"] or "").partition(" ")[2]
+            clock = f"{clock} {LABEL}" if clock else "any time"
             number = f", pickup# {row['pickup_number']}" if row["pickup_number"] else ""
             lines.append(
                 f"  - {clock} {row['vendor'] or 'Unknown vendor'}, PO {_pos(row)}: "

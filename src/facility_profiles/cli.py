@@ -28,6 +28,7 @@ from sqlalchemy.orm import Session
 
 from facility_profiles import __version__
 from facility_profiles.booking.models import CaseStatus, ExceptionType
+from facility_profiles.clock import EASTERN, eastern_to_local, stamp
 from facility_profiles.config import Settings, get_settings
 from facility_profiles.domain.schema import PROFILE_FIELDS, FieldState, Role
 from facility_profiles.logging import configure_logging, get_logger
@@ -638,7 +639,7 @@ def booking_show(case_id: int) -> None:
         typer.echo(describe(case))
         for e in case.events:
             typer.echo(
-                f"  {e.created_at:%Y-%m-%d %H:%M} {e.action} by {e.actor} "
+                f"  {stamp(e.created_at, '%Y-%m-%d %H:%M')} {e.action} by {e.actor} "
                 f"{json.dumps(e.detail)[:160]}"
             )
 
@@ -731,7 +732,7 @@ def booking_delivery_updated(
         str, typer.Option(help="New delivery reference, e.g. Lidl's DCT ref FRG_200526615")
     ],
     date: Annotated[str, typer.Option(help="New delivery date, YYYY-MM-DD")],
-    time: Annotated[str, typer.Option(help="New delivery time, HH:MM local")],
+    time: Annotated[str, typer.Option(help="New delivery time, HH:MM Eastern")],
     by: Annotated[str, typer.Option(help="Who rebooked the delivery")],
     note: Annotated[str | None, typer.Option(help="Why, e.g. We missed the pickup today")] = None,
     tag: Annotated[str, typer.Option(help="Subject tag")] = "MISSED PICK UP",
@@ -741,8 +742,6 @@ def booking_delivery_updated(
     The desk and the booking system's name come from the case's customer file (Lidl: inbound@
     and DCT).
     """
-    from zoneinfo import ZoneInfo
-
     from facility_profiles.booking.mail import LocalDraftMailer, OutboundDraft
     from facility_profiles.booking.models import BookingEvent, BookingMessage
     from facility_profiles.booking.references import ReferenceSource, record_reference
@@ -763,9 +762,7 @@ def booking_delivery_updated(
             )
             raise typer.Exit(code=2)
         where = f" in {customer.delivery_system}" if customer.delivery_system else ""
-        local = datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M").replace(
-            tzinfo=ZoneInfo(case.vendor_timezone or "America/New_York")
-        )
+        local = datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M").replace(tzinfo=EASTERN)
         previous = case.delivery_ref
         record_reference(
             session,
@@ -798,6 +795,7 @@ def booking_delivery_updated(
             subject=f"{pos} {tag}",
             body=body,
             from_addr=customer.sender,
+            reply_to=customer.group,
         )
         label = customer.label(case.customer_name)
         draft_ref = mailer.create_draft(draft)
@@ -826,7 +824,7 @@ def booking_delivery_updated(
             )
         )
     typer.echo(
-        f"#{case_id} delivery now {ref.upper()} {date} {time}; note to {label} drafted "
+        f"#{case_id} delivery now {ref.upper()} {date} {time} ET; note to {label} drafted "
         f"[{draft_ref}]"
     )
 
@@ -836,12 +834,15 @@ def booking_reschedule(
     case_id: int,
     date: Annotated[str, typer.Option(help="New pickup date, YYYY-MM-DD")],
     by: Annotated[str, typer.Option(help="Who is asking")],
-    time: Annotated[str | None, typer.Option(help="New pickup time, HH:MM local")] = None,
+    time: Annotated[str | None, typer.Option(help="New pickup time, HH:MM Eastern")] = None,
     note: Annotated[
         str | None, typer.Option(help="One line of context, e.g. the driver fell off")
     ] = None,
 ) -> None:
-    """Draft an in-thread request for a new pickup slot (after a missed pickup, for example)."""
+    """Draft an in-thread request for a new pickup slot (after a missed pickup, for example).
+
+    The date and time are Eastern, like every time the agent shows and writes.
+    """
     from facility_profiles.booking.mail import LocalDraftMailer
     from facility_profiles.booking.service import reschedule_case
 
@@ -849,9 +850,10 @@ def booking_reschedule(
     mailer = LocalDraftMailer(
         Path(settings.booking_drafts_dir), sender=settings.booking_sender or ""
     )
-    requested = f"{date} {time}" if time else date
     with session_scope(_sessions(settings)) as session:
         case = _booking_case(session, case_id)
+        requested = eastern_to_local(f"{date} {time}" if time else date, case.vendor_timezone)
+        assert requested is not None
         try:
             message = reschedule_case(
                 session, case, mailer, settings, requested_local=requested, by=by, note=note
@@ -1059,7 +1061,7 @@ def booking_booked(
     by: Annotated[str, typer.Option(help="Who booked it")],
     via: Annotated[str, typer.Option(help="How: phone, portal, email")],
     date: Annotated[str | None, typer.Option(help="Pickup date, YYYY-MM-DD")] = None,
-    time: Annotated[str | None, typer.Option(help="Pickup time, HH:MM local")] = None,
+    time: Annotated[str | None, typer.Option(help="Pickup time, HH:MM Eastern")] = None,
     pickup_number: Annotated[str | None, typer.Option(help="Vendor pickup number")] = None,
     note: Annotated[str | None, typer.Option(help="Anything worth keeping")] = None,
     desk: Annotated[
@@ -1076,10 +1078,10 @@ def booking_booked(
 
     if time and not date:
         raise typer.BadParameter("--time needs --date")
-    local = f"{date} {time}" if date and time else date
     settings = _settings()
     with session_scope(_sessions(settings)) as session:
         case = _booking_case(session, case_id)
+        local = eastern_to_local(f"{date} {time}" if date and time else date, case.vendor_timezone)
         try:
             learned = mark_booked(
                 session,
@@ -1451,7 +1453,7 @@ def booking_jobs(
             typer.echo("no jobs")
             return
         for job in jobs:
-            due = f"{job.due_at:%m/%d %H:%M}Z" if job.due_at else "-"
+            due = stamp(job.due_at) if job.due_at else "-"
             tries = f" tries {job.attempts}" if job.attempts else ""
             typer.echo(
                 f"#{job.case_id:<4} {job.kind:<9} {job.status:<9} {job.action:<5} "
@@ -1475,12 +1477,13 @@ def booking_recommend(case_id: int) -> None:
         history = facility_history(session, case.facility_key)
         rec = recommend_time(case, settings, profile, now=datetime.now(tz=UTC), history=history)
         usual = usual_time(history)
-        typer.echo(f"#{case_id} asks for {fmt_slot(case.requested_local)} now")
-        typer.echo(f"recommended: {fmt_slot(rec.local)}  ({rec.verdict})")
+        tz = case.vendor_timezone
+        typer.echo(f"#{case_id} asks for {fmt_slot(case.requested_local, tz)} now")
+        typer.echo(f"recommended: {fmt_slot(rec.local, tz)}  ({rec.verdict})")
         for step in rec.steps:
             typer.echo(f"  {'*' if step.moved else '-'} {step.rule:<8} {step.note}")
         if rec.latest:
-            typer.echo(f"  latest pickup that makes the delivery: {fmt_slot(rec.latest)}")
+            typer.echo(f"  latest pickup that makes the delivery: {fmt_slot(rec.latest, tz)}")
         shown = f"{usual.clock} ({usual.count} of {usual.total})" if usual else "none yet"
         typer.echo(f"facility history: {len(history)} confirmed time(s); usual {shown}")
         session.rollback()
@@ -1503,13 +1506,114 @@ def booking_links(case_id: int) -> None:
             state = offer_state(offer, now)
             answer = f" -> {offer.answer}" if offer.answer else ""
             typer.echo(
-                f"offer {offer.id} ({state}{answer}), expires {offer.expires_at:%m/%d %H:%M}Z: "
-                + ", ".join(fmt_slot(str(slot)) for slot in offer.slots)
+                f"offer {offer.id} ({state}{answer}), expires {stamp(offer.expires_at)}: "
+                + ", ".join(fmt_slot(str(slot), case.vendor_timezone) for slot in offer.slots)
             )
             try:
                 typer.echo(f"  {offer_url(offer, settings)}")
             except LinkError as exc:
                 typer.echo(f"  (no link: {exc})")
+
+
+@booking_app.command("unmatched")
+def booking_unmatched(
+    show_all: Annotated[bool, typer.Option("--all", help="Linked and dismissed ones too")] = False,
+) -> None:
+    """Booking mail no pickup matched: kept for a person to link to its pickup or dismiss."""
+    from sqlalchemy import select
+
+    from facility_profiles.booking.models import UnmatchedMail
+    from facility_profiles.booking.unmatched import open_unmatched
+
+    settings = _settings()
+    with session_scope(_sessions(settings)) as session:
+        items = (
+            list(session.scalars(select(UnmatchedMail).order_by(UnmatchedMail.sent_at.desc())))
+            if show_all
+            else open_unmatched(session)
+        )
+        if not items:
+            typer.echo("no unmatched mail")
+            return
+        for item in items:
+            first = next((ln.strip() for ln in (item.body or "").splitlines() if ln.strip()), "")
+            where = f" -> case #{item.case_id}" if item.case_id else ""
+            typer.echo(
+                f"mail {item.id:<4} {item.status:<9} {stamp(item.sent_at)}  {item.from_addr}  "
+                f"{item.subject!r}  [{item.reason}]{where}"
+            )
+            if first:
+                typer.echo(f"           {first[:120]}")
+
+
+@booking_app.command("link-mail")
+def booking_link_mail(
+    mail_id: int,
+    case_id: int,
+    by: Annotated[str, typer.Option(help="Who links it")],
+) -> None:
+    """Tie an unmatched email to its pickup; the agent reads it as that pickup's reply.
+
+    Answers are drafted only: a person sends them.
+    """
+    from facility_profiles.booking.inbox import reader_tools
+    from facility_profiles.booking.mail import LocalDraftMailer
+    from facility_profiles.booking.models import UnmatchedMail
+    from facility_profiles.booking.respond import Responder
+    from facility_profiles.booking.unmatched import link_unmatched
+
+    settings = _settings()
+    classifier, composer = reader_tools(settings)
+    responder = Responder(
+        settings,
+        LocalDraftMailer(Path(settings.booking_drafts_dir), sender=settings.booking_sender or ""),
+        composer=composer,
+    )
+    with session_scope(_sessions(settings)) as session:
+        item = session.get(UnmatchedMail, mail_id)
+        if item is None:
+            typer.echo(f"no mail {mail_id}")
+            raise typer.Exit(code=1)
+        case = _booking_case(session, case_id)
+        try:
+            stats = link_unmatched(
+                session,
+                item,
+                case,
+                by=by,
+                classifier=classifier,
+                settings=settings,
+                responder=responder,
+            )
+        except ValueError as exc:
+            typer.echo(str(exc))
+            raise typer.Exit(code=1) from exc
+        read = "read" if stats.classified else "kept unread (no reader configured)"
+        typer.echo(f"mail {mail_id} linked to case #{case_id}; {read}")
+
+
+@booking_app.command("dismiss-mail")
+def booking_dismiss_mail(
+    mail_id: int,
+    by: Annotated[str, typer.Option(help="Who dismisses it")],
+    note: Annotated[str, typer.Option(help="Why it needs nothing")],
+) -> None:
+    """Say an unmatched email needs nothing from the agent."""
+    from facility_profiles.booking.models import UnmatchedMail
+    from facility_profiles.booking.unmatched import dismiss_unmatched
+
+    settings = _settings()
+    with session_scope(_sessions(settings)) as session:
+        item = session.get(UnmatchedMail, mail_id)
+        if item is None:
+            typer.echo(f"no mail {mail_id}")
+            raise typer.Exit(code=1)
+        try:
+            dismiss_unmatched(session, item, by=by, note=note)
+        except ValueError as exc:
+            typer.echo(str(exc))
+            raise typer.Exit(code=1) from exc
+    typer.echo(f"mail {mail_id} dismissed")
 
 
 @booking_app.command("find")

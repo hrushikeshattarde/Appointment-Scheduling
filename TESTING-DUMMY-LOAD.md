@@ -82,8 +82,11 @@ checks right away. Each new email then goes through these steps:
    - the only open pickup with that warehouse.
 
    If none fits, it's left alone, and it never guesses.
-3. **Is the pickup still open?** If it's already booked or canceled, the email is kept on the
-   pickup but not acted on.
+3. **Is the pickup still open?** If it's canceled, the email is kept on the pickup but not
+   acted on. If it's booked, the agent only checks whether the warehouse moved or dropped it (see
+   below); thanks, ETAs and paperwork are kept. An email that matches no pickup at all (a new
+   email from someone else at the warehouse, with no PO) shows on Home under **Emails no pickup
+   matched**, for you to link or dismiss.
 4. **What does it say?** The agent reads the reply, without the quoted earlier emails under
    it, as one of: confirmed, another time offered, a question, can't ship, check back later, or
    not about this pickup. Every date, time and pickup number it takes must appear word for word
@@ -93,11 +96,13 @@ checks right away. Each new email then goes through these steps:
    | The warehouse said | The agent does, on its own |
    |---|---|
    | Confirmed the time asked for | **Books it** and sends "Thank you!". A time picked by clicking a link is booked the same way. |
-   | Confirmed a different time, or anything in doubt | Leaves **Approve confirmation** for you, with the reason ("not booked automatically: ..."). |
+   | Confirmed a different time, or anything in doubt | Leaves **Approve confirmation** for you, with the reason ("not booked automatically: ..."). No "Thank you!" goes out, so the warehouse does not think it is booked. |
+   | Moved a pickup that was already booked | Never moves it itself: raises **Booked pickup changed** (what was booked, and whether Transport Pro still shows it) and says nothing until you agree the time. |
    | Another time | Accepts it if the truck still makes the delivery, sends "Yes, ... works", and books it. Otherwise asks for other days. |
    | A question | Answers from what's on the pickup (PO, delivery number, delivery site, load number, carrier, customer). If it can't, raises **Vendor question** for you. |
-   | Can't ship | Raises **Vendor cannot book** and sends a note to the customer's desk (a test address in the test). |
-   | Check back later | Waits, then asks again on that day; no to-do. |
+   | Can't ship that day (not ready, no slots, closed) | Raises **Vendor cannot book** and sends a note to the customer's desk (a test address in the test). |
+   | Can't book for another reason ("we don't have this PO") | Raises **Vendor cannot book** and leaves it to you: moving the delivery would not help. |
+   | Check back later | Waits, then asks again on that day; no to-do. A check-back on the pickup day or later raises **Check-back too late**. |
    | Money, a claim, or the 3rd back-and-forth | Stops and hands it to you. |
 
    **What it books on.** Only a confirmation of the time asked for: the same day, within two

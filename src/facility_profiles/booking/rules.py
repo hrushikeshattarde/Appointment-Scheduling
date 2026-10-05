@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 
 from facility_profiles.booking.models import BookingCase, BookingEvent, CaseStatus, ExceptionType
 from facility_profiles.booking.worklist import flag, resolve
+from facility_profiles.clock import slot_text, stamp
 from facility_profiles.config import Settings
 from facility_profiles.domain.schema import ReferenceType, Role
 from facility_profiles.storage.repository import Repository, unwrap
@@ -212,11 +213,12 @@ def slot_is_stale(
     pickup = _pickup(requested, timezone)
     if pickup is None:
         return None
+    shown = slot_text(requested, timezone)
     if pickup <= now:
-        return f"requested slot {requested} has already passed"
+        return f"requested slot {shown} has already passed"
     if pickup <= now + timedelta(hours=settings.booking_min_notice_hours):
         return (
-            f"requested slot {requested} is inside the {settings.booking_min_notice_hours} h "
+            f"requested slot {shown} is inside the {settings.booking_min_notice_hours} h "
             "notice window; a same-day ask needs a person"
         )
     if profile is None:
@@ -224,15 +226,15 @@ def slot_is_stale(
     cutoff = cutoff_at(requested, timezone, profile.cutoff_time)
     if cutoff is not None and cutoff <= now:
         return (
-            f"the desk's cut-off for {requested} was {cutoff:%a %m/%d %H:%M} "
-            f"({profile.cutoff_time} the business day before)"
+            f"the desk's cut-off for {shown} was {stamp(cutoff, '%a %m/%d %H:%M')} "
+            f"({profile.cutoff_time} their time, the business day before)"
         )
     notice = profile.notice_period_hours
     if notice and pickup - timedelta(hours=notice) <= now:
         latest = pickup - timedelta(hours=notice)
         return (
-            f"requested slot {requested} is inside the desk's {notice} h notice; it had to be "
-            f"asked for by {latest:%a %m/%d %H:%M}"
+            f"requested slot {shown} is inside the desk's {notice} h notice; it had to be "
+            f"asked for by {stamp(latest, '%a %m/%d %H:%M')}"
         )
     return None
 
@@ -262,7 +264,9 @@ def too_early(
     assert profile is not None  # opens is only known from a profile
     days = profile.max_days_ahead
     plural = "" if days == 1 else "s"
-    return f"{WAIT_PREFIX} {days} day{plural} ahead; ask from {opens:%a %m/%d}"
+    return (
+        f"{WAIT_PREFIX} {days} day{plural} ahead; ask from {stamp(opens, '%a %m/%d', label=False)}"
+    )
 
 
 WAIT_PREFIX = "the desk books at most"

@@ -11,13 +11,20 @@ Before it writes, the writer reads the load from Transport Pro:
 - only the load's shipper stop is written (waypoint ``SH``); a stop-off pickup is left for a
   person;
 - the same confirmed time already there means the write was made: nothing is sent again;
-- a different confirmed time already there was set by someone: it is never overwritten, and a
-  person is asked which is right (``tpro_mismatch``);
+- a different confirmed time that this booking put there itself (an earlier time, before the
+  pickup was moved) is replaced by the new one;
+- any other confirmed time was set by someone else: it is never overwritten, and a person is
+  asked which is right (``tpro_mismatch``);
 - after the write the load is read again, so the write is confirmed rather than assumed.
+
+With the appointment, a note goes on the load, once per booking: the time on the Eastern clock,
+the facility's pickup number and the conditions it set (load bars, check-in), which the
+appointment fields have no room for.
 
 Every write is recorded on the case (``written_to_tpro``, with what Transport Pro had before) and
 on its job. A failed write is retried after an hour and raised after three tries. An appointment
-whose time has passed is never written.
+whose time has passed is never written. Transport Pro takes UTC; everything people read is
+Eastern.
 """
 
 from __future__ import annotations
@@ -38,10 +45,11 @@ from facility_profiles.booking.models import (
     JobStatus,
 )
 from facility_profiles.booking.worklist import flag
+from facility_profiles.clock import stamp
 from facility_profiles.config import Settings
 from facility_profiles.storage.repository import as_utc
 from facility_profiles.tpro.errors import TransportProError
-from facility_profiles.tpro.models import Load, Waypoint
+from facility_profiles.tpro.models import Load, Waypoint, parse_iso
 
 KIND = "tpro_write"
 ACTOR = "automation"
@@ -68,6 +76,10 @@ class LoadWriter(Protocol):
         status: str | None = None,
     ) -> Any:
         """``POST /load/{id}/set_appointment``."""
+        ...
+
+    def add_load_note(self, load_id: int, content: str, *, priority: bool = False) -> Any:
+        """``POST /load/{id}/note``."""
         ...
 
 
@@ -165,6 +177,77 @@ def _same(stop: Waypoint, payload: dict[str, Any]) -> bool:
     )
 
 
+def _parse(stamp_utc: str) -> datetime:
+    return datetime.strptime(stamp_utc, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+
+
+def appointment_note(
+    case: BookingCase, payload: dict[str, Any], *, was: dict[str, Any] | None
+) -> str:
+    """The note that goes on the load with the appointment, on the Eastern clock.
+
+    What Transport Pro's appointment fields cannot hold: who confirmed it, the facility's pickup
+    number and the conditions it set.
+    """
+    start, end = _parse(payload["start_utc"]), _parse(payload["end_utc"])
+    when = stamp(start, "%a %m/%d %H:%M")
+    if end != start:
+        when += f" to {stamp(end, '%H:%M')}"
+    vendor = case.vendor_name or "the facility"
+    lines = [f"Pickup appointment confirmed with {vendor}: {when}."]
+    if was is not None:
+        lines[0] = f"Pickup appointment moved, confirmed with {vendor}: {when}."
+        lines.append(f"Replaces {was.get('open') or 'the earlier time'} (UTC) set before.")
+    if case.pickup_number:
+        lines.append(f"Pickup number: {case.pickup_number}.")
+    conditions = _conditions(case)
+    if conditions:
+        lines.append("Facility says: " + "; ".join(conditions) + ".")
+    lines.append(f"Booked by the booking agent, case #{case.id}.")
+    return " ".join(lines)[:1000]
+
+
+def _conditions(case: BookingCase) -> list[str]:
+    """The conditions the facility set in the reply that booked the slot."""
+    for message in reversed(case.messages):
+        reading = message.classification or {}
+        if message.direction == "in" and reading.get("status") in ("confirmed", "counter_offer"):
+            return [str(c).strip().rstrip(".") for c in reading.get("conditions") or []][:5]
+    return []
+
+
+def _put_there_by_us(
+    case: BookingCase, job: AutomationJob, stop: Waypoint
+) -> dict[str, Any] | None:
+    """The earlier booking of this case whose time Transport Pro shows now, if any.
+
+    Such a time was written (or found) by this case's own write-back, so a newer booking may
+    replace it. Anything else there was put by someone else.
+    """
+    for other in reversed(case.jobs):
+        if other is job or other.kind != KIND or other.status != JobStatus.DONE.value:
+            continue
+        earlier = (other.result or {}).get("payload")
+        if earlier and _same(stop, earlier):
+            return dict(earlier)
+    return None
+
+
+def _write_note(
+    job: AutomationJob, client: LoadWriter, case: BookingCase, *, was: dict[str, Any] | None
+) -> None:
+    """Put the note on the load, once per job; a failure is retried with the job."""
+    if (job.result or {}).get("note_written"):
+        return
+    payload = job.result["payload"]
+    try:
+        client.add_load_note(case.load_id, appointment_note(case, payload, was=was))
+    except (TransportProError, OSError, ValueError) as exc:
+        msg = f"the appointment is in Transport Pro but its note was not added: {exc}"
+        raise TransportProError(msg) from exc
+    job.result = {**job.result, "note_written": True}
+
+
 def _held_by_tpro(stop: Waypoint) -> dict[str, Any] | None:
     """What Transport Pro has for the stop, when it is a confirmed appointment."""
     appt = stop.appointment_time
@@ -237,24 +320,38 @@ def _write_one(
         report.say(case, "held: a stop-off pickup is not written by the agent")
         return
     if _same(stop, payload):
-        _close(job, JobStatus.DONE, "already in Transport Pro", now)
-        if not dry_run:
+        if dry_run:
+            report.already += 1
+            report.say(case, "already in Transport Pro")
+            return
+        ours = bool((job.result or {}).get("written_at"))  # written on an earlier try
+        _write_note(job, client, case, was=(job.result or {}).get("replaced"))
+        _close(
+            job,
+            JobStatus.DONE,
+            "written to Transport Pro" if ours else "already in Transport Pro",
+            now,
+        )
+        if not ours:
             _event(session, case, "tpro_already_set", payload=payload)
         report.already += 1
         report.say(case, "already in Transport Pro")
         return
     there = _held_by_tpro(stop)
-    if there is not None:
+    replacing = _put_there_by_us(case, job, stop) if there is not None else None
+    if there is not None and replacing is None:
         job.status = JobStatus.HELD.value
         job.reason = "Transport Pro has another confirmed time; a person decides"
         if not dry_run:
+            held = stamp(parse_iso(there["open"]), "%a %m/%d %H:%M") or there["open"]
+            booked = stamp(_parse(payload["start_utc"]), "%a %m/%d %H:%M")
             flag(
                 session,
                 case,
                 ExceptionType.TPRO_MISMATCH,
                 (
-                    f"Transport Pro has {there['open']} confirmed for this pickup; the booking is "
-                    f"{payload['start_utc']}. Nothing was overwritten"
+                    f"Transport Pro has {held} confirmed for this pickup; the booking is "
+                    f"{booked}. Nothing was overwritten"
                 )[:255],
                 actor=ACTOR,
                 tpro=there,
@@ -263,9 +360,11 @@ def _write_one(
         report.mismatched += 1
         report.say(case, f"not written: Transport Pro already has {there['open']} confirmed")
         return
+    when = stamp(_parse(payload["start_utc"]), "%a %m/%d %H:%M")
     if dry_run:
         report.written += 1
-        report.say(case, f"would write SH {payload['start_utc']} to load {case.load_id}")
+        verb = "would replace its own earlier time with" if replacing else "would write"
+        report.say(case, f"{verb} SH {when} on load {case.load_id}")
         return
     previous = stop.appointment_time.model_dump() if stop.appointment_time else None
     client.set_appointment(
@@ -275,11 +374,25 @@ def _write_one(
     if check is None or not _same(check, payload):
         msg = "Transport Pro took the write but does not show the appointment"
         raise TransportProError(msg)
+    job.result = {
+        **job.result,
+        "previous": previous,
+        "replaced": there if replacing else None,
+        "written_at": now.isoformat(),
+    }
+    _event(
+        session,
+        case,
+        "written_to_tpro",
+        payload=payload,
+        previous=previous,
+        replaced=bool(replacing),
+        reason=f"SH {when}" + (" (replacing the earlier time)" if replacing else ""),
+    )
+    _write_note(job, client, case, was=there if replacing else None)
     _close(job, JobStatus.DONE, "written to Transport Pro", now)
-    job.result = {**job.result, "previous": previous, "written_at": now.isoformat()}
-    _event(session, case, "written_to_tpro", payload=payload, previous=previous)
     report.written += 1
-    report.say(case, f"written to Transport Pro: SH {payload['start_utc']}")
+    report.say(case, f"written to Transport Pro: SH {when}" + (" (replaced)" if replacing else ""))
 
 
 def write_appointments(
@@ -310,7 +423,7 @@ def write_appointments(
             _close(job, JobStatus.CANCELED, f"the case is {case.status}", now)
             report.closed += 1
             continue
-        start = datetime.strptime(payload["start_utc"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+        start = _parse(payload["start_utc"])
         if start <= now:
             _close(job, JobStatus.CANCELED, "the appointment has passed; nothing to write", now)
             report.closed += 1

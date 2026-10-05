@@ -58,8 +58,8 @@ def test_a_template_that_would_write_a_broken_email_is_refused():
     assert problems[0].startswith("the subject has an unmatched brace")
     assert problems[1].startswith("the body uses {name}, which a request cannot fill; use {ask}")
     assert problems[2] == (
-        "a request needs {lines}: the PO lines asked for, one per line: PO# X on MM/DD @ HHMM, "
-        "with any number the desk needs"
+        "a request needs {lines}: the PO lines asked for, one per line: PO# X on MM/DD @ HHMM "
+        "(Eastern), with any number the desk needs"
     )
     assert check_template(TemplateKind.FOLLOW_UP, "Following up", "Hello,\n{lines}") == [
         "the body uses {lines}, which a follow_up cannot fill; use {carrier}, {customer}, "

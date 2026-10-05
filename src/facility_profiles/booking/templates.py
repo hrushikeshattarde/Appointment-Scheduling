@@ -14,6 +14,9 @@ saved: for the desk's address, else for the customer, else the pod's default, el
 one, which is the pod's own wording word for word. A customer template is saved under the
 customer's key (``lidl``), its name, or a Transport Pro customer name. Templates are checked when
 saved: an unknown field, an unmatched brace, or a request without its PO lines is refused.
+
+Every date and time in them is Eastern; a facility outside Eastern time sees "ET" after each
+time, so its desk does not read it as its own.
 """
 
 from __future__ import annotations
@@ -24,13 +27,13 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
 from string import Formatter
-from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from facility_profiles.booking.models import BookingCase, BookingTemplate
 from facility_profiles.booking.rules import VendorProfile, extra_references
+from facility_profiles.clock import LABEL, is_eastern, local_to_eastern, to_eastern
 from facility_profiles.config import Settings
 from facility_profiles.customers import customer_of
 from facility_profiles.storage.models import utcnow
@@ -49,22 +52,23 @@ class TemplateKind(StrEnum):
 
 # Every fill-in field, and what it becomes in the email.
 FIELDS: dict[str, str] = {
-    "lines": "the PO lines asked for, one per line: PO# X on MM/DD @ HHMM, with any number the "
-    "desk needs",
+    "lines": "the PO lines asked for, one per line: PO# X on MM/DD @ HHMM (Eastern), with any "
+    "number the desk needs",
     "line": "the PO line asked for again (reschedule)",
     "ask": "the pod's ask, 'Can I please schedule the following?'; on a shared desk it names the "
     "shipper and the customer",
     "po": "the PO numbers, A & B, or 'load N' when the load has none",
     "load": "Circle's load number (A & B in a batch)",
-    "date": "the pickup date asked for, MM/DD (the first one in a batch)",
-    "time": "the pickup time asked for, HHMM; empty for a desk that is given a date only",
+    "date": "the pickup date asked for, MM/DD, Eastern (the first one in a batch)",
+    "time": "the pickup time asked for, HHMM Eastern ('ET' after it for a facility off Eastern "
+    "time); empty for a desk that is given a date only",
     "vendor": "the shipper's name without Inc. or LLC",
     "customer": "the customer's name from its customer file, e.g. Lidl",
     "desk_name": "the desk contact's name on the vendor profile, or empty",
     "delivery_ref": "the customer's delivery reference (the DCT number), or empty",
-    "delivery_date": "the delivery date, MM/DD, or empty",
+    "delivery_date": "the delivery date, MM/DD, Eastern, or empty",
     "refs": "the numbers the desk needs besides the PO, e.g. Shipment# 7781234, or empty",
-    "previous": "the slot asked for before, MM/DD @ HHMM (reschedule)",
+    "previous": "the slot asked for before, MM/DD @ HHMM, Eastern (reschedule)",
     "note": "the one line of context given with a reschedule, or empty",
     "carrier": "Circle's name as the carrier",
     "signature": "the pod's signature block",
@@ -159,15 +163,27 @@ def fmt_local(value: str | None) -> tuple[str, str]:
     return (parsed.strftime("%m/%d"), clock.replace(":", ""))
 
 
+def vendor_when(local: str | None, timezone: str | None) -> tuple[str, str]:
+    """A facility-clock slot as an email gives it: ("MM/DD", "HHMM") on the Eastern clock.
+
+    For a facility outside Eastern time the time reads "HHMM ET", so its desk does not take it
+    for its own clock.
+    """
+    mmdd, clock = fmt_local(local_to_eastern(local, timezone))
+    if clock and not is_eastern(timezone):
+        clock = f"{clock} {LABEL}"
+    return mmdd, clock
+
+
 def request_lines(
     case: BookingCase, *, date_only: bool = False, extra: Iterable[str] = ()
 ) -> list[str]:
-    """The PO lines exactly as the pod writes them: "PO# X on MM/DD @ HHMM".
+    """The PO lines exactly as the pod writes them: "PO# X on MM/DD @ HHMM", on the Eastern clock.
 
     ``extra`` holds the numbers the desk needs besides the PO ("Shipment# 7781234"); they follow
     the PO: "PO# X / Shipment# 7781234 on MM/DD @ HHMM".
     """
-    mmdd, clock = fmt_local(case.requested_local)
+    mmdd, clock = vendor_when(case.requested_local, case.vendor_timezone)
     when = f"on {mmdd}" + (f" @ {clock}" if clock and not date_only else "")
     refs = "".join(f" / {ref}" for ref in extra)
     pos = [str(p) for p in case.po_numbers]
@@ -197,10 +213,9 @@ def case_values(
     """The fields every template can use, for one case or a batch for one desk."""
     first = cases[0]
     pos = [str(p) for c in cases for p in c.po_numbers]
-    mmdd, clock = fmt_local(first.requested_local)
+    mmdd, clock = vendor_when(first.requested_local, first.vendor_timezone)
     date_only = bool(profile and profile.date_only)
     delivery = as_utc(first.delivery_at_utc)
-    tz = ZoneInfo(first.vendor_timezone or "America/New_York")
     return {
         "po": " & ".join(pos) or " & ".join(f"load {c.load_id}" for c in cases),
         "load": " & ".join(str(c.load_id) for c in cases),
@@ -210,7 +225,7 @@ def case_values(
         "customer": customer_of(first, settings).label(first.customer_name),
         "desk_name": first.contact_name or (profile.contact_name if profile else None) or "",
         "delivery_ref": first.delivery_ref or "",
-        "delivery_date": delivery.astimezone(tz).strftime("%m/%d") if delivery else "",
+        "delivery_date": to_eastern(delivery).strftime("%m/%d") if delivery else "",
         "refs": ", ".join(ref for c in cases for ref in extra_references(c, profile)),
         "carrier": settings.booking_carrier_name,
         "signature": customer_of(first, settings).signature or settings.booking_signature,
@@ -258,7 +273,7 @@ def reschedule_values(
     """The fields of a reschedule: the line asked for again, the slot before, the note."""
     date_only = bool(profile and profile.date_only)
     line = request_lines(case, date_only=date_only, extra=extra_references(case, profile))[0]
-    mmdd, clock = fmt_local(previous)
+    mmdd, clock = vendor_when(previous, case.vendor_timezone)
     return {
         **case_values([case], settings, profile),
         "line": line,

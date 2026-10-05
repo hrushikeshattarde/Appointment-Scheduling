@@ -289,13 +289,14 @@ def test_cut_off_notice_and_horizon_are_read_in_the_vendor_time_zone(settings, s
     assert slot_is_stale(
         "2026-10-01 09:00", "America/New_York", settings, now=WED_3PM, profile=no_notice
     ) == (
-        "the desk's cut-off for 2026-10-01 09:00 was Wed 09/30 14:00 (14:00 the business day before)"
+        "the desk's cut-off for Thu 10/01 09:00 ET was Wed 09/30 14:00 ET "
+        "(14:00 their time, the business day before)"
     )
     assert slot_is_stale(
         "2026-10-01 09:00", "America/New_York", settings, now=NOW, profile=profile
     ) == (
-        "requested slot 2026-10-01 09:00 is inside the desk's 72 h notice; it had to be asked "
-        "for by Mon 09/28 09:00"
+        "requested slot Thu 10/01 09:00 ET is inside the desk's 72 h notice; it had to be asked "
+        "for by Mon 09/28 09:00 ET"
     )
     assert too_early("2026-10-01 09:00", "America/New_York", profile, now=NOW) == (
         "the desk books at most 1 day ahead; ask from Wed 09/30"
@@ -359,8 +360,8 @@ def test_the_timers_raise_a_cut_off_that_passed_before_anyone_sent_the_request(s
         assert [(k, d) for _, k, d in result.raised] == [
             (
                 "slot_unworkable",
-                "the desk's cut-off for 2026-10-01 09:00 was Wed 09/30 14:00 "
-                "(14:00 the business day before)",
+                "the desk's cut-off for Thu 10/01 09:00 ET was Wed 09/30 14:00 ET "
+                "(14:00 their time, the business day before)",
             )
         ]
         assert case.open_exceptions[0].raised_by == "timer"

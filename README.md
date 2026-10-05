@@ -133,7 +133,7 @@ other code names a customer. Lidl's is
 | `[customer_desk]` | where "the vendor cannot ship" goes; mail from it moves the delivery slot; `delivery_system` names where the pod rebooks | inbound@lidl.us, DCT |
 | `[numbers]` | `po`: subjects made of PO numbers; `po_date`: the date inside a PO (named groups dd, mm, yy); `delivery_ref`: read off the delivery stop and the desk's mail | `\d{12}`, DDMMYY in digits 5-10, `[A-Z]{3}_\d{6,}` |
 | `[mail_archive]` | which group mail the S3 archive keeps or drops, on top of the shared rules | "Lidl Pick Ups", DCT, the vendor desks; drops "CIR Capacity" |
-| `timezone` | what "today" means in `booking today --customer lidl` | America/Indiana/Indianapolis |
+| `timezone` | what "today" means in `booking today --customer lidl` | America/New_York |
 
 A load or case belongs to the file that lists its Transport Pro customer id (or name). A load no
 file claims is written with the `FP_BOOKING_*` settings, which name no customer: no cc, no
@@ -296,6 +296,22 @@ facility-profiles access history [--email am@circledelivers.com]
 
 A new customer is a new column: `customers new <key>`, then give the account manager access.
 
+### Times are Eastern
+
+Every time a person reads (the board, the CLI, to-dos, the daily summary, Transport Pro notes,
+the logs) and every time in an email to a facility is Eastern: EST, or EDT while daylight saving
+is on, written "ET". A time a person types (marking a pickup booked, rescheduling, a new delivery
+slot) is Eastern too. The store keeps instants in UTC (Transport Pro takes UTC) and pickup slots
+on the facility's own clock, the one its hours, cut-offs and weekends are written in;
+`facility_profiles/clock.py` converts at the edges. For a facility on Eastern time (every Lidl
+vendor but Seneca in Ripon, WI) the clocks are the same and only the label changes.
+
+A facility outside Eastern time sees "ET" after each time ("PO# X on 10/01 @ 0900 ET"). The reply
+reader reports times as written and the zone the reply names; a time with no zone is taken as
+ours (Eastern), and when that is not the time we asked for, a person checks which clock the desk
+meant (`time_zone_unclear`, "Which time zone?"). The model is told when the reply was written on
+the facility's own clock, so a "tomorrow" written at 8:30 PM is the next day, not the one after.
+
 ### Status and exceptions
 
 A case's status says only where the pickup appointment stands: `unscheduled` (nothing asked of
@@ -403,11 +419,24 @@ requested slot; a time alone means the requested date), deferred ("check back Mo
 waiting, a counter-offer, a question or a decline raises its exception. A "confirmation" of a
 slot that had already passed when the vendor wrote ("latest is 9pm tonight" after a missed
 pickup) is raised as `stale_confirmation`, a work-in note for a person. A confirmation is
-answered once with the pod's "Thank you!". `approve` records the decision, prints the exact
-Transport Pro `set_appointment` payload and queues it for write-back (see "Writing booked pickups
-to Transport Pro").
-Mail that arrives on a scheduled or canceled case (driver ETAs, securement, "did this get
-resolved?") is kept on the case and never read as a new answer.
+answered once with the pod's "Thank you!", but only when nothing about it is in doubt: a time we
+did not ask for, a number its words do not back, a tie to the request by sender only, or a time
+that misses the delivery gets no thank-you (it would tell the facility the pickup is booked).
+`approve` records the decision, prints the exact Transport Pro `set_appointment` payload and
+queues it for write-back (see "Writing booked pickups to Transport Pro").
+Mail on a canceled case is kept and not read. Mail on a booked (scheduled) case is read for one
+thing: whether the facility moved, dropped or put off the booked pickup. The agent never moves
+a booking itself: a new time, a decline or a "check back" puts the case back to pending (declined
+for a decline) and raises `booked_slot_changed` ("Booked pickup changed", with what was booked and
+whether Transport Pro still shows it), which stays open until a person approves a time or marks
+the pickup booked; that writes the new time to Transport Pro in place of the old one. The same
+time again is noted, a question is answered as usual, a time already past when they wrote
+("latest is 9pm tonight") is a question for a person, and anything else is kept. A correction
+that arrives in the same pass as the confirmation it corrects is caught the same way.
+A decline carries its reason (`not_ready`, `no_capacity`, `closed`, `po_not_found`,
+`order_canceled`, `other`). Only the first three are about the day, so only they write to the
+customer's desk for a new delivery appointment; "we do not have this PO" goes to a person. A
+"check back" on or after the pickup day raises `check_back_too_late`.
 
 The conversation policy (`booking/respond.py`) handles what comes back, still as drafts:
 a counter-offer is accepted when the offered pickup still makes the customer's delivery
@@ -508,9 +537,16 @@ row says to enter it there by hand. With it on, each load is read first:
 | Transport Pro shows | The writer |
 |---|---|
 | the same confirmed time | sends nothing ("Already in Transport Pro") |
-| a different confirmed time | overwrites nothing; raises "Transport Pro has another time" for a person |
+| a confirmed time this booking put there before (the pickup was moved since) | replaces it with the new time, then reads the load back |
+| any other confirmed time | overwrites nothing; raises "Transport Pro has another time" for a person |
 | a stop-off, not the load's shipper | writes nothing; a person enters it |
 | the tender, or no appointment | writes the booking, then reads the load back to confirm it |
+
+With the appointment, a note goes on the load once per booking (`POST /load/{id}/note`): the
+time on the Eastern clock, the facility's pickup number and the conditions it set ("check in at
+the guard shack"), which the appointment fields have no room for. A note that fails is retried
+with the job, without writing the time again. Transport Pro takes and gives UTC; nothing changes
+there.
 
 Every write is recorded on the case ("Written to Transport Pro", with what was there before). A
 failed write is retried after an hour and raised as "Automation failed" after three tries. An
@@ -571,6 +607,17 @@ With `FP_BOOKING_INBOX` set, each pass also reads the new replies, the way Bigge
   `FP_BOOKING_INBOX=s3://bucket/prefix` reads the group-mail archive. Each pass looks
   `FP_BOOKING_INBOX_DAYS` back (2). Mail already on a case is skipped by its email ID, so a reply
   is never answered twice, however often the inbox is read.
+- **Finding the pickup**: by the email IDs the reply answers, its thread, a PO in its words (of a
+  pickup being booked or one booked), the desk that wrote, or another address at that desk's
+  company when only one pickup is open with it (too weak to book on). Every email the agent
+  sends asks for answers to go to the customer's group (`Reply-To`), so a plain Reply reaches the
+  group as well as Reply All.
+- **Mail no pickup matches** is kept for a person (table `booking_unmatched_mail`) when it is
+  about booking (a pickup subject, a known desk or its company, a PO-shaped number): the board's
+  Home shows "Emails no pickup matched" to link each to its pickup (the agent then reads it) or
+  dismiss it; `booking unmatched`, `booking link-mail MAIL CASE --by`, `booking dismiss-mail
+  MAIL --by --note` do the same. A later pass that finds the pickup links it itself. Tour plans,
+  tenders and rate requests are never kept.
 - **What it does with a reply**: matches it to its pickup, reads it, and answers by the
   conversation policy:
   - accept an offer that still makes the delivery, or ask for other days;
@@ -723,9 +770,11 @@ link. The vendor's second click, a POST, is what counts:
   a driver is refused.
 - **A time proposed** becomes the usual "vendor offered another time" to-do, with whether it
   still makes the delivery.
-- A link is signed (HMAC, never guessable), expires after `FP_BOOKING_LINK_VALID_HOURS` (72) or
-  the last time offered, whichever comes first, and stops working once answered, once a later
-  request replaces it, or once the pickup is booked or canceled another way.
+- A link is signed (HMAC, never guessable), expires after `FP_BOOKING_LINK_VALID_HOURS` (72)
+  weekday hours (weekends do not count, so a Friday-morning request's links last into
+  Wednesday) or the last time offered, whichever comes first, and stops working once answered,
+  once a later request replaces it, or once the pickup is booked or canceled another way.
+- The buttons and the page show times in Eastern; a time the vendor proposes is read as Eastern.
 - A draft nobody marked as sent is marked sent by the click: the vendor holds the link.
 
 `booking links ID` lists a case's offers, their links and what the vendor did; `booking template
@@ -865,6 +914,10 @@ fake API client and a scripted extractor; the client is tested against mocked HT
 the board on a demo store, the commands, and a pod's real cases on a copy of its store.
 
 ## Known gaps and next steps
+
+- The agent learns of new mail only when a pass runs (`serve --autopilot-every N`); there is no
+  push (Gmail watch, or SES inbound to a function), and nothing runs while the machine is off.
+  Hosting it (HTTPS, a shared Postgres store, the sending mailbox) is still to do.
 
 - Vendor asks from the PRD are still open: a facility write path, a facility search endpoint,
   the allowed `appointments.method` values, the `needsAppointment` filter definition.

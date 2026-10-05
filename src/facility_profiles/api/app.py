@@ -26,6 +26,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy.orm import Session, sessionmaker
+from starlette.types import Scope
 
 from facility_profiles import __version__
 from facility_profiles.access import Viewer, signin_enabled
@@ -47,6 +48,20 @@ from facility_profiles.storage.repository import Repository, unwrap
 BOARD = Path(__file__).parent / "static"
 WRITES = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 log = get_logger(__name__)
+
+
+class BoardFiles(StaticFiles):
+    """The board's page, script and styles, checked with the server on every load.
+
+    Without it a browser keeps an old app.js for a while after an update; with it an unchanged
+    file costs a 304 and a changed one reaches everyone at once.
+    """
+
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        """The file, marked to be revalidated before each use."""
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
 
 def same_origin(request: Request, settings: Settings) -> bool:
@@ -224,7 +239,7 @@ def create_app(
     # The vendor pages too, for trying links on this machine; in public they run on their own
     # (links_api.create_links_app), never with the board.
     app.include_router(links_api.router)
-    app.mount("/app", StaticFiles(directory=BOARD, html=True), name="board")
+    app.mount("/app", BoardFiles(directory=BOARD, html=True), name="board")
 
     @app.get("/", include_in_schema=False)
     def home() -> RedirectResponse:

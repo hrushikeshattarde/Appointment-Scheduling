@@ -105,7 +105,7 @@ def test_po_date_after_the_delivery_hands_the_case_to_a_person(settings, session
         infeasible = case.open_exceptions[0]
         assert infeasible.description.startswith(
             "cannot make the delivery: the PO date 10/07 is the earliest pickup; "
-            "a pickup Wed 10/07 09:00 arrives"
+            "a pickup Wed 10/07 09:00 ET arrives"
         )
         assert "after the delivery slot" in infeasible.description
         assert infeasible.detail["requested"] == "2026-10-07 09:00"

@@ -58,6 +58,14 @@ class ExceptionType(StrEnum):
     # Transport Pro shows the load canceled after a request was written or the pickup booked
     # (booking/service.py refresh): the vendor still holds the slot.
     LOAD_CANCELED = "load_canceled"
+    # The facility wrote about a pickup already booked: a new time, a decline, or "check back".
+    # The agent never moves a booked pickup itself; this stays open until a person settles it.
+    BOOKED_SLOT_CHANGED = "booked_slot_changed"
+    # A facility off Eastern time gave a time with no zone, and not the one we asked for: it may
+    # be on their clock or ours.
+    TIME_ZONE_UNCLEAR = "time_zone_unclear"
+    # The facility said to check back on the pickup day itself, or later.
+    CHECK_BACK_TOO_LATE = "check_back_too_late"
 
 
 class BookingCase(Base):
@@ -299,6 +307,44 @@ class AutomationJob(Base):
     done_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     case: Mapped[BookingCase] = relationship(back_populates="jobs")
+
+
+class UnmatchedMail(Base):
+    """Booking mail the agent could not tie to any pickup, kept for a person.
+
+    A reply that answers no request by its email IDs, names no PO of an open pickup and comes
+    from no single desk would otherwise be lost. Mail that is not about booking (tour plans,
+    tenders, rate requests) is never kept. An item is ``open`` until a person links it to its
+    pickup (the agent then reads it as that pickup's reply) or dismisses it; the agent links it
+    itself when a later pass finds its pickup.
+    """
+
+    __tablename__ = "booking_unmatched_mail"
+    __table_args__ = (Index("ix_booking_unmatched_mail_status", "status"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    message_id: Mapped[str] = mapped_column(String(255), unique=True)
+    rfc_message_id: Mapped[str | None] = mapped_column(String(255), index=True)
+    thread_id: Mapped[str | None] = mapped_column(String(128))
+    in_reply_to: Mapped[str | None] = mapped_column(Text)
+    references_header: Mapped[str | None] = mapped_column(Text)
+    sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    from_addr: Mapped[str | None] = mapped_column(String(255))
+    to_addr: Mapped[str | None] = mapped_column(String(512))
+    cc_addr: Mapped[str | None] = mapped_column(String(512))
+    subject: Mapped[str | None] = mapped_column(String(512))
+    body: Mapped[str | None] = mapped_column(Text)
+    quoted: Mapped[str | None] = mapped_column(Text)
+    # Whose mail it is (the customer file's key, from the group it went to), for the board's
+    # access rules; None when no customer's group was on it.
+    customer_key: Mapped[str | None] = mapped_column(String(64))
+    reason: Mapped[str] = mapped_column(String(128))  # why it was kept: a subject rule, a desk
+    status: Mapped[str] = mapped_column(String(16), default="open")  # open | linked | dismissed
+    case_id: Mapped[int | None] = mapped_column(ForeignKey("booking_cases.id"))
+    resolved_by: Mapped[str | None] = mapped_column(String(128))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    note: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class BookingTemplate(Base):

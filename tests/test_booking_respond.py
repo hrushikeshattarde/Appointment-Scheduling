@@ -17,7 +17,7 @@ from facility_profiles.booking.respond import (
     case_facts,
     offer_is_feasible,
 )
-from facility_profiles.booking.schema import ReplyClassification, ReplyStatus
+from facility_profiles.booking.schema import RejectReason, ReplyClassification, ReplyStatus
 from facility_profiles.booking.service import draft_case, ingest, list_cases, mark_sent, scan
 from facility_profiles.booking.worklist import open_kinds, resolve
 from facility_profiles.storage.db import session_scope
@@ -224,7 +224,9 @@ def test_rejection_drafts_a_note_to_the_customer_desk_and_money_talk_is_handed_o
                 status=ReplyStatus.QUESTION, question="Will you pay detention?"
             )
         return ReplyClassification(
-            status=ReplyStatus.REJECTED, question="PO will not be ready until 10/07"
+            status=ReplyStatus.REJECTED,
+            reject_reason=RejectReason.NOT_READY,
+            question="PO will not be ready until 10/07",
         )
 
     classifier = FakeReplyClassifier(script)
@@ -241,7 +243,9 @@ def test_rejection_drafts_a_note_to_the_customer_desk_and_money_talk_is_handed_o
         )
         # Declined, and the decline stays open: a person sends the note and Lidl moves the delivery.
         assert case.status == CaseStatus.DECLINED.value
-        assert case.reason == "vendor cannot book: PO will not be ready until 10/07"
+        assert case.reason == (
+            "vendor cannot book (the order is not ready that day): PO will not be ready until 10/07"
+        )
         assert open_kinds(case) == ["facility_declined"]
         assert "note to the customer desk drafted" in case.open_exceptions[0].description
         note = mailer.drafts[-1]
@@ -391,9 +395,9 @@ def test_bare_set_and_time_only_confirmations_use_the_requested_slot(settings, s
         # 14:30 is five and a half hours from the 09:00 asked for, so that is raised with it.
         assert case.status == CaseStatus.PENDING.value
         assert open_kinds(case) == ["confirmation_review", "confirmed_outside_window"]
-        assert "2026-10-01 14:30" in case.open_exceptions[0].description
+        assert "Thu 10/01 14:30 ET" in case.open_exceptions[0].description
         assert case.open_exceptions[1].description == (
-            "vendor confirmed Thu 10/01 14:30; we asked for Thu 10/01 09:00 (5.5 h later)"
+            "vendor confirmed Thu 10/01 14:30 ET; we asked for Thu 10/01 09:00 ET (5.5 h later)"
         )
         assert case.exceptions[0].resolution == "superseded by a later reply (vendor_confirmed)"
         assert case.confirmed_local == "2026-10-01 14:30"
@@ -428,7 +432,13 @@ def test_deferred_replies_keep_waiting_and_unbacked_confirmations_are_not_truste
             responder=Responder(settings, mailer, now=NOW),
         )
         assert stats.deferred == 1 and case.status == CaseStatus.PENDING.value
-        assert case.reason == "vendor asked to check back on 2026-10-05" and open_kinds(case) == []
+        assert case.reason == "vendor asked to check back on 2026-10-05"
+        # Monday 10/5 is after the pickup asked for (Thu 10/01): the pickup is at risk.
+        assert open_kinds(case) == ["check_back_too_late"]
+        assert case.open_exceptions[0].description == (
+            "facility said to check back Mon 10/05, on or after the pickup Thu 10/01 09:00 ET; "
+            "the pickup is at risk"
+        )
         assert len(mailer.drafts) == 1  # nothing drafted back
 
         stats = ingest(
@@ -459,6 +469,8 @@ def test_follow_up_waits_for_the_vendor_check_back_day(settings, sessions):
     with session_scope(sessions) as session:
         case = session.get(BookingCase, case_id)
         assert case is not None
+        # A pickup a week out, so Monday's check-back still leaves time to book it.
+        case.requested_local = "2026-10-08 09:00"
         ingest(
             session,
             [reply("PO is unconfirmed. Please check back on Monday, 10/5", mid="cb1")],

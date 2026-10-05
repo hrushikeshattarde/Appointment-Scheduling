@@ -36,7 +36,7 @@ WEEKDAYS = ["mon", "tue", "wed", "thu", "fri"]
 
 
 def a_case(**changes: Any) -> BookingCase:
-    """The Koch Foods pickup: tendered Thu 10/01 09:00 New York, delivered Fri 10/02 09:30."""
+    """The Koch Foods pickup: tendered Thu 10/01 09:00 ET New York, delivered Fri 10/02 09:30 ET."""
     values: dict[str, Any] = {
         "load_id": 1,
         "customer_id": 7211,
@@ -84,7 +84,7 @@ def test_the_tendered_time_is_asked_for_as_before(settings: Settings) -> None:
     assert rec.local == "2026-09-30 15:30" and rec.feasible
     assert (
         rec.moved[0].note
-        == "that day has passed; the earliest pickup a driver can still make is Wed 09/30 15:30"
+        == "that day has passed; the earliest pickup a driver can still make is Wed 09/30 15:30 ET"
     )
 
 
@@ -134,7 +134,8 @@ def test_a_time_too_late_for_the_delivery_moves_earlier_the_same_day(settings: S
     assert rec.local == "2026-10-01 14:30" and rec.feasible
     assert rec.moved[-1].rule == "fit"
     assert rec.moved[-1].note == (
-        "18:00 would arrive after the delivery at 10/02 04:00; 14:30 is the latest that makes it"
+        "18:00 ET would arrive after the delivery at 10/02 04:00 ET; 14:30 ET is the latest "
+        "that makes it"
     )
     # Not before the facility opens, though: then no time that day makes it.
     rec = recommend_time(evening, settings, now=NOW, profile=hours("15:00", "22:00"))
@@ -153,7 +154,7 @@ def test_a_pickup_after_its_delivery_cannot_make_it(settings: Settings) -> None:
     rec = recommend_time(late, settings, None, now=NOW)
     assert not rec.feasible and rec.local == "2026-10-03 11:00"
     assert rec.verdict == (
-        "a pickup Sat 10/03 11:00 arrives Sun 10/04 00:10, after the delivery slot Fri 10/02 09:30"
+        "a pickup Sat 10/03 11:00 ET arrives Sun 10/04 00:10 ET, after the delivery slot Fri 10/02 09:30 ET"
     )
     assert rec.latest == "2026-10-01 20:00"
 
@@ -259,8 +260,8 @@ def test_a_load_that_cannot_make_its_delivery_goes_to_a_person(
         assert open_kinds(case) == ["load_infeasible"]
         todo = case.open_exceptions[0]
         assert todo.description == (
-            "cannot make the delivery: a pickup Sat 10/03 11:00 arrives Sun 10/04 00:10, after "
-            "the delivery slot Fri 10/02 09:30; the latest pickup that makes it is Thu 10/01 20:00"
+            "cannot make the delivery: a pickup Sat 10/03 11:00 ET arrives Sun 10/04 00:10 ET, after "
+            "the delivery slot Fri 10/02 09:30 ET; the latest pickup that makes it is Thu 10/01 20:00 ET"
         )
         assert todo.detail["latest"] == "2026-10-01 20:00"
         assert KINDS["load_infeasible"][0] == "Cannot make the delivery"
@@ -340,9 +341,9 @@ def test_booking_recommend_explains_without_changing_anything(tmp_path, monkeypa
         engine.dispose()
         result = CliRunner().invoke(app, ["booking", "recommend", "1"])
         assert result.exit_code == 0, result.output
-        assert "#1 asks for Sat 10/03 11:00 now" in result.output
-        assert "after the delivery slot Fri 10/02 09:30" in result.output
-        assert "latest pickup that makes the delivery: Thu 10/01 20:00" in result.output
+        assert "#1 asks for Sat 10/03 11:00 ET now" in result.output
+        assert "after the delivery slot Fri 10/02 09:30 ET" in result.output
+        assert "latest pickup that makes the delivery: Thu 10/01 20:00 ET" in result.output
         assert "facility history: 0 confirmed time(s); usual none yet" in result.output
     finally:
         get_settings.cache_clear()

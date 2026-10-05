@@ -43,6 +43,9 @@ def main() -> int:
     parser.add_argument("--requested", default=None, help='requested slot, e.g. "2026-10-05 09:00"')
     parser.add_argument("--vendor", default="the vendor", help="vendor name for the prompt")
     parser.add_argument(
+        "--timezone", default="America/New_York", help="the facility's time zone (IANA name)"
+    )
+    parser.add_argument(
         "--sender", default=None, help="only messages whose sender domain contains this"
     )
     parser.add_argument("--internal-domain", default="circledelivers.com")
@@ -81,6 +84,7 @@ def main() -> int:
             subject=m.subject,
             body=m.body,
             quoted=m.quoted,
+            timezone=args.timezone,
         )
         output = classifier.classify(context)
         kept, issues = validate_classification(output.result, m.body, m.quoted)

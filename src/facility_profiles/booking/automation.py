@@ -61,6 +61,7 @@ from facility_profiles.booking.service import (
 from facility_profiles.booking.timers import fmt_slot, slot_at, sweep
 from facility_profiles.booking.worklist import flag, open_kinds
 from facility_profiles.booking.writeback import LoadWriter, write_appointments
+from facility_profiles.clock import stamp
 from facility_profiles.config import Settings
 from facility_profiles.customers import customers
 from facility_profiles.customers.profile import Customer, Rule
@@ -93,6 +94,8 @@ class RunReport:
     mail_answered: int = 0  # answers the agent wrote to them (sent or drafted)
     auto_confirmed: int = 0  # confirmations it booked itself
     mail_failed: int = 0  # replies that failed (retried on the next pass) or an unreadable inbox
+    mail_unmatched: int = 0  # booking mail no pickup matched, kept for a person this pass
+    booked_changed: int = 0  # replies that moved, dropped or put off a booked pickup
     lines: list[str] = field(default_factory=list)
 
     def say(self, case: BookingCase, text: str) -> None:
@@ -242,7 +245,7 @@ def _plan(
     due = _due(job, case, rule, tz, now)
     job.status = JobStatus.PLANNED.value
     job.due_at = due.astimezone(UTC)  # SQLite keeps the wall clock and drops the zone
-    job.reason = f"rule {rule.name!r}: {rule.do} at {due.astimezone(tz):%a %m/%d %H:%M}"
+    job.reason = f"rule {rule.name!r}: {rule.do} at {stamp(due, '%a %m/%d %H:%M')}"
     report.planned += 1
 
 
@@ -333,7 +336,7 @@ def _execute(
                 report.sent += 1
             else:
                 report.drafted += 1
-            when = fmt_slot(job.case.requested_local)
+            when = fmt_slot(job.case.requested_local, job.case.vendor_timezone)
             report.say(job.case, f"{'sent' if send else 'drafted'} to {desk} for {when}")
 
 
@@ -418,12 +421,21 @@ def _read_inbox(
             report.mail_failed += 1
             report.lines.append(f"inbox: could not handle {message.subject!r}; trying next pass")
             continue
-        new = stats.messages - stats.duplicates - stats.own_outbound - stats.skipped_internal
-        report.mail_read += max(new, 0)
+        report.mail_read += stats.new_mail
         report.mail_answered += stats.responded
         report.auto_confirmed += stats.auto_confirmed
+        report.mail_unmatched += stats.unmatched_kept
+        report.booked_changed += stats.booked_changed
         if stats.auto_confirmed:
             report.lines.append(f"inbox: booked {message.subject!r} from the vendor's confirmation")
+        if stats.unmatched_kept:
+            report.lines.append(
+                f"inbox: no pickup matched {message.subject!r}; kept for a person to link"
+            )
+        if stats.booked_changed:
+            report.lines.append(
+                f"inbox: {message.subject!r} changes a booked pickup; left for a person"
+            )
 
 
 def run_once(

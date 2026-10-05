@@ -22,7 +22,7 @@ from facility_profiles.booking.inbox import ArchiveInbox, inbox_from_settings
 from facility_profiles.booking.mail import InboundMessage, RecordingMailer, RecordingSender
 from facility_profiles.booking.models import BookingCase, CaseStatus
 from facility_profiles.booking.respond import Responder
-from facility_profiles.booking.schema import ReplyClassification, ReplyStatus
+from facility_profiles.booking.schema import RejectReason, ReplyClassification, ReplyStatus
 from facility_profiles.booking.service import draft_case, ingest, list_cases, scan
 from facility_profiles.booking.worklist import open_kinds
 from facility_profiles.config import Settings
@@ -344,6 +344,7 @@ def test_a_note_to_the_customer_desk_is_sent_when_the_rule_says_so(
     case_id, sent_id, sender = _sent_request(settings, sessions)
     no = ReplyClassification(
         status=ReplyStatus.REJECTED,
+        reject_reason=RejectReason.NOT_READY,
         question="This PO is not ready, we cannot ship it this week.",
         quotes=["This PO is not ready, we cannot ship it this week."],
         confidence=0.9,

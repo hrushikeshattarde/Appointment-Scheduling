@@ -8,6 +8,10 @@ who made it. Nothing here sends mail or writes to Transport Pro.
 With sign-in on (api/auth.py), every route answers with the signed-in person's customers only:
 another customer's case is "not found", and a decision needs "act" access to its customer.
 Decisions are recorded under the signed-in name; without sign-in, under the ``by`` sent.
+
+Every pickup slot here is on the Eastern clock ("YYYY-MM-DD HH:MM", the facility's own zone in
+``timezone``); instants are ISO-8601 in UTC, which the board shows in Eastern. A time sent in a
+decision (marking a pickup booked) is Eastern too.
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from facility_profiles.access import Viewer
 from facility_profiles.api.auth import ViewerDep, decided_by
+from facility_profiles.booking.inbox import reader_tools
 from facility_profiles.booking.links import offer_state
 from facility_profiles.booking.memory import desk_history
 from facility_profiles.booking.models import (
@@ -36,6 +41,7 @@ from facility_profiles.booking.models import (
     DeskMemory,
     ExceptionType,
     SlotOffer,
+    UnmatchedMail,
 )
 from facility_profiles.booking.references import case_numbers
 from facility_profiles.booking.rules import REFERENCE_LABELS, REFERENCE_NAMES
@@ -48,7 +54,9 @@ from facility_profiles.booking.service import (
 )
 from facility_profiles.booking.timers import fmt_slot, pickup_passed
 from facility_profiles.booking.today import pickup_slot, render_today, stage, today_summary
+from facility_profiles.booking.unmatched import dismiss_unmatched, link_unmatched, open_unmatched
 from facility_profiles.booking.worklist import KINDS, resolve
+from facility_profiles.clock import eastern_to_local, local_to_eastern, to_eastern
 from facility_profiles.config import Settings, get_settings
 from facility_profiles.customers import customers
 from facility_profiles.storage.repository import as_utc
@@ -98,6 +106,10 @@ EVENTS: dict[str, str] = {
     "tpro_already_set": "Already in Transport Pro",
     "confirmed_by_link": "Vendor picked a time from the link",
     "proposed_by_link": "Vendor proposed a time from the link",
+    "vendor_reconfirmed": "Vendor confirmed the booked time again",
+    "booked_changed": "Vendor changed a booked pickup",
+    "thanks_held": "No thank-you sent",
+    "mail_linked": "Email linked to this pickup",
 }
 
 
@@ -166,8 +178,11 @@ def case_summary(case: BookingCase, *, now: datetime) -> dict[str, Any]:
     }
 
 
-def _message_view(message: BookingMessage) -> dict[str, Any]:
-    reading = message.classification or {}
+def _message_view(message: BookingMessage, timezone: str | None = None) -> dict[str, Any]:
+    reading = dict(message.classification or {})
+    if reading.get("pickup_date") and reading.get("pickup_time"):  # read on the facility's clock
+        eastern = local_to_eastern(f"{reading['pickup_date']} {reading['pickup_time']}", timezone)
+        reading["pickup_date"], _, reading["pickup_time"] = (eastern or "").partition(" ")
     keep = (
         "status",
         "pickup_date",
@@ -282,14 +297,15 @@ def offer_view(offer: SlotOffer, *, now: datetime) -> dict[str, Any]:
     """The times one request offered by link, and what became of them."""
     detail = offer.answer_detail or {}
     answer = offer.answer
+    tz = offer.case.vendor_timezone
     if answer == "proposed":
         proposed = f"{detail.get('date') or ''} {detail.get('time') or ''}".strip()
-        answer = f"proposed {fmt_slot(proposed)}"
+        answer = f"proposed {fmt_slot(proposed, tz)}"
     elif answer:
-        answer = fmt_slot(answer)
+        answer = fmt_slot(answer, tz)
     return {
         "id": offer.id,
-        "slots": [fmt_slot(s) for s in offer.slots],
+        "slots": [fmt_slot(s, tz) for s in offer.slots],
         "state": offer_state(offer, now),
         "answer": answer,
         "answered_at": _iso(offer.answered_at),
@@ -330,16 +346,16 @@ def case_detail(
             for d in desks or []
         ],
         **case_summary(case, now=now),
-        "requested_local": case.requested_local,
+        "requested_local": local_to_eastern(case.requested_local, case.vendor_timezone),
         "requested_why": requested_why(case),
-        "confirmed_local": case.confirmed_local,
+        "confirmed_local": local_to_eastern(case.confirmed_local, case.vendor_timezone),
         "tendered_pickup_at": _iso(case.tendered_pickup_utc),
         "miles": case.miles,
         "reason": case.reason,
         "facility_key": case.facility_key,
         "references": [n.as_dict() for n in case_numbers(case)],
         "exceptions": [exception_view(e) for e in case.exceptions],
-        "messages": [_message_view(m) for m in case.messages],
+        "messages": [_message_view(m, case.vendor_timezone) for m in case.messages],
         "offers": [offer_view(o, now=now) for o in case.offers],
         "jobs": [job_view(j) for j in case.jobs],
         "timeline": timeline(case),
@@ -357,8 +373,9 @@ def overview(cases: list[BookingCase], *, now: datetime, days: int) -> dict[str,
     """The board's front page: counts, what needs a person, what slipped, what is coming up."""
     rows = [case_summary(c, now=now) for c in cases]
     live = [r for r in rows if r["status"] != CaseStatus.CANCELED.value]
-    today = now.date().isoformat()
-    horizon = (now.date() + timedelta(days=days)).isoformat()
+    eastern_today = to_eastern(now).date()
+    today = eastern_today.isoformat()
+    horizon = (eastern_today + timedelta(days=days)).isoformat()
     # What is still ahead: a pickup that has slipped is listed as past due, not as coming up.
     upcoming = [
         r
@@ -398,6 +415,22 @@ def overview(cases: list[BookingCase], *, now: datetime, days: int) -> dict[str,
         "todos": todos,
         "past_due": sorted((r for r in rows if r["past_due"]), key=_sort_key),
         "upcoming": sorted(upcoming, key=_sort_key),
+    }
+
+
+def mail_view(item: UnmatchedMail) -> dict[str, Any]:
+    """One email the agent could not tie to a pickup, for a person to link or dismiss."""
+    return {
+        "id": item.id,
+        "from": item.from_addr,
+        "to": item.to_addr,
+        "cc": item.cc_addr,
+        "subject": item.subject,
+        "body": item.body,
+        "sent_at": _iso(item.sent_at),
+        "reason": item.reason,
+        "customer": item.customer_key,
+        "status": item.status,
     }
 
 
@@ -461,6 +494,20 @@ class Cancellation(BaseModel):
 
     by: Who | None = None
     reason: Note
+
+
+class MailLink(BaseModel):
+    """Which pickup an email the agent could not match belongs to."""
+
+    by: Who | None = None
+    case_id: int
+
+
+class MailDismissal(BaseModel):
+    """Why an email the agent could not match needs nothing."""
+
+    by: Who | None = None
+    note: Note
 
 
 # ------------------------------------------------------------------ routes
@@ -583,7 +630,10 @@ def get_overview(
         for c in _visible(session, viewer, settings)
         if not customer or c.customer_name == customer
     ]
-    return overview(cases, now=now, days=days)
+    data = overview(cases, now=now, days=days)
+    data["mail"] = [mail_view(m) for m in open_unmatched(session) if _sees_mail(viewer, m)]
+    data["counts"]["unmatched_mail"] = len(data["mail"])
+    return data
 
 
 @router.get("/today")
@@ -723,7 +773,8 @@ def post_booked(
     if body.time and not body.date:
         raise HTTPException(status_code=422, detail="a pickup time needs a date")
     case = _get_case(session, case_id, viewer, settings, act=True)
-    local = f"{body.date} {body.time}" if body.date and body.time else body.date
+    eastern = f"{body.date} {body.time}" if body.date and body.time else body.date
+    local = eastern_to_local(eastern, case.vendor_timezone)  # people give times in Eastern
     try:
         mark_booked(
             session,
@@ -786,3 +837,67 @@ def post_cancel(
         raise HTTPException(status_code=409, detail=f"case {case_id} is already canceled")
     close_case(session, case, by=by, reason=body.reason)
     return _decided(session, case, now, viewer, settings)
+
+
+# ------------------------------------------------------------------ mail no pickup matched
+
+
+def _sees_mail(viewer: Viewer, item: UnmatchedMail) -> bool:
+    return viewer.sees(item.customer_key or "default")
+
+
+def _get_mail(session: Session, mail_id: int, viewer: Viewer) -> UnmatchedMail:
+    """An email the viewer may act on (404 when they may not see it, 403 when only see it)."""
+    item = session.get(UnmatchedMail, mail_id)
+    key = (item.customer_key or "default") if item is not None else ""
+    if item is None or not viewer.sees(key):
+        raise HTTPException(status_code=404, detail=f"mail {mail_id} not found")
+    if not viewer.acts(key):
+        raise HTTPException(
+            status_code=403,
+            detail="you can see this customer's mail but not act on it; ask an admin",
+        )
+    return item
+
+
+@router.get("/mail")
+def get_mail(session: SessionDep, viewer: ViewerDep) -> list[dict[str, Any]]:
+    """Booking mail no pickup matched, newest first, for a person to link or dismiss."""
+    return [mail_view(m) for m in open_unmatched(session) if _sees_mail(viewer, m)]
+
+
+@router.post("/mail/{mail_id}/link")
+def post_mail_link(
+    mail_id: int,
+    body: MailLink,
+    *,
+    session: SessionDep,
+    now: NowDep,
+    settings: SettingsDep,
+    viewer: ViewerDep,
+) -> dict[str, Any]:
+    """Tie an email to its pickup; the agent reads it as that pickup's reply."""
+    by = decided_by(viewer, body.by)
+    item = _get_mail(session, mail_id, viewer)
+    case = _get_case(session, body.case_id, viewer, settings, act=True)
+    classifier, _ = reader_tools(settings)
+    try:
+        link_unmatched(session, item, case, by=by, classifier=classifier, settings=settings)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _decided(session, case, now, viewer, settings)
+
+
+@router.post("/mail/{mail_id}/dismiss")
+def post_mail_dismiss(
+    mail_id: int, body: MailDismissal, *, session: SessionDep, viewer: ViewerDep
+) -> dict[str, Any]:
+    """Say an email the agent could not match needs nothing."""
+    by = decided_by(viewer, body.by)
+    item = _get_mail(session, mail_id, viewer)
+    try:
+        dismiss_unmatched(session, item, by=by, note=body.note)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    session.commit()
+    return mail_view(item)

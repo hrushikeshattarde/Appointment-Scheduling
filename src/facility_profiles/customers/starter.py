@@ -17,7 +17,7 @@ _STARTER = Template(
 name = "$name"
 # description = "Inbound vendor pickups to the customer's DCs, pod NNNN"
 # The pod's own time zone: what "today" means in this customer's daily summary.
-# timezone = "America/Indiana/Indianapolis"
+# timezone = "America/New_York"
 
 [transport_pro]
 # The Transport Pro customer record(s) the loads are billed to: a load billed to any of them is

@@ -126,12 +126,14 @@ def _view(
     asked = case.requested_local
     slots = "".join(
         f'<label class="slot"><input type="radio" name="slot" value="{i}"'
-        f"{' checked' if i == pick else ''} required> {html.escape(fmt_slot(s))}"
+        f"{' checked' if i == pick else ''} required> "
+        f"{html.escape(fmt_slot(s, case.vendor_timezone))}"
         f"{' (the time we asked for)' if s == asked else ''}</label>"
         for i, s in enumerate(offer.slots)
     )
     parts.append(
         '<form class="card" method="post"><h2>Choose the pickup time that works</h2>'
+        '<p class="muted">All times are Eastern Time (ET).</p>'
         f"{slots}"
         '<label class="field" for="pu">Pickup or confirmation number (optional)</label>'
         '<input type="text" id="pu" name="pickup_number" maxlength="64" autocomplete="off">'
@@ -144,7 +146,7 @@ def _view(
         '<p class="muted">Propose a time and we will confirm it by email.</p>'
         '<div class="row"><div><label class="field" for="dt">Date</label>'
         '<input type="date" id="dt" name="date" required></div>'
-        '<div><label class="field" for="tm">Time (optional)</label>'
+        '<div><label class="field" for="tm">Time, Eastern (optional)</label>'
         '<input type="time" id="tm" name="time"></div></div>'
         '<label class="field" for="nt">Note (optional)</label>'
         '<input type="text" id="nt" name="note" maxlength="300">'

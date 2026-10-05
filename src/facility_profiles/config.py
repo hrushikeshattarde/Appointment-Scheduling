@@ -137,8 +137,9 @@ class Settings(BaseSettings):
     booking_po_date_floor_desks: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["shipping.appointments@morganfoods.com"]
     )
-    # The pod's own time zone: what "today" means in the daily summary (Fort Wayne).
-    booking_timezone: str = "America/Indiana/Indianapolis"
+    # The time zone people work in: what "today" means in the daily summary, and when a batch
+    # goes out. Every time shown is Eastern (facility_profiles/clock.py), so this is too.
+    booking_timezone: str = "America/New_York"
     # Click-to-confirm (booking/links.py). Off until both are set: the public address the
     # vendor pages are served from, and the key the links are signed with.
     booking_link_base_url: str | None = None
@@ -148,7 +149,7 @@ class Settings(BaseSettings):
     booking_link_offsets_minutes: Annotated[list[int], NoDecode] = Field(
         default_factory=lambda: [-60, 0, 60, 120]
     )
-    booking_link_valid_hours: int = Field(72, gt=0)  # and never past the last time offered
+    booking_link_valid_hours: int = Field(72, gt=0)  # weekday hours; never past the last time
     # A time the vendor picked is booked straight away; off, it waits for approval like an
     # emailed confirmation.
     booking_link_auto_schedule: bool = True

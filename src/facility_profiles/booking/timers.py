@@ -52,6 +52,7 @@ from facility_profiles.booking.worklist import (
     open_exceptions,
     resolve,
 )
+from facility_profiles.clock import slot_text, stamp
 from facility_profiles.config import Settings
 from facility_profiles.logging import get_logger
 from facility_profiles.storage.repository import Repository, as_utc
@@ -109,16 +110,12 @@ def slot_at(local: str | None, timezone: str | None) -> datetime | None:
     return naive.replace(tzinfo=ZoneInfo(timezone or "America/New_York"))
 
 
-def fmt_slot(local: str | None) -> str:
-    """A slot the way the board writes it: "2026-10-01 09:00" becomes "Thu 10/01 09:00"."""
-    if not local:
-        return "no date"
-    day, _, clock = local.partition(" ")
-    try:
-        parsed = datetime.strptime(day, "%Y-%m-%d")
-    except ValueError:
-        return local
-    return f"{parsed:%a %m/%d}" + (f" {clock}" if clock else "")
+def fmt_slot(local: str | None, timezone: str | None = None, *, label: bool = True) -> str:
+    """A slot for people, on the Eastern clock: "2026-10-01 09:00" becomes "Thu 10/01 09:00 ET".
+
+    ``local`` is on the facility's clock, in ``timezone`` (Eastern when not given).
+    """
+    return slot_text(local, timezone, label=label)
 
 
 def target_slot(case: BookingCase) -> tuple[str | None, str]:
@@ -157,6 +154,25 @@ def weekday_hours(start: datetime, end: datetime, tz: ZoneInfo) -> float:
             total += (chunk_end - cursor).total_seconds() / 3600
         cursor = chunk_end
     return total
+
+
+def after_weekday_hours(start: datetime, hours: float, tz: ZoneInfo) -> datetime:
+    """The instant ``hours`` weekday hours after ``start`` in ``tz``; weekends do not count.
+
+    A link sent on Friday morning with 72 hours to live lasts into Wednesday, not Monday morning.
+    """
+    left = timedelta(hours=hours)
+    cursor = start.astimezone(UTC)
+    while left > timedelta(0):
+        local = cursor.astimezone(tz)
+        midnight = datetime.combine(local.date() + timedelta(days=1), time(0), tzinfo=tz)
+        next_day = midnight.astimezone(UTC)
+        if local.weekday() < 5:
+            if next_day - cursor >= left:
+                return cursor + left
+            left -= next_day - cursor
+        cursor = next_day
+    return cursor
 
 
 def is_vendor_answer(message: BookingMessage) -> bool:
@@ -280,7 +296,7 @@ def _check_expiry(run: _Pass, case: BookingCase) -> None:
         if case.status not in UNBOOKED:
             why = f"case is {case.status}"
         elif local:
-            why = f"the pickup is now {fmt_slot(local)} ({source})"
+            why = f"the pickup is now {fmt_slot(local, case.vendor_timezone)} ({source})"
         else:
             why = "no pickup slot on the case"
         run.clear(case, [ExceptionType.PICKUP_EXPIRED], why)
@@ -323,7 +339,7 @@ def _check_desk(run: _Pass, case: BookingCase) -> None:
 
 
 def _expired_text(case: BookingCase, local: str | None) -> str:
-    when = f"pickup {fmt_slot(local)} passed"
+    when = f"pickup {fmt_slot(local, case.vendor_timezone)} passed"
     if case.status == CaseStatus.UNSCHEDULED.value:
         if any(m.direction == "out" and m.kind == "request" for m in case.messages):
             return f"{when}; the request was drafted but never sent"
@@ -365,10 +381,9 @@ def _check_silence(run: _Pass, case: BookingCase) -> None:
 
 
 def _silence_text(case: BookingCase, message: BookingMessage, since: datetime, limit: int) -> str:
-    local = since.astimezone(tz_of(case))
     what = _SENT_WHAT.get(message.kind, "our message")
     desk = case.contact_email or case.vendor_name or "the vendor"
     return (
-        f"no reply from {desk} to {what} sent {local:%a %m/%d %H:%M} {local:%Z} "
+        f"no reply from {desk} to {what} sent {stamp(since, '%a %m/%d %H:%M')} "
         f"({limit} weekday hours)"
     )[:255]

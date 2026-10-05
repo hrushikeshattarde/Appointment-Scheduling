@@ -22,6 +22,7 @@ from facility_profiles.booking.service import (
     mark_booked,
     scan,
 )
+from facility_profiles.booking.timers import fmt_slot
 from facility_profiles.booking.worklist import open_kinds
 from facility_profiles.booking.writeback import OFF, queue_write, write_appointments
 from facility_profiles.config import Settings, get_settings
@@ -44,6 +45,8 @@ class FakeLoads:
         self.fail = fail
         self.ignore_writes = ignore_writes
         self.writes: list[tuple[Any, ...]] = []
+        self.notes: list[tuple[int, str]] = []
+        self.note_fails = 0
         self.reads = 0
 
     def get_load(self, load_id: int) -> Load:
@@ -69,6 +72,13 @@ class FakeLoads:
                 "close": end_utc,
                 "appointmentStatus": status,
             }
+        return {"success": True}
+
+    def add_load_note(self, load_id: int, content: str, *, priority: bool = False) -> Any:
+        if self.note_fails:
+            self.note_fails -= 1
+            raise TransportProApiError(503, "busy", f"POST /load/{load_id}/note")
+        self.notes.append((load_id, content))
         return {"success": True}
 
 
@@ -205,8 +215,8 @@ def test_a_different_confirmed_time_is_never_overwritten(settings: Settings, ses
         assert report.mismatched == 1 and loads.writes == []
         assert open_kinds(case) == ["tpro_mismatch"]
         assert case.open_exceptions[0].description == (
-            "Transport Pro has 2026-10-01T12:00:00Z confirmed for this pickup; the booking is "
-            "2026-10-01T14:00:00Z. Nothing was overwritten"
+            "Transport Pro has Thu 10/01 08:00 ET confirmed for this pickup; the booking is "
+            "Thu 10/01 10:00 ET. Nothing was overwritten"
         )
         assert tpro_job(case)[0].status == JobStatus.HELD.value
         write_appointments(session, on(settings), loads, now=NOW)  # held: left alone
@@ -311,7 +321,7 @@ def test_booking_writeback_from_the_command_line(settings: Settings, tmp_path, m
         case = list_cases(session)[0]
         mark_booked(session, case, by="pod", via="phone", local=f"{pickup:%Y-%m-%d} 10:00")
         case_id = case.id
-        start = tpro_job(case)[0].result["payload"]["start_utc"]
+        shown = fmt_slot(f"{pickup:%Y-%m-%d} 10:00")  # Eastern, as the CLI says it
     engine.dispose()
     loads = FakeLoads(load)
     monkeypatch.setenv("TPRO_BASE_URL", "https://tpro.test")
@@ -334,13 +344,13 @@ def test_booking_writeback_from_the_command_line(settings: Settings, tmp_path, m
         assert off.exit_code == 0 and "FP_BOOKING_TPRO_WRITEBACK is off" in off.output
         assert opened == [] and loads.writes == []
         dry = runner.invoke(cli.app, ["booking", "writeback", "--dry-run"])
-        assert f"#{case_id} would write SH {start} to load 2001" in dry.output
+        assert f"#{case_id} would write SH {shown} on load 2001" in dry.output
         assert opened == [False] and loads.writes == []
         monkeypatch.setenv("FP_BOOKING_TPRO_WRITEBACK", "true")
         get_settings.cache_clear()
         live = runner.invoke(cli.app, ["booking", "writeback"])
         assert live.exit_code == 0, live.output
-        assert f"#{case_id} written to Transport Pro: SH {start}" in live.output
+        assert f"#{case_id} written to Transport Pro: SH {shown}" in live.output
         assert opened == [False, True] and len(loads.writes) == 1
     finally:
         get_settings.cache_clear()

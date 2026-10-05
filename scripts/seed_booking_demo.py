@@ -14,6 +14,10 @@ Two cases carry click-to-confirm links signed with a demo-only key (one picked, 
 the vendor). To open the waiting one's vendor page, serve the board with that key and address:
 the seeder prints both and the link.
 
+Every time the agent writes is Eastern; the vendors on Central time answer naming their zone,
+except one, whose bare time a person has to check. One booked pickup is moved by its vendor,
+and one email matches no pickup at all, for the board's "Emails no pickup matched".
+
 The store must be new or empty: the demo is never mixed into a real store.
 """
 
@@ -45,7 +49,7 @@ from facility_profiles.booking.models import (
 from facility_profiles.booking.references import record_load_numbers
 from facility_profiles.booking.respond import Responder
 from facility_profiles.booking.rules import check_desk_rules, vendor_profile
-from facility_profiles.booking.schema import ReplyClassification, ReplyStatus
+from facility_profiles.booking.schema import RejectReason, ReplyClassification, ReplyStatus
 from facility_profiles.booking.service import (
     approve,
     close_case,
@@ -56,8 +60,10 @@ from facility_profiles.booking.service import (
     plan_request,
 )
 from facility_profiles.booking.timers import sweep
+from facility_profiles.booking.unmatched import keep_unmatched
 from facility_profiles.booking.worklist import flag, method_exception
 from facility_profiles.config import Settings
+from facility_profiles.customers import customers
 from facility_profiles.domain.schema import FacilityIdentity, FieldState, Role
 from facility_profiles.storage.db import init_db, make_engine, session_factory, session_scope
 from facility_profiles.storage.repository import Repository
@@ -362,7 +368,7 @@ def build(demo: Demo) -> int:
         tz=CT,
     )
     d.send(c, d.at(-1, "15:30"))
-    offer = f"I have {d.mmdd(d.day(3))} at 1300"
+    offer = f"I have {d.mmdd(d.day(3))} at 1300 CT"
     d.reply(
         c,
         d.ago(5),
@@ -371,6 +377,7 @@ def build(demo: Demo) -> int:
             status=ReplyStatus.COUNTER_OFFER,
             pickup_date=f"{d.day(3)}",
             pickup_time="13:00",
+            time_zone="CT",
             quotes=[offer],
             confidence=0.85,
         ),
@@ -460,7 +467,11 @@ def build(demo: Demo) -> int:
         d.ago(3),
         text,
         ReplyClassification(
-            status=ReplyStatus.REJECTED, question=text, quotes=[text], confidence=0.9
+            status=ReplyStatus.REJECTED,
+            reject_reason=RejectReason.NOT_READY,
+            question=text,
+            quotes=[text],
+            confidence=0.9,
         ),
     )
     made += 1
@@ -622,7 +633,7 @@ def build(demo: Demo) -> int:
         tz=CT,
     )
     d.send(c, d.at(-1, "11:00"))
-    text = f"We can load you {d.mmdd(d.day(3))} @ 1300. PU# 66210"
+    text = f"We can load you {d.mmdd(d.day(3))} @ 1300 CT. PU# 66210"
     d.reply(
         c,
         d.ago(3),
@@ -632,6 +643,7 @@ def build(demo: Demo) -> int:
             pickup_date=f"{d.day(3)}",
             pickup_time="13:00",
             pickup_number="66210",
+            time_zone="CT",
             quotes=[text],
             confidence=0.9,
         ),
@@ -706,6 +718,84 @@ def build(demo: Demo) -> int:
         c.miles = 1450
         plan_request(s, c, d.settings, now=c.created_at)
     made += 1
+
+    # A Central-time desk answers with a bare time: their 09:00, or ours? A person checks.
+    c = d.case(
+        25,
+        "Lone Pine Cheese",
+        "Plymouth, WI",
+        pickup=(3, "09:00"),
+        desk="shipping@lonepine.example",
+        tz=CT,
+    )
+    d.send(c, d.at(-1, "14:00"))
+    d.reply(
+        c,
+        d.ago(4),
+        "We can do 0900 that day.",
+        ReplyClassification(
+            status=ReplyStatus.CONFIRMED,
+            pickup_date=f"{d.day(3)}",
+            pickup_time="09:00",
+            quotes=["We can do 0900"],
+            confidence=0.8,
+        ),
+    )
+    made += 1
+
+    # A booked pickup the vendor moves: the agent never moves a booking itself.
+    c = d.case(
+        26,
+        "Blue Ridge Mills",
+        "Roanoke, VA",
+        pickup=(4, "10:00"),
+        desk="appointments@blueridgemills.example",
+    )
+    d.send(c, d.at(-2, "09:00"))
+    confirmed = f"Confirmed {d.mmdd(d.day(4))} @ 1000. PU# 55120"
+    d.reply(
+        c,
+        d.ago(30),
+        confirmed,
+        ReplyClassification(
+            status=ReplyStatus.CONFIRMED,
+            pickup_date=f"{d.day(4)}",
+            pickup_time="10:00",
+            pickup_number="55120",
+            quotes=[confirmed],
+            confidence=0.95,
+        ),
+    )
+    with d.step(c, d.ago(29)):
+        approve(s, c, by="Demo user")
+    moved = f"move your pickup on {d.mmdd(d.day(4))} to 1400"
+    d.reply(
+        c,
+        d.ago(2),
+        f"We need to {moved} because of a line issue. Please confirm.",
+        ReplyClassification(
+            status=ReplyStatus.COUNTER_OFFER,
+            pickup_date=f"{d.day(4)}",
+            pickup_time="14:00",
+            quotes=[moved],
+            confidence=0.9,
+        ),
+    )
+    made += 1
+
+    # An email no pickup matches: a new thread, another address, no PO. Kept for a person.
+    stray = InboundMessage(
+        message_id="demo-stray-1",
+        thread_id="demo-thread-stray",
+        sent_at=d.ago(1),
+        from_addr="Ridgeline Dispatch <dispatch@ridgeline-trucking.example>",
+        to_addr="Booking desk <booking-demo@example.com>",
+        cc_addr="",
+        subject="Pickup appointment tomorrow?",
+        body="Is your truck still coming at 9 tomorrow? We have not heard back from you.",
+        rfc_message_id="<demo-stray-1@vendor.example>",
+    )
+    keep_unmatched(s, stray, customers(d.settings))
 
     # The timers run as they would on the server: what went silent, what slipped.
     sweep(s, now=d.now, settings=d.settings)

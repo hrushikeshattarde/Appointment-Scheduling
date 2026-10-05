@@ -14,7 +14,7 @@ from facility_profiles.booking.classify import FakeReplyClassifier
 from facility_profiles.booking.mail import InboundMessage, RecordingMailer
 from facility_profiles.booking.models import BookingCase, CaseStatus
 from facility_profiles.booking.respond import Responder
-from facility_profiles.booking.schema import ReplyClassification, ReplyStatus
+from facility_profiles.booking.schema import RejectReason, ReplyClassification, ReplyStatus
 from facility_profiles.booking.service import draft_batch, ingest, list_cases, mark_sent, scan
 from facility_profiles.booking.templates import TemplateKind, pick, save_template
 from facility_profiles.cli import app
@@ -352,7 +352,9 @@ def test_a_vendor_that_cannot_ship_goes_to_the_case_customers_desk(two: Settings
 
     rejected = FakeReplyClassifier(
         lambda _ctx: ReplyClassification(
-            status=ReplyStatus.REJECTED, question="PO will not be ready until 10/07"
+            status=ReplyStatus.REJECTED,
+            reject_reason=RejectReason.NOT_READY,
+            question="PO will not be ready until 10/07",
         )
     )
     with session_scope(sessions) as session:

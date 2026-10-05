@@ -40,6 +40,7 @@ from facility_profiles.booking.respond import local_dt, transit_hours
 from facility_profiles.booking.rules import VendorProfile
 from facility_profiles.booking.templates import short_vendor
 from facility_profiles.booking.timers import fmt_slot
+from facility_profiles.clock import local_to_eastern, stamp
 from facility_profiles.config import Settings
 from facility_profiles.customers import customer_of
 from facility_profiles.domain.schema import Role, SourceType
@@ -79,6 +80,7 @@ class Recommendation:
     verdict: str
     latest: str | None = None  # the latest pickup that makes the delivery, when this one cannot
     floor: date | None = None  # the PO date the desk loads from, when it moved the day
+    timezone: str | None = None  # the facility's zone, for showing its slots
 
     @property
     def moved(self) -> list[Step]:
@@ -224,7 +226,7 @@ def _start(
     if tender is not None:
         local = tender.astimezone(tz)
         clock = None if local.strftime("%H:%M") == "00:00" else local.strftime("%H:%M")
-        shown = fmt_slot(f"{local:%Y-%m-%d} {clock or ''}".strip())
+        shown = fmt_slot(f"{local:%Y-%m-%d} {clock or ''}".strip(), case.vendor_timezone)
         return local.date(), clock, Step("tender", f"the tendered pickup, {shown}")
     delivery = as_utc(case.delivery_at_utc)
     if delivery is None:
@@ -234,7 +236,7 @@ def _start(
     while day.weekday() >= 5:  # vendors ship Monday to Friday
         day -= timedelta(days=1)
     plural = "" if days == 1 else "s"
-    note = f"{days} day{plural} before the delivery on {delivery.astimezone(tz):%m/%d}"
+    note = f"{days} day{plural} before the delivery on {stamp(delivery, '%m/%d', label=False)}"
     return day, None, Step("delivery", note)
 
 
@@ -267,8 +269,10 @@ def _floor(
     target = floor
     while target.weekday() >= 5:
         target += timedelta(days=1)
+    tz = case.vendor_timezone
     note = (
-        f"moved from {day:%Y-%m-%d} {clock} to {target:%Y-%m-%d} {clock}: "
+        f"moved from {fmt_slot(f'{day:%Y-%m-%d} {clock}', tz)} to "
+        f"{fmt_slot(f'{target:%Y-%m-%d} {clock}', tz)}: "
         f"{short_vendor(case.vendor_name)} reads the PO date {floor:%m/%d} as the earliest pickup"
     )
     return target, Step("floor", note, moved=True)
@@ -344,7 +348,7 @@ def recommend_time(
             Step(
                 "soon",
                 "that day has passed; the earliest pickup a driver can still make is "
-                f"{fmt_slot(f'{day:%Y-%m-%d} {clock}')}",
+                f"{fmt_slot(f'{day:%Y-%m-%d} {clock}', case.vendor_timezone)}",
                 moved=True,
             )
         )
@@ -382,11 +386,13 @@ def recommend_time(
     )
     if fits_today:
         fit = latest.strftime("%H:%M")
+        asked_et = _eastern_clock(day, clock, case.vendor_timezone)
+        fit_et = _eastern_clock(day, fit, case.vendor_timezone)
         steps.append(
             Step(
                 "fit",
-                f"{clock} would arrive after the delivery at "
-                f"{delivery.astimezone(tz):%m/%d %H:%M}; {fit} is the latest that makes it",
+                f"{asked_et} ET would arrive after the delivery at {stamp(delivery)}; "
+                f"{fit_et} ET is the latest that makes it",
                 moved=True,
             )
         )
@@ -397,14 +403,32 @@ def recommend_time(
     slot = f"{day:%Y-%m-%d} {clock}"
     arrival = pickup + timedelta(hours=transit_hours(case, settings))
     verdict = (
-        f"a pickup {fmt_slot(slot)} arrives {arrival:%a %m/%d %H:%M}, after the delivery slot "
-        f"{delivery.astimezone(tz):%a %m/%d %H:%M}"
+        f"a pickup {fmt_slot(slot, case.vendor_timezone)} arrives "
+        f"{stamp(arrival, '%a %m/%d %H:%M')}, after the delivery slot "
+        f"{stamp(delivery, '%a %m/%d %H:%M')}"
     )
-    return Recommendation(slot, tuple(steps), False, verdict, shown_latest, floor=floor_day)
+    return Recommendation(
+        slot,
+        tuple(steps),
+        False,
+        verdict,
+        shown_latest,
+        floor=floor_day,
+        timezone=case.vendor_timezone,
+    )
+
+
+def _eastern_clock(day: date, clock: str, timezone: str | None) -> str:
+    """A facility-clock time that day, as the Eastern clock shows it ("HH:MM")."""
+    return (local_to_eastern(f"{day:%Y-%m-%d} {clock}", timezone) or "").partition(" ")[2] or clock
 
 
 def infeasible_note(rec: Recommendation) -> str:
     """The to-do's one line when no pickup that day makes the delivery."""
     floor = f"the PO date {rec.floor:%m/%d} is the earliest pickup; " if rec.floor else ""
-    latest = f"; the latest pickup that makes it is {fmt_slot(rec.latest)}" if rec.latest else ""
+    latest = (
+        f"; the latest pickup that makes it is {fmt_slot(rec.latest, rec.timezone)}"
+        if rec.latest
+        else ""
+    )
     return f"cannot make the delivery: {floor}{rec.verdict}{latest}"[:255]

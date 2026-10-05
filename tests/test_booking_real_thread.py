@@ -33,6 +33,7 @@ from facility_profiles.booking.service import (
     reschedule_case,
     scan,
 )
+from facility_profiles.booking.worklist import open_kinds
 from facility_profiles.domain.schema import FacilityIdentity, FieldState, Role
 from facility_profiles.storage.db import session_scope
 from facility_profiles.storage.repository import Repository, as_utc
@@ -301,18 +302,22 @@ def test_replay_of_the_morgan_foods_thread(settings, sessions):
         assert payload["start_utc"] == "2026-10-05T13:00:00Z"
         calls_so_far = len(classifier.calls)
 
-        # Day 4 onwards: a missed pickup, ETAs, securement, "did this get resolved?". None of it
-        # is a new answer to the request: recorded on the case, never classified, nothing moves.
+        # Day 4 onwards: a missed pickup, ETAs, securement, "did this get resolved?". A booked
+        # pickup's mail is read now, because a facility can move a booking. None of this does:
+        # the work-in note ("Latest is 9pm tonight", about a slot already past) and the chaser
+        # become one question for a person; the rest is kept; the booking stands.
         responder = Responder(settings, mailer, now=datetime(2026, 9, 29, 13, 0, tzinfo=UTC))
         stats = ingest(
             session, messages[7:], classifier, internal_domains=INTERNAL, responder=responder
         )
-        assert stats.skipped_internal == 6 and stats.after_decision == 4 and stats.classified == 0
-        assert len(classifier.calls) == calls_so_far
+        assert stats.skipped_internal == 6 and stats.after_decision == 0 and stats.classified == 4
+        assert stats.booked_changed == 0
+        assert len(classifier.calls) == calls_so_far + 4
         assert case.status == CaseStatus.SCHEDULED.value
         assert case.confirmed_local == "2026-10-05 09:00"
+        assert open_kinds(case) == ["facility_question"]
         assert [m.kind for m in case.messages if m.direction == "out"].count("acknowledge") == 1
-        assert [e.action for e in case.events].count("reply_after_decision") == 4
+        assert [e.action for e in case.events].count("reply_after_decision") == 2
         assert len([m for m in case.messages if m.direction == "in"]) == 7
 
 

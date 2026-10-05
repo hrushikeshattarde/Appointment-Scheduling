@@ -236,7 +236,7 @@ def test_one_email_per_desk_at_the_batch_hour_its_lead_days_ahead(
         jobs = [request_job(c) for c in list_cases(session)]
         due = datetime(2026, 9, 30, 14, 0, tzinfo=UTC)  # Wed 10:00 New York, a day before
         assert {j.due_at.replace(tzinfo=UTC) for j in jobs} == {due}  # type: ignore[union-attr]
-        assert jobs[0].reason == "rule 'daily': draft at Wed 09/30 10:00"
+        assert jobs[0].reason == "rule 'daily': draft at Wed 09/30 10:00 ET"
         assert (
             run_once(session, settings, now=due - timedelta(minutes=1), mailer=mailer).drafted == 0
         )

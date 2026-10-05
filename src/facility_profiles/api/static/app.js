@@ -64,6 +64,8 @@ const JOB = {
   canceled: "Not needed any more",
 };
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+// Every time on the board is Eastern (EST, or EDT in summer), whatever the reader's own clock.
+const EASTERN = "America/New_York";
 const TABS = ["overview", "appointments", "week", "access"];
 const LEVELS = { act: "View and act", view: "View", none: "No access" };
 
@@ -148,8 +150,8 @@ function debounce(fn, ms) {
   };
 }
 
-// A pickup slot is vendor-local wall time written "YYYY-MM-DD" or "YYYY-MM-DD HH:MM"; it is
-// shown as written, with its weekday, never converted.
+// A pickup slot comes on the Eastern clock, written "YYYY-MM-DD" or "YYYY-MM-DD HH:MM"; it is
+// shown as written, with its weekday and "ET".
 function parseLocal(local) {
   if (!local) return null;
   const [day, time] = local.split(" ");
@@ -161,7 +163,7 @@ function parseLocal(local) {
 function fmtSlot(local) {
   const p = parseLocal(local);
   if (!p) return "No date yet";
-  return `${p.weekday} ${pad(p.m)}/${pad(p.d)}${p.time ? ` ${p.time}` : ""}`;
+  return `${p.weekday} ${pad(p.m)}/${pad(p.d)}${p.time ? ` ${p.time} ET` : ""}`;
 }
 
 // "Today", "Tomorrow", else "Wed 10/07".
@@ -172,15 +174,36 @@ function dayName(day) {
   return fmtSlot(day);
 }
 
-// Instants (sent, raised, delivery) are UTC on the wire and shown in the reader's own time.
+// Instants (sent, raised, delivery) are UTC on the wire and shown on the Eastern clock.
 function fmtInstant(iso) {
   if (!iso) return "";
-  return new Date(iso).toLocaleString(undefined, {
+  const text = new Date(iso).toLocaleString("en-US", {
+    timeZone: EASTERN,
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
+    hourCycle: "h23",
   });
+  return `${text} ET`;
+}
+
+// The Eastern clock now: its calendar day as a local Date at midnight, and its hour.
+function easternNow() {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat("en-US", {
+      timeZone: EASTERN,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    })
+      .formatToParts(new Date())
+      .map((part) => [part.type, part.value]),
+  );
+  return { day: new Date(Number(parts.year), Number(parts.month) - 1, Number(parts.day)), hour: Number(parts.hour), minute: Number(parts.minute) };
 }
 
 function ago(iso) {
@@ -195,9 +218,7 @@ function ago(iso) {
 const isoDay = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 
 function startOfToday() {
-  const d = new Date();
-  d.setHours(0, 0, 0, 0);
-  return d;
+  return easternNow().day; // the Eastern calendar day, so "today" is the same for everyone
 }
 
 function mondayOf(date) {
@@ -372,8 +393,8 @@ async function renderTab() {
     else if (state.tab === "access") await renderAccess();
     else await renderWeek();
     if (state.tab !== "overview") refreshAttention();
-    const now = new Date().toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
-    stampEl.textContent = `Updated ${now}`;
+    const now = easternNow();
+    stampEl.textContent = `Updated ${pad(now.hour)}:${pad(now.minute)} ET`;
   } catch (err) {
     view.replaceChildren(
       h(
@@ -416,7 +437,7 @@ function caseRow(row, meta = null) {
 function greeting() {
   const first = (state.viewer.name || "").trim().split(/\s+/)[0];
   if (!first) return "Today";
-  const hour = new Date().getHours();
+  const hour = easternNow().hour;
   return `Good ${hour < 12 ? "morning" : hour < 17 ? "afternoon" : "evening"}, ${first}`;
 }
 
@@ -451,6 +472,8 @@ async function renderOverview() {
     api(`/overview${scope}`),
     state.summaryOpen ? api(`/today${scope}`) : null,
   ]);
+  const mail = data.mail || [];
+  const pickups = mail.length ? (await api(`/cases${scope}`)).filter((r) => r.status !== "canceled") : [];
   const c = data.counts;
   showAttention(c.needs_action);
   const tile = (key, iconName, label, sub, filter, t) =>
@@ -462,7 +485,7 @@ async function renderOverview() {
       h("div", { class: "sub" }, sub),
     );
   const whose = state.customer || (state.viewer.admin ? "All customers" : "Your customers");
-  const today = new Date().toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" });
+  const today = new Date().toLocaleDateString("en-US", { timeZone: EASTERN, weekday: "long", month: "long", day: "numeric" });
   view.replaceChildren(
     ...show(
       h(
@@ -522,6 +545,7 @@ async function renderOverview() {
           data.upcoming.length ? byDay(data.upcoming) : empty("No pickups in the next days."),
         ),
       ),
+      mail.length ? mailPanel(mail, pickups) : null,
       h(
         "div",
         { class: "grid2" },
@@ -533,6 +557,70 @@ async function renderOverview() {
         ),
         panel("What the to-dos are about", "", data.todos_by_kind.length ? bars(data.todos_by_kind) : empty("No open to-dos.", true)),
       ),
+    ),
+  );
+}
+
+// Emails the agent could not tie to any pickup: kept so none is lost. A person links each to its
+// pickup (the agent then reads it as that pickup's reply) or dismisses it.
+function mailPanel(items, pickups) {
+  return panel(
+    "Emails no pickup matched",
+    plural(items.length, "email"),
+    items.map((m) => mailItem(m, pickups)),
+    "Link each to its pickup, or dismiss it",
+  );
+}
+
+function mailItem(m, pickups) {
+  const first = (m.body || "").split("\n").map((line) => line.trim()).find(Boolean) || "";
+  const choose = h(
+    "select",
+    { "aria-label": "The pickup this email is about" },
+    h("option", { value: "" }, "Choose the pickup…"),
+    pickups.map((r) => h("option", { value: r.id }, `#${r.id} ${r.vendor || "Unknown vendor"} · PO ${pos(r)} · ${fmtSlot(r.pickup_local)}`)),
+  );
+  const link = async () => {
+    const by = decisionBy();
+    if (!by) return;
+    if (!choose.value) {
+      toast("Choose the pickup this email is about first.", true);
+      choose.focus();
+      return;
+    }
+    try {
+      await api(`/mail/${m.id}/link`, { method: "POST", body: JSON.stringify({ case_id: Number(choose.value), ...by }) });
+      toast(`Linked to pickup #${choose.value}; the agent read it`);
+      renderTab();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  };
+  const dismiss = async () => {
+    const by = decisionBy();
+    if (!by) return;
+    const note = window.prompt("Why does this email need nothing?", "not about a pickup");
+    if (!note) return;
+    try {
+      await api(`/mail/${m.id}/dismiss`, { method: "POST", body: JSON.stringify({ note, ...by }) });
+      toast("Dismissed");
+      renderTab();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  };
+  return h(
+    "div",
+    { class: "mail-item" },
+    h("div", { class: "title" }, m.subject || "(no subject)"),
+    h("div", { class: "meta" }, `${m.from || "Unknown sender"} · ${fmtInstant(m.sent_at)}`),
+    first ? h("div", { class: "snippet" }, first.slice(0, 220)) : null,
+    h(
+      "div",
+      { class: "acts" },
+      choose,
+      h("button", { class: "btn small primary", type: "button", onclick: link }, "Link to pickup"),
+      h("button", { class: "btn small ghost", type: "button", onclick: dismiss }, "Dismiss"),
     ),
   );
 }
@@ -586,7 +674,8 @@ function byDay(rows) {
       last = row.pickup_date;
       out.push(h("div", { class: `day-head${row.pickup_date === today ? " today" : ""}` }, dayName(row.pickup_date)));
     }
-    const time = parseLocal(row.pickup_local)?.time || "Any time";
+    const at = parseLocal(row.pickup_local)?.time;
+    const time = at ? `${at} ET` : "Any time";
     out.push(caseRow(row, `${time} · ${row.stage} · PO ${pos(row)}`));
   }
   return out;
@@ -840,7 +929,7 @@ function card(row) {
     h(
       "div",
       { class: "t" },
-      parseLocal(row.pickup_local)?.time || "Any time",
+      parseLocal(row.pickup_local)?.time ? `${parseLocal(row.pickup_local).time} ET` : "Any time",
       todos ? h("span", { class: "flag" }, ` · ${plural(todos, "to-do")}`) : null,
     ),
     h("div", { class: "v" }, row.vendor || "Unknown vendor"),
@@ -1073,7 +1162,7 @@ function bookedForm(d) {
       h("label", {}, "How did you book it?", via),
       h("label", {}, "Vendor's pickup number", number),
       h("label", {}, "Pickup date", date),
-      h("label", {}, "Pickup time (vendor's local time)", time),
+      h("label", {}, "Pickup time (Eastern)", time),
       h("label", { class: "full" }, "Booked with (we remember it for this vendor)", desk),
       h("label", { class: "full" }, "Note", note),
     ),
@@ -1144,7 +1233,7 @@ function actionSection(d) {
 function keyFacts(d) {
   const fact = (k, v, sub = null, big = false) =>
     h("div", {}, h("div", { class: "k" }, k), h("div", { class: `v${big ? " big" : ""}` }, v, sub ? h("span", { class: "sub" }, sub) : null));
-  const delivery = [d.delivery_ref, d.delivery_at ? `${fmtInstant(d.delivery_at)} your time` : null].filter(Boolean).join(" · ");
+  const delivery = [d.delivery_ref, d.delivery_at ? fmtInstant(d.delivery_at) : null].filter(Boolean).join(" · ");
   const desk = d.desk ? `${d.desk}${d.method ? ` (${d.method.replace("_", " ")})` : ""}` : d.method ? cap(d.method.replace("_", " ")) : "None on file yet";
   return h(
     "div",
@@ -1153,7 +1242,7 @@ function keyFacts(d) {
     h(
       "div",
       { class: "keyfacts" },
-      fact("Pickup", fmtSlot(d.pickup_local), `${cap(SOURCE[d.pickup_source] || d.pickup_source)}, vendor's local time`, true),
+      fact("Pickup", fmtSlot(d.pickup_local), `${cap(SOURCE[d.pickup_source] || d.pickup_source)}, Eastern time`, true),
       fact("Vendor's pickup number", d.pickup_number || "Not given yet"),
       fact("Delivery", d.delivery_site || "-", delivery || null),
       fact("Booking desk", desk),
@@ -1225,7 +1314,7 @@ function moreDetails(d) {
     ["Numbers", numbersText(d.references, true)],
     ["Earlier numbers", numbersText(d.references, false)],
     ["Booked before with", deskHistory(d.desk_history)],
-    ["Time on the tender", d.tendered_pickup_at ? `${fmtInstant(d.tendered_pickup_at)} your time` : "-"],
+    ["Time on the tender", d.tendered_pickup_at ? fmtInstant(d.tendered_pickup_at) : "-"],
     ["Miles", d.miles ?? "-"],
     ["Times rescheduled", d.reschedule_count],
     ["Load number", d.load_id],

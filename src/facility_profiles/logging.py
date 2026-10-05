@@ -4,8 +4,20 @@ from __future__ import annotations
 
 import logging
 import sys
+from collections.abc import MutableMapping
+from typing import Any
 
 import structlog
+
+from facility_profiles.clock import now_eastern
+
+
+def _eastern_timestamp(
+    _logger: Any, _method: str, event_dict: MutableMapping[str, Any]
+) -> MutableMapping[str, Any]:
+    """Stamp each line on the Eastern clock, with its offset: 2026-10-05T14:23:29-04:00."""
+    event_dict["timestamp"] = now_eastern().isoformat(timespec="seconds")
+    return event_dict
 
 
 def configure_logging(level: str = "INFO", *, json: bool = False) -> None:
@@ -23,7 +35,7 @@ def configure_logging(level: str = "INFO", *, json: bool = False) -> None:
         structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_log_level,
         structlog.stdlib.add_logger_name,
-        structlog.processors.TimeStamper(fmt="iso", utc=True),
+        _eastern_timestamp,
         structlog.processors.StackInfoRenderer(),
         structlog.processors.format_exc_info,
     ]

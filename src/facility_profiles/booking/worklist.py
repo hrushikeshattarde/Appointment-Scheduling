@@ -116,6 +116,22 @@ KINDS: dict[str, tuple[str, str]] = {
         "The vendor confirmed a time we did not ask for. Check it still makes the delivery "
         "before you approve it.",
     ),
+    "booked_slot_changed": (
+        "Booked pickup changed",
+        "The facility wrote about a pickup that was already booked. Read their email and agree "
+        "the time with them (and the carrier), then approve it or mark it booked: that writes "
+        "the new time to Transport Pro in place of the old one.",
+    ),
+    "time_zone_unclear": (
+        "Which time zone?",
+        "This facility is outside Eastern time and gave a time without saying which zone. "
+        "Check whether they meant Eastern or their own time before you approve it.",
+    ),
+    "check_back_too_late": (
+        "Check-back too late",
+        "The facility said to check back on the pickup day or later, so the pickup is at risk. "
+        "Call the desk, or ask the customer to move the delivery.",
+    ),
 }
 # The vendor's silence: raised by the no-reply timers, cleared by any answer from the vendor.
 UNANSWERED: frozenset[ExceptionType] = frozenset(
@@ -134,7 +150,11 @@ SLOT_REPLY_SUPERSEDES: frozenset[ExceptionType] = UNANSWERED | {
     ExceptionType.STALE_CONFIRMATION,
     ExceptionType.FACILITY_QUESTION,
     ExceptionType.HANDOFF,
+    ExceptionType.TIME_ZONE_UNCLEAR,
+    ExceptionType.CHECK_BACK_TOO_LATE,
 }
+# A change to a booked pickup is not superseded by later replies: once a booked pickup is
+# disturbed, a person settles it (approving or marking it booked resolves it).
 # A question replaces an earlier open question only. "Which carrier?" after a confirmation
 # leaves the confirmation waiting for approval; after a decline, the decline stays open.
 QUESTION_SUPERSEDES: frozenset[ExceptionType] = UNANSWERED | {

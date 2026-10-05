@@ -65,7 +65,7 @@ def linked(settings: Settings, **more: Any) -> Settings:
 def drafted(
     settings: Settings, sessions: sessionmaker[Session], *, sent: bool = True
 ) -> tuple[int, RecordingMailer]:
-    """One Lidl pickup at Koch Foods (asked for Thu 10/01 09:00), drafted and sent."""
+    """One Lidl pickup at Koch Foods (asked for Thu 10/01 09:00 ET), drafted and sent."""
     seed_vendor(sessions)
     scan(
         FakeTPro([lidl_load(2001, po="226321092660")], {}),
@@ -122,7 +122,7 @@ def test_a_request_offers_times_around_the_one_asked_for(settings: Settings, ses
     )
     assert url.startswith(f"{BASE}/c/") and len(url) < 80
     assert draft.html is not None
-    for i, label in enumerate(["Thu 10/01 08:00", "Thu 10/01 09:00", "Thu 10/01 10:00"]):
+    for i, label in enumerate(["Thu 10/01 08:00 ET", "Thu 10/01 09:00 ET", "Thu 10/01 10:00 ET"]):
         assert f'href="{url}?s={i}"' in draft.html and f">{label}</a>" in draft.html
     assert f'href="{url}#propose"' in draft.html
     mime = build_mime(draft, "lidl@circledelivers.com")
@@ -266,26 +266,26 @@ def test_a_picked_time_is_booked_with_the_vendors_pickup_number(
             session, offer, 2, settings=on, now=clicked, pickup_number=" 20463798 ", name="Shannon"
         )
         case = offer.case
-        assert said.ok and said.say == "Thank you, the pickup is set for Thu 10/01 10:00."
+        assert said.ok and said.say == "Thank you, the pickup is set for Thu 10/01 10:00 ET."
         assert case.status == CaseStatus.SCHEDULED.value and open_kinds(case) == []
         assert case.confirmed_local == "2026-10-01 10:00"
         assert case.confirmed_start_utc.replace(tzinfo=UTC) == datetime(
             2026, 10, 1, 14, 0, tzinfo=UTC
         )  # type: ignore[union-attr]
         assert case.pickup_number == "20463798"
-        assert case.reason == "vendor picked Thu 10/01 10:00 from the link"
+        assert case.reason == "vendor picked Thu 10/01 10:00 ET from the link"
         pu = next(r for r in case.references if r.kind == "pickup_number")
         assert pu.source == "vendor" and pu.message_id == case.messages[-1].id
         answer = case.messages[-1]
         assert answer.direction == "in" and answer.kind == "link"
-        assert answer.body == "Picked Thu 10/01 10:00 from the link, PU# 20463798 (Shannon)"
+        assert answer.body == "Picked Thu 10/01 10:00 ET from the link, PU# 20463798 (Shannon)"
         actions = [e.action for e in case.events]
         tail = actions[actions.index("vendor_confirmed") :]
         assert tail == ["vendor_confirmed", "confirmed_by_link", "approved", "desk_remembered"]
         assert offer_state(offer, clicked) == "answered"
         # A second click changes nothing and says what was booked.
         again = confirm(session, offer, 0, settings=on, now=clicked)
-        assert not again.ok and "set for Thu 10/01 10:00" in again.say
+        assert not again.ok and "set for Thu 10/01 10:00 ET" in again.say
         assert case.confirmed_local == "2026-10-01 10:00"
 
 
@@ -355,7 +355,8 @@ def test_a_proposed_time_goes_to_a_person(settings: Settings, sessions) -> None:
         event = case.events[-1]
         assert event.action == "proposed_by_link" and event.detail["feasible"] is True
         assert (
-            case.messages[-1].body == "Proposed Thu 10/01 14:00 from the link: dock 4 is free then"
+            case.messages[-1].body
+            == "Proposed Thu 10/01 14:00 ET from the link: dock 4 is free then"
         )
 
 
@@ -427,7 +428,7 @@ def test_opening_the_page_changes_nothing(page) -> None:  # type: ignore[no-unty
     assert (
         "Pickup appointment, PO# 226321092660" in text and "Koch Foods, Inc., Erlanger, KY" in text
     )
-    assert 'value="2" checked' in text and "Thu 10/01 09:00 (the time we asked for)" in text
+    assert 'value="2" checked' in text and "Thu 10/01 09:00 ET (the time we asked for)" in text
     assert (
         shown.headers["cache-control"] == "no-store" and "noindex" in shown.headers["x-robots-tag"]
     )
@@ -447,7 +448,7 @@ def test_confirming_on_the_page_books_the_pickup(page) -> None:  # type: ignore[
     )
     assert done.status_code == 303 and done.headers["location"] == f"/c/{token}"
     after = client.get(f"/c/{token}")
-    assert "Thank you, the pickup is set for Thu 10/01 11:00." in after.text
+    assert "Thank you, the pickup is set for Thu 10/01 11:00 ET." in after.text
     assert "Confirm pickup time" not in after.text
     with session_scope(sessions) as session:
         case = session.get(BookingCase, case_id)
@@ -490,9 +491,9 @@ def test_the_board_shows_what_the_link_offered(page) -> None:  # type: ignore[no
         # The board app serves the vendor page too, for trying links locally.
         assert b.get(f"/c/{token}").status_code == 200
     [offer] = detail["offers"]
-    assert offer["slots"][0] == "Thu 10/01 08:00" and offer["state"] == "answered"
-    assert offer["answer"] == "Thu 10/01 09:00"
+    assert offer["slots"][0] == "Thu 10/01 08:00 ET" and offer["state"] == "answered"
+    assert offer["answer"] == "Thu 10/01 09:00 ET"
     titles = [row["title"] for row in detail["timeline"]]
     assert "Vendor picked a time from the link" in titles
     assert detail["messages"][-1]["kind"] == "link"
-    assert re.search(r"vendor picked Thu 10/01 09:00 from the link", detail["stage"], re.I)
+    assert re.search(r"vendor picked Thu 10/01 09:00 ET from the link", detail["stage"], re.I)

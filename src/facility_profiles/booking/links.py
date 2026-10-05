@@ -15,6 +15,10 @@ on the click. A time proposed is raised for a person, like a counter-offer.
 Links are off until FP_BOOKING_LINK_BASE_URL (the public address the pages are served from,
 ``facility-profiles serve-links``) and FP_BOOKING_LINK_SECRET (the signing key) are both set.
 Without them requests are written exactly as before.
+
+Times on the buttons and the page are Eastern, as in every email; a time the vendor proposes is
+read as Eastern too. A link lives FP_BOOKING_LINK_VALID_HOURS weekday hours (weekends do not
+count), and never past the last time it offers.
 """
 
 from __future__ import annotations
@@ -40,7 +44,8 @@ from facility_profiles.booking.models import (
 from facility_profiles.booking.respond import local_dt, offer_is_feasible
 from facility_profiles.booking.rules import VendorProfile, slot_is_stale, too_early
 from facility_profiles.booking.schema import ReplyClassification, ReplyStatus
-from facility_profiles.booking.timers import fmt_slot, slot_at
+from facility_profiles.booking.timers import after_weekday_hours, fmt_slot, slot_at
+from facility_profiles.clock import EASTERN, eastern_to_local
 from facility_profiles.config import Settings
 from facility_profiles.storage.repository import as_utc
 
@@ -126,7 +131,8 @@ def create_offer(
             old.superseded_at = now
     # In UTC: SQLite keeps the wall clock and drops the zone, and the token signs this instant.
     last = max(at for s in slots if (at := slot_at(s, case.vendor_timezone)) is not None)
-    expires = min(now + timedelta(hours=settings.booking_link_valid_hours), last).astimezone(UTC)
+    lives = after_weekday_hours(now, settings.booking_link_valid_hours, EASTERN)
+    expires = min(lives, last).astimezone(UTC)
     offer = SlotOffer(case_id=case.id, slots=slots, created_at=now, expires_at=expires)
     case.offers.append(offer)
     session.flush()
@@ -228,7 +234,8 @@ def html_body(text: str, offers: Mapping[str, SlotOffer]) -> str:
         url, offer = hit
         label = line.replace(url, "").strip().rstrip(":").strip() or "Confirm a time"
         buttons = "".join(
-            f'<a href="{html.escape(url)}?s={i}" style="{_BUTTON}">{html.escape(fmt_slot(s))}</a>'
+            f'<a href="{html.escape(url)}?s={i}" style="{_BUTTON}">'
+            f"{html.escape(fmt_slot(s, offer.case.vendor_timezone))}</a>"
             for i, s in enumerate(offer.slots)
         )
         other = f'<a href="{html.escape(url)}#propose" style="color:#1a5fb4">another time</a>'
@@ -270,7 +277,8 @@ def state_says(offer: SlotOffer, state: str) -> str:
     if state == "answered":
         if offer.answer == "proposed":
             return "Thank you, we have your proposed time and will confirm it by email."
-        return f"Thank you, the pickup is set for {fmt_slot(offer.answer)}."
+        shown = fmt_slot(offer.answer, offer.case.vendor_timezone)
+        return f"Thank you, the pickup is set for {shown}."
     return {
         "superseded": "A newer email about this pickup replaced this link. Please use that one.",
         "closed": "This pickup is already settled. Reply to the email if something changed.",
@@ -333,17 +341,18 @@ def confirm(
     case = offer.case
     slot = str(offer.slots[index])
     tz = case.vendor_timezone
+    shown = fmt_slot(slot, tz)
     # The vendor's own cut-off is theirs to waive; ours, and the delivery, are not.
     if slot_is_stale(slot, tz, settings, now=now) or not _feasible(case, slot, settings, now=now):
         return LinkAnswer(
             False,
-            f"{fmt_slot(slot)} is too close now for us to send a driver. "
+            f"{shown} is too close now for us to send a driver. "
             "Please choose a later time or reply to the email.",
         )
     number = _clean(pickup_number, 64)
     who = _clean(name, 80)
     day, _, clock = slot.partition(" ")
-    said = f"Picked {fmt_slot(slot)} from the link" + (f", PU# {number}" if number else "")
+    said = f"Picked {shown} from the link" + (f", PU# {number}" if number else "")
     message = _record(
         session,
         case,
@@ -378,9 +387,9 @@ def confirm(
         return LinkAnswer(False, "We could not record that time. Please reply to the email.")
     if settings.booking_link_auto_schedule:
         approve(session, case, by="agent")
-        case.reason = f"vendor picked {fmt_slot(slot)} from the link"
-        return LinkAnswer(True, f"Thank you, the pickup is set for {fmt_slot(slot)}.")
-    return LinkAnswer(True, f"Thank you, we have {fmt_slot(slot)} and will confirm it shortly.")
+        case.reason = f"vendor picked {shown} from the link"
+        return LinkAnswer(True, f"Thank you, the pickup is set for {shown}.")
+    return LinkAnswer(True, f"Thank you, we have {shown} and will confirm it shortly.")
 
 
 def propose(
@@ -394,7 +403,11 @@ def propose(
     note: str | None = None,
     name: str | None = None,
 ) -> LinkAnswer:
-    """The vendor proposed a time of their own: record it as an offer for a person to settle."""
+    """The vendor proposed a time of their own: record it as an offer for a person to settle.
+
+    The page asks for the time in Eastern, like every time we write; it is kept on the
+    facility's clock.
+    """
     from facility_profiles.booking.service import apply_reply  # noqa: PLC0415
 
     state = offer_state(offer, now)
@@ -404,6 +417,9 @@ def propose(
     clock = (clock or "").strip() or None
     if not _DAY_RE.match(day) or (clock is not None and not _CLOCK_RE.match(clock)):
         return LinkAnswer(False, "Please give the date (and, if you can, the time) that works.")
+    if clock:  # the page asks for Eastern; the case keeps the facility's own clock
+        moved = eastern_to_local(f"{day} {clock}", offer.case.vendor_timezone) or ""
+        day, _, clock = moved.partition(" ")
     try:
         at = local_dt(day, clock or "23:59", offer.case.vendor_timezone)
     except ValueError:
@@ -425,7 +441,7 @@ def propose(
         case,
         offer,
         now=now,
-        body=f"Proposed {fmt_slot(slot)} from the link"
+        body=f"Proposed {fmt_slot(slot, case.vendor_timezone)} from the link"
         + (f": {text}" if text else "")
         + (f" ({who})" if who else ""),
         reading={"status": "counter_offer", "pickup_date": day, "pickup_time": clock},
