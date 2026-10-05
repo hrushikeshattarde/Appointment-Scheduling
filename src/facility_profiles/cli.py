@@ -932,18 +932,13 @@ def booking_inbox(
         s3_bucket, _, s3_prefix = s3.removeprefix("s3://").strip("/").partition("/")
         messages = S3MailReader(Store(s3_bucket, s3_prefix)).fetch(days=days)
     elif key is not None and subject:
-        from facility_profiles.customers import customers
+        from facility_profiles.booking.inbox import group_query
 
-        known = customers(settings)
-        chosen = [known.get(k) for k in settings.customers] or list(known.files)
-        groups = [g for g in dict.fromkeys(c.group for c in chosen) if g] or (
-            [settings.booking_sender] if settings.booking_sender else []
-        )
-        if not groups:
+        query = group_query(settings, days)
+        if query is None:
             typer.echo("no group to read: set [mail] group in a customer file")
             raise typer.Exit(code=2)
-        where = " OR ".join(f"to:{g} OR cc:{g} OR deliveredto:{g}" for g in groups)
-        messages = GmailReader(key, subject).fetch(f"({where}) newer_than:{days}d")
+        messages = GmailReader(key, subject).fetch(query)
     else:
         typer.echo("give --file messages.jsonl, --s3 s3://bucket, or --key and --subject for Gmail")
         raise typer.Exit(code=2)
@@ -1346,10 +1341,13 @@ def booking_run(
 ) -> None:
     """One pass of the agent on its own, by each customer's rules.
 
-    Every open request is planned by its customer's rules and the ones that are due are written:
-    drafts, sent only where a rule and send mode say so.
+    With FP_BOOKING_INBOX the new replies are read first and answered by the customer's rules
+    (sent where ``replies = "send"``, booked where ``confirm = "auto"``). Then every open request
+    is planned and the due ones are written: drafts, sent only where a rule and send mode say so.
+    A dry run reads and answers too, then rolls everything back: nothing is sent or kept.
     """
     from facility_profiles.booking.automation import run_once
+    from facility_profiles.booking.inbox import inbox_from_settings, reader_tools
     from facility_profiles.booking.mail import GmailSender, LocalDraftMailer, RecordingMailer
 
     settings = _settings()
@@ -1374,8 +1372,18 @@ def booking_run(
         client = None
         if settings.booking_tpro_writeback and not dry_run:
             client = stack.enter_context(_client(settings, allow_writes=True))
+        inbox = inbox_from_settings(settings)
+        classifier, composer = reader_tools(settings) if inbox is not None else (None, None)
         report = run_once(
-            session, settings, now=datetime.now(tz=UTC), mailer=mailer, sender=sender, client=client
+            session,
+            settings,
+            now=datetime.now(tz=UTC),
+            mailer=mailer,
+            sender=sender,
+            client=client,
+            inbox=inbox,
+            classifier=classifier,
+            composer=composer,
         )
         for line in report.lines:
             typer.echo(line)

@@ -10,8 +10,13 @@ The policy is deliberately narrow. The agent only ever does five things in a thr
 
 Everything else, and anything that mentions money, is handed to a person: the exception the
 reply raised stays open with the agent's reason added to it. A move that settles the reply
-resolves its exception (an answered question, an offer accepted or declined). Every message is a
-draft in draft mode.
+resolves its exception (an answered question, an offer accepted or declined).
+
+Whether an answer is sent or drafted is the customer's rule (``replies``, ``customer_notes``)
+with FP_BOOKING_MODE=send and a sender given; every send passes the send gate first (the desk on
+the profile, or the person at that company who wrote, or the customer's own desk for a note to
+it; the daily cap). An answer the gate refuses is drafted instead and handed to a person. Every
+message is a draft in draft mode.
 """
 
 from __future__ import annotations
@@ -37,7 +42,13 @@ from facility_profiles.booking.models import (
     CaseStatus,
     ExceptionType,
 )
-from facility_profiles.booking.outbox import dispatch
+from facility_profiles.booking.outbox import (
+    SendRefusedError,
+    address,
+    check_send_gate,
+    dispatch,
+    is_sender,
+)
 from facility_profiles.booking.rules import vendor_profile
 from facility_profiles.booking.schema import ReplyClassification, ReplyStatus
 from facility_profiles.booking.templates import (
@@ -220,6 +231,14 @@ def answer_from_rules(question: str, facts: dict[str, Any]) -> AnswerDraft | Non
             message=f"The carrier is {carrier}" + ("" if carrier.endswith(".") else "."),
             facts_used=["carrier"],
         )
+    if re.search(r"\bdelivery\s*(number|#|ref\w*|appointment\s*number)", q) and facts.get(
+        "delivery_ref"
+    ):
+        return AnswerDraft(
+            answerable=True,
+            message=f"The delivery number is {facts['delivery_ref']}.",
+            facts_used=["delivery_ref"],
+        )
     if re.search(r"\b(where|which)\b.*\b(deliver\w*|going|destination)\b", q) and facts.get(
         "delivery_site"
     ):
@@ -357,12 +376,17 @@ def _fmt(day: str, clock: str | None) -> str:
 
 @dataclass
 class Responder:
-    """Decides the next message for a case after a classified reply, and drafts it."""
+    """Decides the next message for a case after a classified reply, and drafts or sends it.
+
+    ``mailer`` drafts (or, passed a sender, sends everything through the gate). ``sender``
+    sends what the customer's rule says to send, in send mode; the rest is drafted.
+    """
 
     settings: Settings
     mailer: Mailer | Sender
     composer: AnswerComposer | None = None
     now: datetime | None = None
+    sender: Sender | None = None
 
     def _now(self) -> datetime:
         return self.now or datetime.now(tz=UTC)
@@ -489,6 +513,7 @@ class Responder:
         subject = self._subject(case, reply, plan)
         escalation = plan.intent == ResponseIntent.ESCALATE_TO_CUSTOMER
         customer = customer_of(case, self.settings)
+        outbox = self._outbox(case, plan.intent)
         signature = customer.signature or self.settings.booking_signature
         draft = OutboundDraft(
             to_addr=plan.to_addr,
@@ -502,6 +527,18 @@ class Responder:
             in_reply_to=None if escalation or reply is None else reply.rfc_message_id,
             references=None if escalation or reply is None else reply.references_header,
         )
+        refused = (
+            self._refused(session, case, reply, draft, plan.intent) if is_sender(outbox) else None
+        )
+        if refused is not None:
+            if is_sender(self.mailer):  # nowhere to keep a draft: a person takes it from here
+                return self.act(
+                    session,
+                    case,
+                    reply,
+                    ResponsePlan(ResponseIntent.HANDOFF, f"not sent: {refused}"),
+                )
+            outbox = self.mailer
         message = BookingMessage(
             case_id=case.id,
             direction="out",
@@ -514,8 +551,24 @@ class Responder:
         )
         case.messages.append(message)
         session.flush()
-        delivery = dispatch(session, case, message, self.mailer, draft)
+        delivery = dispatch(session, case, message, outbox, draft)
         ref = delivery.ref
+        if refused is not None:
+            note = f"the agent's answer was not sent ({refused}); it is a draft for a person"
+            if annotate(session, case, note) is None:
+                flag(session, case, ExceptionType.HANDOFF, note[:255])
+            self._event(session, case, "reply_not_sent", reason=refused, draft_ref=ref)
+        self._settle(session, case, plan, sent=delivery.sent)
+        session.flush()
+        self._event(
+            session, case, plan.intent.value, reason=plan.reason, to=draft.to_addr, draft_ref=ref
+        )
+        return message
+
+    def _settle(
+        self, session: Session, case: BookingCase, plan: ResponsePlan, *, sent: bool
+    ) -> None:
+        """Move the case for the answer that went out (or was drafted) and settle its to-do."""
         if plan.intent == ResponseIntent.ACCEPT_OFFER and plan.proposed_local:
             day, _, clock = plan.proposed_local.partition(" ")
             start = local_dt(day, clock or None, case.vendor_timezone).astimezone(UTC)
@@ -542,6 +595,16 @@ class Responder:
                 pickup_number=case.pickup_number,
                 accepted_by_agent=True,
             )
+            if sent:  # the vendor has the agent's "yes"; book it when the rule says so
+                from facility_profiles.booking.service import auto_confirm  # noqa: PLC0415
+
+                auto_confirm(
+                    session,
+                    case,
+                    self.settings,
+                    now=self._now(),
+                    reason=f"the agent accepted the vendor's {plan.proposed_local} and said so",
+                )
         elif plan.intent == ResponseIntent.ASK_ALTERNATIVE:
             case.status = CaseStatus.PENDING.value
             case.reason = None
@@ -558,21 +621,17 @@ class Responder:
             )
         elif plan.intent == ResponseIntent.FOLLOW_UP:
             case.status = CaseStatus.PENDING.value
-            if delivery.sent:  # a draft has not chased anyone yet; a sent follow-up has
+            if sent:  # a draft has not chased anyone yet; a sent follow-up has
                 resolve(session, case, [ExceptionType.UNANSWERED_24H], resolution="follow-up sent")
         elif plan.intent == ResponseIntent.ACKNOWLEDGE:
             pass  # the case already moved on the confirmation itself
-        else:  # escalation: a person sends it; the decline stays open until the delivery moves
+        else:  # escalation: the decline stays open until the customer moves the delivery
+            done = "sent" if sent else "drafted"
             annotate(
                 session,
                 case,
-                "note to the customer desk drafted; the customer must move the delivery",
+                f"note to the customer desk {done}; the customer must move the delivery",
             )
-        session.flush()
-        self._event(
-            session, case, plan.intent.value, reason=plan.reason, to=draft.to_addr, draft_ref=ref
-        )
-        return message
 
     def respond(
         self,
@@ -676,6 +735,49 @@ class Responder:
         return self.act(session, case, reply, plan)
 
     # -- helpers
+
+    def _outbox(self, case: BookingCase, intent: ResponseIntent) -> Mailer | Sender:
+        """The sender when the customer's rule and the mode say send, else the drafts."""
+        if self.sender is not None and self.settings.booking_mode == "send":
+            rule = customer_of(case, self.settings).rule_for(case)
+            wanted = (
+                rule.customer_notes
+                if intent == ResponseIntent.ESCALATE_TO_CUSTOMER
+                else rule.reply_mode
+            )
+            if wanted == "send":
+                return self.sender
+        return self.mailer
+
+    def _refused(
+        self,
+        session: Session,
+        case: BookingCase,
+        reply: BookingMessage | None,
+        draft: OutboundDraft,
+        intent: ResponseIntent,
+    ) -> str | None:
+        """Why the send gate refuses this answer, or None when it may go.
+
+        Besides the desk on the profile, an answer may go to the person at that desk's company
+        who wrote the reply, and a note for the customer to the desk in the customer's file.
+        """
+        profile = (
+            vendor_profile(Repository(session), case.facility_key) if case.facility_key else None
+        )
+        trusted = profile.contact_email if profile and profile.can_email else None
+        also: list[str | None] = []
+        if intent == ResponseIntent.ESCALATE_TO_CUSTOMER:
+            also.append(customer_of(case, self.settings).customer_desk)
+        elif reply is not None and trusted:
+            wrote = address(reply.from_addr)
+            if wrote.rpartition("@")[2] == address(trusted).rpartition("@")[2]:
+                also.append(wrote)
+        try:
+            check_send_gate(session, case, draft, self.settings, trusted_desk=trusted, also=also)
+        except SendRefusedError as exc:
+            return str(exc)
+        return None
 
     def _subject(self, case: BookingCase, reply: BookingMessage | None, plan: ResponsePlan) -> str:
         if plan.intent == ResponseIntent.ESCALATE_TO_CUSTOMER:

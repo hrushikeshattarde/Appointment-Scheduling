@@ -155,6 +155,12 @@ class Settings(BaseSettings):
     # Write booked pickups to Transport Pro (POST /load/{id}/set_appointment; booking/writeback.py).
     # Off: each booking waits, and the board says to enter it there by hand.
     booking_tpro_writeback: bool = False
+    # Where the agent reads vendors' replies when it runs on its own (`booking run`, `serve
+    # --autopilot-every`): "gmail" (FP_BOOKING_GMAIL_KEY reads FP_BOOKING_GMAIL_USER's mailbox for
+    # the customers' group mail) or "s3://bucket[/prefix]" (the group-mail archive). Not set:
+    # replies are read only by `booking inbox`. Each pass reads this many days back.
+    booking_inbox: str | None = None
+    booking_inbox_days: int = Field(2, gt=0, le=30)
 
     # --- Board sign-in and who sees which customer (access/; README "Who sees which customer")
     # Google sign-in is on when both are set. Without them the board has no login: everyone who
@@ -213,6 +219,18 @@ class Settings(BaseSettings):
             msg = "FP_BOARD_PUBLIC_URL must start with https:// (http only for localhost)"
             raise ValueError(msg)
         return url
+
+    @field_validator("booking_inbox")
+    @classmethod
+    def _inbox_source(cls, value: str | None) -> str | None:
+        """Gmail or an S3 archive."""
+        if value is None or not value.strip():
+            return None
+        where = value.strip()
+        if where != "gmail" and not where.startswith("s3://"):
+            msg = "FP_BOOKING_INBOX must be gmail or s3://bucket[/prefix]"
+            raise ValueError(msg)
+        return where
 
     @field_validator("google_client_id")
     @classmethod

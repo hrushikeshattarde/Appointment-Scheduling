@@ -532,6 +532,9 @@ wait_for = "delivery_slot"          # ask only once the load has its delivery sl
 # batch_at = "10:00"                # write at this time of day, one email per desk
 # pickup_from = "delivery"          # plan the pickup back from the delivery, not the tender
 # follow_up = false                 # no automatic nudge to a silent desk
+# replies = "send"                  # send the answers to the vendor (default: as `do` says)
+# confirm = "auto"                  # book a confirmation of the time asked for, no approval
+# customer_notes = "send"           # send the note to the customer's desk (default: draft)
 ```
 
 The first rule that covers a pickup decides; without one, the agent drafts it as soon as it can.
@@ -541,6 +544,8 @@ this", with the rule's `why`) and writes nothing.
 Each pass:
 
 1. **Timers**: the timers run first.
+   **Replies**: with `FP_BOOKING_INBOX` set, the new replies are read next and answered (see
+   "The agent answering on its own" below).
 2. **Planning**: every unscheduled case without a request gets a request job (table
    `booking_jobs`). The job is waiting (for the delivery slot), blocked (something on the case
    needs a person), held, or planned for its time.
@@ -556,6 +561,50 @@ Each pass:
 A request drafted, a booking made or a case canceled by a person closes the job: the agent never
 redoes it. Lidl's rule drafts its email desks once the DCT slot is known; the batch hour and lead
 days are left for the pod to set.
+
+### The agent answering on its own
+
+With `FP_BOOKING_INBOX` set, each pass also reads the new replies, the way Bigger Picture does:
+
+- **Where it reads**: `FP_BOOKING_INBOX=gmail` reads the sending mailbox (`FP_BOOKING_GMAIL_KEY`
+  for `FP_BOOKING_GMAIL_USER`) for mail to or copying the customers' groups;
+  `FP_BOOKING_INBOX=s3://bucket/prefix` reads the group-mail archive. Each pass looks
+  `FP_BOOKING_INBOX_DAYS` back (2). Mail already on a case is skipped by its email ID, so a reply
+  is never answered twice, however often the inbox is read.
+- **What it does with a reply**: matches it to its pickup, reads it, and answers by the
+  conversation policy:
+  - accept an offer that still makes the delivery, or ask for other days;
+  - answer a question from what's on the pickup (PO, delivery number, delivery site, load
+    number, carrier, customer);
+  - thank the vendor for a confirmation;
+  - write a note to the customer's desk when the vendor cannot ship.
+
+  Money, claims and the third back-and-forth go to a person.
+- **What goes out**: with `FP_BOOKING_MODE=send` and a sender, an answer is sent where the
+  customer's rule says `replies = "send"` (and a note to the customer's desk where it says
+  `customer_notes = "send"`). Every send passes the send gate:
+  - it goes only to the desk on the profile, to the person at that company who wrote, or to the
+    customer desk in the file;
+  - the daily cap holds.
+
+  An answer the gate refuses is drafted instead, and raised for a person.
+- **Booking without a person**: where the rule says `confirm = "auto"`, the agent books a
+  confirmation itself: the case becomes scheduled, the desk is remembered, and the slot is
+  queued for Transport Pro, exactly as a person's approval. It does so only when nothing is in
+  doubt:
+  - the time asked for (the same day, within two hours, not already past);
+  - nothing else open on the pickup;
+  - every date, time and number backed by the reply's own words;
+  - no money or claims;
+  - tied to the request by its email ID, thread or PO (not only by the sender);
+  - a time that still makes the delivery.
+
+  Otherwise the approval stays for a person, with the reason on it ("not booked automatically:
+  ..."). An offer the agent accepted is booked once its "yes" has been sent.
+- **Failures**: a reply that fails (the model is down, say) is left for the next pass; an
+  unreadable inbox is reported and the rest of the pass goes on.
+
+Lidl's file keeps drafting and approval by a person until the pod switches these on.
 
 `booking run --dry-run` shows what a pass would do and changes nothing. `booking jobs [ID]` lists
 the jobs with their rule, status, due time and why. `customers show KEY` lists the rules. The

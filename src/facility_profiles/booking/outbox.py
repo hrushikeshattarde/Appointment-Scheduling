@@ -8,7 +8,9 @@ event naming what went out and to whom.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
+from email.utils import parseaddr
 from typing import Any
 
 from sqlalchemy import func, select
@@ -28,6 +30,11 @@ class SendRefusedError(ValueError):
     """The send gate said no; the message was neither drafted nor sent."""
 
 
+def address(value: str | None) -> str:
+    """The bare email address in a header value, lower case ("Ana <a@x.com>" is a@x.com)."""
+    return parseaddr(value or "")[1].strip().lower()
+
+
 def check_send_gate(
     session: Session,
     case: BookingCase,
@@ -35,18 +42,22 @@ def check_send_gate(
     settings: Settings,
     *,
     trusted_desk: str | None,
+    also: Iterable[str | None] = (),
 ) -> None:
     """The deterministic checks every unattended send must pass.
 
     The recipient must be the desk the facility profile trusts (a human-set or verified email),
-    the mode must allow sending, and the day's cap must not be reached. The wording is the
-    caller's responsibility: only template text reaches this point today.
+    or one of ``also`` (for an answer: the person at that desk's company who wrote; for a note to
+    the customer: the desk in the customer's file). The mode must allow sending, and the day's
+    cap must not be reached. The wording is the caller's responsibility: only template text and
+    checked answers reach this point.
     """
     if settings.booking_mode != "send":
         msg = "FP_BOOKING_MODE is not 'send'; the agent may only draft"
         raise SendRefusedError(msg)
-    to = draft.to_addr.strip().lower()
-    if not trusted_desk or to != trusted_desk.strip().lower():
+    to = address(draft.to_addr)
+    allowed = {a for a in (address(trusted_desk), *(address(x) for x in also)) if a}
+    if not to or to not in allowed:
         msg = (
             f"case {case.id}: {draft.to_addr or 'no recipient'} is not the trusted desk on the "
             f"profile ({trusted_desk or 'none'})"

@@ -3,6 +3,11 @@
 One pass (:func:`run_once`: ``booking run``, or ``serve --autopilot-every``):
 
 1. the timers run (a desk's silence, a pickup that slipped);
+   then, with an inbox (FP_BOOKING_INBOX, ``booking/inbox.py``), the new replies are read and
+   answered: each reply is matched to its pickup, read, and answered by the conversation policy
+   (``booking/respond.py``), sent where the customer's rule says ``replies = "send"`` and booked
+   by the agent itself where it says ``confirm = "auto"``. One reply that fails is retried on
+   the next pass and does not stop the others;
 2. every unscheduled case without a request gets a request job from the first rule in its
    customer's file that covers it (``customers.profile.Rule``; without one, the default: draft
    now). The job waits for the delivery slot when the rule says so, is held for a person, waits
@@ -31,6 +36,8 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from facility_profiles.booking.classify import ReplyClassifier
+from facility_profiles.booking.inbox import Inbox
 from facility_profiles.booking.mail import Mailer, Sender
 from facility_profiles.booking.models import (
     AutomationJob,
@@ -41,16 +48,26 @@ from facility_profiles.booking.models import (
     JobStatus,
 )
 from facility_profiles.booking.outbox import SendRefusedError
-from facility_profiles.booking.respond import Responder
+from facility_profiles.booking.respond import AnswerComposer, Responder
 from facility_profiles.booking.rules import check_desk_rules, request_opens, vendor_profile
-from facility_profiles.booking.service import draft_batch, has_request, list_cases, plan_request
+from facility_profiles.booking.service import (
+    IngestStats,
+    draft_batch,
+    has_request,
+    ingest,
+    list_cases,
+    plan_request,
+)
 from facility_profiles.booking.timers import fmt_slot, slot_at, sweep
 from facility_profiles.booking.worklist import flag, open_kinds
 from facility_profiles.booking.writeback import LoadWriter, write_appointments
 from facility_profiles.config import Settings
 from facility_profiles.customers import customers
 from facility_profiles.customers.profile import Customer, Rule
+from facility_profiles.logging import get_logger
 from facility_profiles.storage.repository import Repository, as_utc
+
+log = get_logger(__name__)
 
 ACTOR = "automation"
 MAX_ATTEMPTS = 3
@@ -72,6 +89,10 @@ class RunReport:
     failed: int = 0
     closed: int = 0
     written_to_tpro: int = 0
+    mail_read: int = 0  # new replies read from the inbox
+    mail_answered: int = 0  # answers the agent wrote to them (sent or drafted)
+    auto_confirmed: int = 0  # confirmations it booked itself
+    mail_failed: int = 0  # replies that failed (retried on the next pass) or an unreadable inbox
     lines: list[str] = field(default_factory=list)
 
     def say(self, case: BookingCase, text: str) -> None:
@@ -327,17 +348,15 @@ def _follow_ups(
 ) -> None:
     """One nudge for each sent request the desk has not answered, where the rule allows it."""
     known = customers(settings)
-    drafts = Responder(settings, mailer, now=now)
-    sends = Responder(settings, sender, now=now) if sender is not None else None
+    responder = Responder(settings, mailer, now=now, sender=sender)
     for case in list_cases(session, CaseStatus.PENDING.value):
         rule = known.for_case(case).rule_for(case)
         if rule.do not in ("draft", "send") or not rule.follow_up:
             continue
-        send = rule.do == "send" and settings.booking_mode == "send" and sends is not None
-        responder = sends if send and sends is not None else drafts
         message = responder.follow_up(session, case)
         if message is None:
             continue
+        send = message.sent_at is not None
         case.jobs.append(
             AutomationJob(
                 case_id=case.id,
@@ -362,6 +381,51 @@ def _zone(customer: Customer, settings: Settings) -> ZoneInfo:
     return ZoneInfo(customer.timezone or settings.booking_timezone)
 
 
+def _read_inbox(
+    session: Session,
+    inbox: Inbox,
+    classifier: ReplyClassifier,
+    *,
+    settings: Settings,
+    mailer: Mailer,
+    sender: Sender | None,
+    composer: AnswerComposer | None,
+    now: datetime,
+    report: RunReport,
+) -> None:
+    """Read the new replies and answer each, one at a time; a failure leaves that one for later."""
+    try:
+        messages = inbox.fetch()
+    except Exception as exc:  # an unreadable inbox must not stop the rest of the pass
+        log.exception("booking.inbox_failed")
+        report.mail_failed += 1
+        report.lines.append(f"inbox: could not read the mail ({exc})")
+        return
+    responder = Responder(settings, mailer, composer=composer, now=now, sender=sender)
+    for message in messages:
+        try:
+            with session.begin_nested():
+                stats: IngestStats = ingest(
+                    session,
+                    [message],
+                    classifier,
+                    internal_domains=settings.internal_email_domains,
+                    responder=responder,
+                    settings=settings,
+                )
+        except Exception:  # this reply is tried again on the next pass
+            log.exception("booking.reply_failed", subject=message.subject)
+            report.mail_failed += 1
+            report.lines.append(f"inbox: could not handle {message.subject!r}; trying next pass")
+            continue
+        new = stats.messages - stats.duplicates - stats.own_outbound - stats.skipped_internal
+        report.mail_read += max(new, 0)
+        report.mail_answered += stats.responded
+        report.auto_confirmed += stats.auto_confirmed
+        if stats.auto_confirmed:
+            report.lines.append(f"inbox: booked {message.subject!r} from the vendor's confirmation")
+
+
 def run_once(
     session: Session,
     settings: Settings,
@@ -371,14 +435,31 @@ def run_once(
     sender: Sender | None = None,
     timers: bool = True,
     client: LoadWriter | None = None,
+    inbox: Inbox | None = None,
+    classifier: ReplyClassifier | None = None,
+    composer: AnswerComposer | None = None,
 ) -> RunReport:
-    """One pass of the agent on its own: plan every open request, write what is due.
+    """One pass of the agent on its own: read new replies, plan open requests, write what's due.
 
     ``client`` writes the booked pickups to Transport Pro; pass one only while write-back is on.
+    ``inbox`` and ``classifier`` read and answer the vendors' replies (``composer`` answers the
+    questions no rule answers); without them replies wait for ``booking inbox``.
     """
     report = RunReport()
     if timers:
         sweep(session, now=now, settings=settings)
+    if inbox is not None and classifier is not None:
+        _read_inbox(
+            session,
+            inbox,
+            classifier,
+            settings=settings,
+            mailer=mailer,
+            sender=sender if settings.booking_mode == "send" else None,
+            composer=composer,
+            now=now,
+            report=report,
+        )
     known = customers(settings)
     for case in sorted(list_cases(session, CaseStatus.UNSCHEDULED.value), key=lambda c: c.id):
         customer = known.for_case(case)

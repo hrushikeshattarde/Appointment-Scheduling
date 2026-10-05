@@ -59,8 +59,24 @@ class CustomerFileError(ValueError):
 # (booking/automation.py).
 RULE_ACTIONS = ("draft", "send", "hold", "skip")
 RULE_KEYS = frozenset(
-    {"name", "when", "do", "why", "lead_days", "batch_at", "wait_for", "pickup_from", "follow_up"}
+    {
+        "name",
+        "when",
+        "do",
+        "why",
+        "lead_days",
+        "batch_at",
+        "wait_for",
+        "pickup_from",
+        "follow_up",
+        "replies",
+        "confirm",
+        "customer_notes",
+    }
 )
+# How the agent's answers in a thread go out, and whether it books a confirmation itself.
+OUTBOX = ("draft", "send")
+CONFIRM = ("review", "auto")
 WHEN_KEYS = frozenset({"methods", "desks", "vendors", "facilities", "customer_ids"})
 METHODS = frozenset({"email", "phone", "web_portal", "fcfs", "preset_by_customer", "unknown"})
 WAIT_FOR = frozenset({"delivery_slot"})
@@ -81,6 +97,17 @@ class Rule:
     - ``wait_for = "delivery_slot"``: ask only once the delivery has its slot and reference;
     - ``pickup_from = "delivery"``: plan the pickup back from the delivery, not the tender;
     - ``follow_up``: nudge a silent desk on its own (default true).
+
+    The conversation, once the vendor answers:
+
+    - ``replies``: ``send`` or ``draft`` the agent's answers to the vendor (accepting an offer,
+      asking for other days, answering a question, the thank-you, the follow-up). Not set: as
+      ``do`` says (a ``hold`` or ``skip`` rule drafts);
+    - ``confirm``: ``auto`` books a vendor's confirmation of the time asked for without a
+      person, and an offer the agent accepted and sent; ``review`` (the default) waits for a
+      person's approval;
+    - ``customer_notes``: ``send`` or ``draft`` (the default) the note to the customer's desk
+      when the vendor cannot ship.
     """
 
     name: str
@@ -96,6 +123,16 @@ class Rule:
     wait_for: str | None = None
     pickup_from: str = "tender"
     follow_up: bool = True
+    replies: str | None = None
+    confirm: str = "review"
+    customer_notes: str = "draft"
+
+    @property
+    def reply_mode(self) -> str:
+        """``send`` or ``draft``: how the agent's answers to the vendor go out."""
+        if self.replies:
+            return self.replies
+        return "send" if self.do == "send" else "draft"
 
     def matches(self, case: Any) -> bool:
         """True when the case is one this rule covers (a booking case, or one being opened)."""
@@ -131,6 +168,9 @@ class Rule:
                 "once the delivery has its slot" if self.wait_for == "delivery_slot" else None,
                 "planned back from the delivery" if self.pickup_from == "delivery" else None,
                 None if self.follow_up else "no follow-ups",
+                "replies sent" if self.reply_mode == "send" else None,
+                "books confirmations itself" if self.confirm == "auto" else None,
+                "customer notes sent" if self.customer_notes == "send" else None,
             )
             if text
         ]
@@ -509,7 +549,24 @@ def _timing(r: _Reader, where: str, raw: dict[str, Any]) -> dict[str, Any]:
         "wait_for": wait_for,
         "pickup_from": pickup_from,
         "follow_up": follow_up,
+        **_conversation(r, where, raw),
     }
+
+
+def _conversation(r: _Reader, where: str, raw: dict[str, Any]) -> dict[str, Any]:
+    """How a rule's answers go out, and whether it books confirmations itself."""
+    found: dict[str, Any] = {}
+    for name, allowed, default in (
+        ("replies", OUTBOX, None),
+        ("confirm", CONFIRM, "review"),
+        ("customer_notes", OUTBOX, "draft"),
+    ):
+        value = r.text(where, raw, name)
+        if value is not None and value not in allowed:
+            r.problems.append(f"{where}: {name} must be {' or '.join(allowed)}")
+            value = None
+        found[name] = value if value is not None else default
+    return found
 
 
 def _rules(r: _Reader, raw: Any) -> tuple[Rule, ...]:

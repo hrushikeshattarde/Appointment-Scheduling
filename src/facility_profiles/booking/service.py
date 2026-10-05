@@ -73,8 +73,10 @@ from facility_profiles.booking.references import (
     record_reference,
 )
 from facility_profiles.booking.respond import (
+    FORBIDDEN_TOPICS,
     Responder,
     local_dt,
+    offer_is_feasible,
 )
 from facility_profiles.booking.rules import (
     REFERENCE_LABELS,
@@ -187,6 +189,7 @@ class IngestStats:
     linked_outbound: int = 0  # a person's own send of a drafted request, recognised and linked
     not_about_case: int = 0  # a reply that named other POs than this case's
     own_outbound: int = 0  # the agent's own sent mail seen again in the archive
+    auto_confirmed: int = 0  # confirmations the agent booked itself (the rule's confirm = auto)
 
 
 # ------------------------------------------------------------------ profile and load helpers
@@ -1325,6 +1328,15 @@ def match_cases(session: Session, message: InboundMessage) -> list[BookingCase]:
     what the agent or a person sent; the Gmail thread, when the reply was read from the mailbox
     that sent the request; PO numbers in the reply's own words; a lone open case for the sender.
     """
+    return match_with_how(session, message)[0]
+
+
+def match_with_how(session: Session, message: InboundMessage) -> tuple[list[BookingCase], str]:
+    """The cases a reply belongs to (as :func:`match_cases`), and how they were found.
+
+    ``message_id``, ``thread`` or ``po``; ``sender`` when only the sender tied it to a lone open
+    case, which is too weak for the agent to book on by itself; ``none``.
+    """
     referenced = message.referenced_ids
     if referenced:
         answered = list(
@@ -1336,7 +1348,7 @@ def match_cases(session: Session, message: InboundMessage) -> list[BookingCase]:
             )
         )
         if answered:
-            return _distinct(m.case for m in answered)
+            return _distinct(m.case for m in answered), "message_id"
     if message.thread_id:
         in_thread = list(
             session.scalars(
@@ -1346,7 +1358,7 @@ def match_cases(session: Session, message: InboundMessage) -> list[BookingCase]:
             )
         )
         if in_thread:
-            return in_thread
+            return in_thread, "thread"
     open_cases = list(
         session.scalars(
             select(BookingCase)
@@ -1358,10 +1370,10 @@ def match_cases(session: Session, message: InboundMessage) -> list[BookingCase]:
     if numbers:
         hits = [c for c in open_cases if numbers & {str(p) for p in c.po_numbers}]
         if hits:
-            return hits
+            return hits, "po"
     sender = message.from_email
     by_sender = [c for c in open_cases if (c.contact_email or "").lower() == sender]
-    return by_sender if len(by_sender) == 1 else []
+    return (by_sender, "sender") if len(by_sender) == 1 else ([], "none")
 
 
 def _distinct(cases: Iterable[BookingCase]) -> list[BookingCase]:
@@ -1607,7 +1619,7 @@ def ingest(  # noqa: PLR0912 - one branch per reply outcome
         if _already_recorded(session, message):
             stats.duplicates += 1
             continue
-        cases = match_cases(session, message)
+        cases, how = match_with_how(session, message)
         if not cases:
             stats.unmatched += 1
             continue
@@ -1637,7 +1649,14 @@ def ingest(  # noqa: PLR0912 - one branch per reply outcome
         if not live:
             continue
         _ingest_reply(
-            session, message, cases=live, classifier=classifier, responder=responder, stats=stats
+            session,
+            message,
+            cases=live,
+            classifier=classifier,
+            responder=responder,
+            stats=stats,
+            settings=settings,
+            strong=how != "sender",
         )
         session.flush()
     return stats
@@ -1651,13 +1670,20 @@ def _ingest_reply(
     classifier: ReplyClassifier,
     responder: Responder | None,
     stats: IngestStats,
+    settings: Settings | None = None,
+    strong: bool = True,
 ) -> None:
     """Classify one vendor reply once and apply it to every live case it answers.
 
     A reply that answers PO lines separately is applied line by line; a case whose POs the
-    reply never names is left where it was. Whatever happens, at most one message goes back
-    for one reply: the conversation policy's answers first, else a single "Thank you!".
+    reply never names is left where it was. A confirmation is booked by the agent itself when
+    the customer's rule says ``confirm = "auto"`` and :func:`auto_confirm` finds nothing to
+    doubt. Whatever happens, at most one message goes back for one reply: the conversation
+    policy's answers first, else a single "Thank you!".
     """
+    settings = settings or (responder.settings if responder is not None else None)
+    now = (responder.now if responder is not None else None) or datetime.now(tz=UTC)
+    booked: set[int] = set()
     first = cases[0]
     context = ReplyContext(
         vendor_name=first.vendor_name or "",
@@ -1708,6 +1734,18 @@ def _ingest_reply(
         )
         if action == "vendor_confirmed":
             stats.proposed += 1
+            if settings is not None and auto_confirm(
+                session,
+                case,
+                settings,
+                now=now,
+                reason="the vendor confirmed the time asked for",
+                issues=issues,
+                text=message.body,
+                strong=strong,
+            ):
+                stats.auto_confirmed += 1
+                booked.add(case.id)
         elif action in ("counter_offer", "question", "rejected_by_vendor", "stale_confirmation"):
             stats.needs_human += 1
         elif action == "deferred":
@@ -1716,7 +1754,7 @@ def _ingest_reply(
             stats.unrelated += 1
         answered.append((case, inbound, reading))
     if responder is not None:
-        _answer_once(session, responder, answered, stats)
+        _answer_once(session, responder, answered, stats, booked=booked)
 
 
 def _answer_once(
@@ -1724,6 +1762,8 @@ def _answer_once(
     responder: Responder,
     answered: list[tuple[BookingCase, BookingMessage, ReplyClassification]],
     stats: IngestStats,
+    *,
+    booked: set[int] | None = None,
 ) -> None:
     """At most one message back for one reply: policy answers first, else a single thanks."""
     drafted_any = False
@@ -1743,8 +1783,8 @@ def _answer_once(
     if drafted_any:
         return
     for case, inbound, reading in answered:
-        if reading.status == ReplyStatus.CONFIRMED and open_exceptions(
-            case, ExceptionType.CONFIRMATION_REVIEW
+        if reading.status == ReplyStatus.CONFIRMED and (
+            case.id in (booked or set()) or open_exceptions(case, ExceptionType.CONFIRMATION_REVIEW)
         ):
             if responder.acknowledge(session, case, inbound) is not None:
                 stats.responded += 1
@@ -2055,6 +2095,85 @@ def draft_batch(
 
 
 # ------------------------------------------------------------------ decisions
+
+
+# What a confirmation the agent books itself may leave open beside the review it settles: the
+# timers (the vendor answered and the pickup is booked).
+AUTO_CONFIRM_SETTLES = frozenset(
+    {ExceptionType.CONFIRMATION_REVIEW.value, *(k.value for k in TIMER_KINDS)}
+)
+# A reading that dropped one of these (the reply's words do not back it) is not booked on.
+SLOT_FIELDS = frozenset(
+    {"status", "pickup_date", "pickup_time", "pickup_time_end", "pickup_number"}
+)
+
+
+def auto_confirm(
+    session: Session,
+    case: BookingCase,
+    settings: Settings,
+    *,
+    now: datetime,
+    reason: str,
+    issues: Iterable[ClassificationIssue] = (),
+    text: str = "",
+    strong: bool = True,
+) -> bool:
+    """Book a confirmation without a person, when the customer's rule says ``confirm = "auto"``.
+
+    True when booked (as :func:`approve` does, by the agent). Only booked when nothing is in
+    doubt: the confirmation is of the time asked for (nothing else raised, so not another day,
+    not more than two hours off, not already past), every date, time and number in it is backed
+    by the reply's own words, the reply says nothing of money or claims and was tied to the
+    request by its email ID, thread or PO (not only by its sender), and the time still makes
+    the delivery. Otherwise the review stays for a person, with the reason added to it.
+    """
+    if customer_of(case, settings).rule_for(case).confirm != "auto":
+        return False
+    doubt = _auto_confirm_doubt(
+        case, settings, now=now, issues=list(issues), text=text, strong=strong
+    )
+    if doubt is not None:
+        review = open_exceptions(case, ExceptionType.CONFIRMATION_REVIEW)
+        if review:  # the note goes on the approval a person now makes, not the latest to-do
+            exc = review[0]
+            exc.description = f"{exc.description} | not booked automatically: {doubt}"[:255]
+            exc.detail = {**exc.detail, "auto_confirm": doubt}
+        _event(session, case, "auto_confirm_held", reason=doubt)
+        return False
+    approve(session, case, by=REFRESH_ACTOR)
+    _event(session, case, "auto_confirmed", reason=reason, local=case.confirmed_local)
+    return True
+
+
+def _auto_confirm_doubt(
+    case: BookingCase,
+    settings: Settings,
+    *,
+    now: datetime,
+    issues: list[ClassificationIssue],
+    text: str,
+    strong: bool,
+) -> str | None:
+    """Why the agent should not book this confirmation itself, or None."""
+    if case.status != CaseStatus.PENDING.value or not case.confirmed_local:
+        return "nothing confirmed to book"
+    other = [e.kind for e in case.open_exceptions if e.kind not in AUTO_CONFIRM_SETTLES]
+    if other:
+        return "also open: " + ", ".join(sorted(set(other)))
+    if any(i.field_name in SLOT_FIELDS for i in issues):
+        return "the reply's words do not back every date, time or number read from it"
+    if FORBIDDEN_TOPICS.search(text or ""):
+        return "the reply mentions money or a claim"
+    if not strong:
+        return "the reply was tied to this pickup by its sender only"
+    day, _, clock = case.confirmed_local.partition(" ")
+    feasible, why = offer_is_feasible(
+        case, local_dt(day, clock or None, case.vendor_timezone), settings, now=now
+    )
+    if not feasible:
+        return f"the confirmed time {why}"
+    return None
 
 
 def approve(session: Session, case: BookingCase, *, by: str) -> tuple[dict[str, Any], bool]:

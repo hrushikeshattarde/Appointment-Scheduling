@@ -79,9 +79,11 @@ def run_timers(sessions: sessionmaker[Session], settings: Settings | None = None
 def run_autopilot(sessions: sessionmaker[Session], settings: Settings) -> None:
     """One pass of the agent on its own (booking/automation.py), drafting into the drafts folder.
 
-    It sends only where a rule says send, FP_BOOKING_MODE is send and a Gmail sender is set.
+    It sends only where a rule says send, FP_BOOKING_MODE is send and a Gmail sender is set. With
+    FP_BOOKING_INBOX it also reads the new replies and answers them by the customers' rules.
     """
     from facility_profiles.booking.automation import run_once  # noqa: PLC0415 - optional loop
+    from facility_profiles.booking.inbox import inbox_from_settings, reader_tools  # noqa: PLC0415
     from facility_profiles.booking.mail import GmailSender, LocalDraftMailer  # noqa: PLC0415
 
     mailer = LocalDraftMailer(
@@ -95,6 +97,9 @@ def run_autopilot(sessions: sessionmaker[Session], settings: Settings) -> None:
     ):
         user = settings.booking_gmail_user
         sender = GmailSender(Path(settings.booking_gmail_key), user, user)
+    inbox = inbox_from_settings(settings)
+    classifier, composer = reader_tools(settings) if inbox is not None else (None, None)
+    conversation: dict[str, Any] = {"inbox": inbox, "classifier": classifier, "composer": composer}
     if settings.booking_tpro_writeback:
         from facility_profiles.tpro.client import TransportProClient  # noqa: PLC0415
 
@@ -109,11 +114,17 @@ def run_autopilot(sessions: sessionmaker[Session], settings: Settings) -> None:
                 mailer=mailer,
                 sender=sender,
                 client=client,
+                **conversation,
             )
     else:
         with session_scope(sessions) as session:
             report = run_once(
-                session, settings, now=datetime.now(tz=UTC), mailer=mailer, sender=sender
+                session,
+                settings,
+                now=datetime.now(tz=UTC),
+                mailer=mailer,
+                sender=sender,
+                **conversation,
             )
     log.info("booking.autopilot", **report.counts())
 

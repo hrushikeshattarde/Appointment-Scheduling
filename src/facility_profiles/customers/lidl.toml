@@ -76,3 +76,6 @@ do = "draft"
 wait_for = "delivery_slot"
 # batch_at = "10:00"   # one email per desk, written at this time of day (not set: as soon as due)
 # lead_days = 2        # ask this many business days before the pickup (not set: straight away)
+# replies = "send"     # send the agent's answers to the vendor (with FP_BOOKING_MODE=send)
+# confirm = "auto"     # book a confirmation of the time asked for without a person
+# customer_notes = "send"   # send the note to inbound@lidl.us when a vendor cannot ship
