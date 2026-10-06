@@ -155,6 +155,24 @@ def init_db_cmd() -> None:
     typer.echo(f"schema ready at {settings.database_url}")
 
 
+def _serve_scan_scope(
+    settings: Settings, customer: list[str] | None
+) -> tuple[list[int], list[int]]:
+    """Whose loads ``serve --scan-every`` checks.
+
+    It refuses to start without a pod or a customer: that scan would take every load in
+    Transport Pro.
+    """
+    chosen = _scope(settings, customer, None, booking=True)
+    if not any(chosen):
+        typer.echo(
+            "--scan-every needs to know whose loads to check: --scan-customer lidl, or "
+            "FP_CUSTOMERS (or FP_PILOT_TERMINAL_IDS) in .env"
+        )
+        raise typer.Exit(code=2)
+    return chosen
+
+
 @app.command()
 def serve(
     host: Annotated[str, typer.Option(help="Interface to listen on")] = "127.0.0.1",
@@ -176,6 +194,22 @@ def serve(
             "(drafts; sends only where a rule and send mode say so); 0, the default, is off"
         ),
     ] = 0,
+    scan_every: Annotated[
+        float,
+        typer.Option(
+            help="Check Transport Pro for new and changed pickups every this many minutes "
+            "(booking scan; reads only); 0, the default, is off"
+        ),
+    ] = 0,
+    scan_customer: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--scan-customer",
+            help="Whose loads --scan-every checks: a customer file's key (lidl) or a Transport "
+            "Pro customer ID; repeatable. Default: FP_CUSTOMERS, else FP_PILOT_TERMINAL_IDS and "
+            "FP_PILOT_CUSTOMER_IDS",
+        ),
+    ] = None,
     no_sign_in: Annotated[
         bool,
         typer.Option(
@@ -206,6 +240,7 @@ def serve(
     if signin_enabled(settings) and not settings.board_admins:
         typer.echo("Google sign-in is on: set FP_BOARD_ADMINS to your email first")
         raise typer.Exit(code=2)
+    scan_scope = _serve_scan_scope(settings, scan_customer) if scan_every > 0 else ([], [])
     typer.echo(f"appointments board: http://{host}:{port}/app/  (store {settings.database_url})")
     if no_sign_in:
         typer.echo("sign-in off for this run (--no-sign-in): this machine only, every customer")
@@ -224,10 +259,23 @@ def serve(
         typer.echo(f"booking timers run every {timers_every:g} min")
     if autopilot_every > 0:
         typer.echo(f"the agent runs on its own every {autopilot_every:g} min (booking run)")
+    if scan_every > 0:
+        terminals, customer_ids = scan_scope
+        whose = "; ".join(
+            f"{label} {', '.join(map(str, ids))}"
+            for label, ids in (("terminals", terminals), ("customers", customer_ids))
+            if ids
+        )
+        typer.echo(
+            f"Transport Pro is checked for new pickups every {scan_every:g} min ({whose}); "
+            f"pickups up to {settings.booking_days_ahead} days ahead"
+        )
     app_ = create_app(
         settings,
         timers_every=timers_every if timers_every > 0 else None,
         autopilot_every=autopilot_every if autopilot_every > 0 else None,
+        scan_every=scan_every if scan_every > 0 else None,
+        scan_scope=scan_scope,
     )
     uvicorn.run(app_, host=host, port=port, log_level="warning")
 

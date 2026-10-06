@@ -616,6 +616,7 @@ def _decided(
 
 @router.get("/overview")
 def get_overview(
+    request: Request,
     session: SessionDep,
     now: NowDep,
     settings: SettingsDep,
@@ -624,7 +625,11 @@ def get_overview(
     customer: str | None = None,
     days: Annotated[int, Query(ge=1, le=60)] = 7,
 ) -> dict[str, Any]:
-    """Counts, open to-dos, past-due pickups and the next days' pickups."""
+    """Counts, open to-dos, past-due pickups and the next days' pickups.
+
+    ``scan`` is when this server last checked Transport Pro for new pickups and whether that
+    worked (``serve --scan-every``); None when it does not check on its own.
+    """
     cases = [
         c
         for c in _visible(session, viewer, settings)
@@ -633,6 +638,7 @@ def get_overview(
     data = overview(cases, now=now, days=days)
     data["mail"] = [mail_view(m) for m in open_unmatched(session) if _sees_mail(viewer, m)]
     data["counts"]["unmatched_mail"] = len(data["mail"])
+    data["scan"] = getattr(request.app.state, "scan", None)
     return data
 
 

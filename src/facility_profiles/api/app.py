@@ -13,7 +13,7 @@ api/access.py); without them there is no login, so the board must stay on this m
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
@@ -35,6 +35,7 @@ from facility_profiles.api import access as access_api
 from facility_profiles.api import auth as auth_api
 from facility_profiles.api import booking as booking_api
 from facility_profiles.api import links as links_api
+from facility_profiles.booking.service import ScanStats, scan
 from facility_profiles.booking.timers import sweep
 from facility_profiles.config import Settings, get_settings
 from facility_profiles.logging import get_logger
@@ -144,26 +145,68 @@ def run_autopilot(sessions: sessionmaker[Session], settings: Settings) -> None:
     log.info("booking.autopilot", **report.counts())
 
 
-async def _autopilot_loop(
-    sessions: sessionmaker[Session], minutes: float, settings: Settings
-) -> None:
-    """Run the agent's pass now and then every ``minutes``; a failed pass is logged, not fatal."""
+def run_scan(
+    sessions: sessionmaker[Session],
+    settings: Settings,
+    scope: tuple[list[int], list[int]],
+    client: Any = None,
+) -> ScanStats:
+    """One scan of Transport Pro (booking/service.py ``scan``); it only reads Transport Pro.
+
+    New pickups come onto the board and the board's pickups are kept in step with their loads.
+    ``scope`` is the terminals and Transport Pro customer ids, as ``serve --scan-customer`` (or
+    FP_CUSTOMERS) chose them.
+    """
+    from facility_profiles.tpro.client import TransportProClient  # noqa: PLC0415 - optional loop
+
+    terminals, customer_ids = scope
+    if client is None:
+        with TransportProClient.from_settings(settings) as tpro:
+            return run_scan(sessions, settings, scope, tpro)
+    stats = scan(client, sessions, settings, terminal_ids=terminals, customer_ids=customer_ids)
+    log.info("booking.scan", **{k: v for k, v in stats.__dict__.items() if k != "case_ids"})
+    return stats
+
+
+async def _every(minutes: float, name: str, job: Callable[[], object]) -> None:
+    """Run ``job`` now and then every ``minutes``; a failed pass is logged, not fatal."""
     while True:
         try:
-            await run_in_threadpool(run_autopilot, sessions, settings)
+            await run_in_threadpool(job)
         except Exception:  # keep the board serving; the next pass retries
-            log.exception("booking.autopilot_failed")
+            log.exception(f"booking.{name}_failed")
         await asyncio.sleep(minutes * 60)
 
 
-async def _timer_loop(sessions: sessionmaker[Session], minutes: float, settings: Settings) -> None:
-    """Run the timers now and then every ``minutes``; a failed pass is logged, not fatal."""
-    while True:
+def _scan_job(
+    app: FastAPI,
+    sessions: sessionmaker[Session],
+    settings: Settings,
+    minutes: float,
+    scope: tuple[list[int], list[int]],
+) -> Callable[[], object]:
+    """One scan, remembered on ``app.state.scan`` for the board.
+
+    The board shows when Transport Pro was last checked and what came of it, or that the check
+    failed; why it failed goes to the log only.
+    """
+
+    def job() -> None:
+        at = datetime.now(tz=UTC).isoformat()
         try:
-            await run_in_threadpool(run_timers, sessions, settings)
-        except Exception:  # keep the board serving; the next pass retries
-            log.exception("booking.timers_failed")
-        await asyncio.sleep(minutes * 60)
+            stats = run_scan(sessions, settings, scope)
+        except Exception:
+            app.state.scan = {"every": minutes, "at": at, "ok": False}
+            raise
+        app.state.scan = {
+            "every": minutes,
+            "at": at,
+            "ok": True,
+            "loads": stats.loads,
+            "created": stats.created,
+        }
+
+    return job
 
 
 def create_app(
@@ -171,11 +214,15 @@ def create_app(
     *,
     timers_every: float | None = None,
     autopilot_every: float | None = None,
+    scan_every: float | None = None,
+    scan_scope: tuple[list[int], list[int]] = ([], []),
 ) -> FastAPI:
     """Build the application.
 
     With ``timers_every`` (minutes) it also runs the booking timers; with ``autopilot_every``,
-    the agent's own pass by each customer's rules (off unless asked for).
+    the agent's own pass by each customer's rules; with ``scan_every``, a scan of Transport Pro
+    for new pickups over ``scan_scope`` (terminals, customer ids). The last two are off unless
+    asked for.
     """
     settings = settings or get_settings()
     if signin_enabled(settings) and not settings.board_admins:
@@ -191,12 +238,17 @@ def create_app(
         secret = session_secret(session, settings) if signin_enabled(settings) else b""
 
     @asynccontextmanager
-    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        tasks = []
-        if timers_every:
-            tasks.append(asyncio.create_task(_timer_loop(sessions, timers_every, settings)))
-        if autopilot_every:
-            tasks.append(asyncio.create_task(_autopilot_loop(sessions, autopilot_every, settings)))
+    async def lifespan(app_: FastAPI) -> AsyncIterator[None]:
+        loops: list[tuple[float | None, str, Callable[[], object]]] = [
+            (timers_every, "timers", lambda: run_timers(sessions, settings)),
+            (autopilot_every, "autopilot", lambda: run_autopilot(sessions, settings)),
+        ]
+        if scan_every:
+            scanning = _scan_job(app_, sessions, settings, scan_every, scan_scope)
+            loops.insert(0, (scan_every, "scan", scanning))
+        tasks = [
+            asyncio.create_task(_every(every, name, job)) for every, name, job in loops if every
+        ]
         yield
         for task in tasks:
             task.cancel()
@@ -218,6 +270,8 @@ def create_app(
     app.state.sessions = sessions
     app.state.settings = settings
     app.state.session_secret = secret
+    # The scan's last pass, for the board (None: this server does not scan Transport Pro).
+    app.state.scan = {"every": scan_every, "at": None, "ok": None} if scan_every else None
     if signin_enabled(settings):
 
         @app.middleware("http")

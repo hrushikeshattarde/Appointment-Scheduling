@@ -166,8 +166,8 @@ This needs the Google client in `.env` (README, "Who sees which customer"), with
 ## Do not run while testing
 
 - `booking send`: it emails vendors. It is refused anyway while `FP_BOOKING_MODE` is `draft`.
-- `booking scan` and `booking inbox`: they read live Transport Pro and the mailbox, and the inbox
-  pays for model calls. Section 4 tests the same logic on a copy.
+- `booking scan`, `serve --scan-every` and `booking inbox`: they read live Transport Pro and the
+  mailbox, and the inbox pays for model calls. Section 4 tests the same logic on a copy.
 - `profile portals --apply`, `scripts/seed_lidl_*.py` or any command without a test store: they
   write to the real stores.
 - `booking run` without `--dry-run`, or `serve --autopilot-every`, on a real store: they write

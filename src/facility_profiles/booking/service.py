@@ -15,7 +15,7 @@ import math
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -398,12 +398,27 @@ def scan(  # noqa: PLR0912 - one branch per kind of load
     stats = ScanStats()
     resolver = FacilityResolver([])
     known = customers(settings)
+    # Transport Pro first, the store after: the store is held only for the short work here, not
+    # while Transport Pro answers, so the board and the timers are not kept waiting on a scan.
+    loads = list(
+        iter_terminal_loads(
+            client, terminal_ids=terminals, customer_ids=billed_to, start=start, end=end
+        )
+    )
+    canceled = list(
+        iter_terminal_loads(
+            client,
+            terminal_ids=terminals,
+            customer_ids=billed_to,
+            start=start,
+            end=end,
+            extra_filters={"load_status": CANCELED_STATUS},
+        )
+    )
     with session_scope(sessions) as session:
         repo = Repository(session)
         seen_loads: set[int] = set()
-        for load in iter_terminal_loads(
-            client, terminal_ids=terminals, customer_ids=billed_to, start=start, end=end
-        ):
+        for load in loads:
             stats.loads += 1
             seen_loads.add(load.id)
             found = pickup_waypoint(load)
@@ -517,18 +532,7 @@ def scan(  # noqa: PLR0912 - one branch per kind of load
                 stats.already_booked += 1
             elif blocker is not None:
                 stats.needs_profile += 1
-        _canceled_pass(
-            client,
-            session,
-            settings,
-            terminals=terminals,
-            billed_to=billed_to,
-            start=start,
-            end=end,
-            skip=seen_loads,
-            now=now,
-            stats=stats,
-        )
+        _canceled_pass(session, settings, canceled, skip=seen_loads, now=now, stats=stats)
     return stats
 
 
@@ -542,14 +546,10 @@ def _case_for_stop(session: Session, load_id: int, index: int) -> BookingCase | 
 
 
 def _canceled_pass(
-    client: TransportProClient,
     session: Session,
     settings: Settings,
+    loads: list[Load],
     *,
-    terminals: list[int | None],
-    billed_to: list[int | None],
-    start: date,
-    end: date,
     skip: set[int],
     now: datetime,
     stats: ScanStats,
@@ -559,14 +559,7 @@ def _canceled_pass(
     Transport Pro only returns canceled loads when asked for them (:data:`CANCELED_STATUS`).
     """
     known = customers(settings)
-    for load in iter_terminal_loads(
-        client,
-        terminal_ids=terminals,
-        customer_ids=billed_to,
-        start=start,
-        end=end,
-        extra_filters={"load_status": CANCELED_STATUS},
-    ):
+    for load in loads:
         if load.id in skip or not load_canceled(load):
             continue
         found = pickup_waypoint(load)

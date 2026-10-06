@@ -180,6 +180,12 @@ function fmtInstant(iso) {
   return `${text} ET`;
 }
 
+// An instant's time of day on the Eastern clock: "08:30 ET".
+function clock(iso) {
+  const text = new Date(iso).toLocaleTimeString("en-US", { timeZone: EASTERN, hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+  return `${text} ET`;
+}
+
 // The Eastern clock now: its calendar day as a local Date at midnight, and its hour.
 function easternNow() {
   const parts = Object.fromEntries(
@@ -441,12 +447,16 @@ async function renderOverview() {
     );
   const whose = state.customer || (state.viewer.admin ? "All customers" : "Your customers");
   const today = new Date().toLocaleDateString("en-US", { timeZone: EASTERN, weekday: "long", month: "long", day: "numeric" });
+  const scan = data.scan;
+  let checked = null;
+  if (scan && scan.ok) checked = `New loads checked in Transport Pro at ${clock(scan.at)}`;
+  else if (scan && scan.ok === null) checked = "Checking Transport Pro for new loads…";
   view.replaceChildren(
     ...show(
       h(
         "div",
         { class: "page-head" },
-        h("div", {}, h("h1", {}, greeting()), h("p", { class: "sub" }, `${today} · ${whose}`)),
+        h("div", {}, h("h1", {}, greeting()), h("p", { class: "sub" }, [today, whose, checked].filter(Boolean).join(" · "))),
         h(
           "div",
           { class: "acts" },
@@ -457,6 +467,15 @@ async function renderOverview() {
           ),
         ),
       ),
+      scan && scan.ok === false
+        ? h(
+            "div",
+            { class: "notice alert", role: "alert" },
+            h("span", { class: "dot", "aria-hidden": "true" }),
+            `Could not check Transport Pro for new loads at ${clock(scan.at)}, so new pickups may be missing. ` +
+              `It tries again every ${plural(scan.every, "minute")}; the reason is in the server's log.`,
+          )
+        : null,
       summary ? summaryBox(summary) : null,
       h(
         "section",

@@ -66,7 +66,7 @@ MCP server, so the existing file can be reused. Never commit `.env`.
 | `facility-profiles export-xlsx [--out file.xlsx] [--facility F ...]` | Reviewer workbook: a Review Queue sheet with Decision (accept/edit/reject), Corrected value and Reviewer columns, plus Profile Fields, Scheduling Summaries, Facilities, Audit Log and Runs sheets. `--facility` (repeatable) restricts every sheet to those facilities, for a focused hand-off. |
 | `facility-profiles review import file.xlsx [--by NAME] [--dry-run]` | Reads the filled-in Review Queue sheet and applies each decision as a human-set value; rows with a blank Decision are skipped and problems are listed per row. |
 | `facility-profiles digest [--out file.md]` | Markdown digest for the pod lead: what the run did, what needs a decision (FR-13). |
-| `facility-profiles serve [--db URL] [--port 8000] [--timers-every 15]` | The appointments board at `/app/` (see below) plus the lookup and review HTTP API (`/facilities/{id}`, `/facilities?name=`, `/review`, `/digest`) and the board's API under `/api/booking`. Needs the `api` extra. `uvicorn facility_profiles.api.app:create_app --factory` serves the same app. |
+| `facility-profiles serve [--db URL] [--port 8000] [--timers-every 15] [--scan-every 30 --scan-customer lidl]` | The appointments board at `/app/` (see below) plus the lookup and review HTTP API (`/facilities/{id}`, `/facilities?name=`, `/review`, `/digest`) and the board's API under `/api/booking`. Needs the `api` extra. `uvicorn facility_profiles.api.app:create_app --factory` serves the same app. |
 
 Run modes: `FP_MODE=recommend` (default; qualifying fields are stored as recommendations and
 audited as `recommend`) or `FP_MODE=write`. Switching back to `recommend` is the kill switch
@@ -348,6 +348,21 @@ confirmation waiting for approval. `close` cancels a case and resolves everythin
 schedules the case. Stores written before this split are moved onto the new statuses the next
 time any command opens them, each parked case getting the exception its old status implied and a
 `status_migrated` event.
+
+### New loads on their own
+
+`booking scan` puts the coming pickups on the board once. With `serve --scan-every 30
+--scan-customer lidl` the board does it itself: every 30 minutes it reads Transport Pro (only
+reads) for the customer's pickups in the next `FP_BOOKING_DAYS_AHEAD` days, adds the new ones and
+keeps the others in step with their loads (canceled, booked in Transport Pro, delivery moved).
+Without `--scan-customer` it scans the customers in `FP_CUSTOMERS`, else the pods in
+`FP_PILOT_TERMINAL_IDS`; with neither it refuses to start, as it would take every load in
+Transport Pro. It is off unless asked for.
+
+Today on the board says when Transport Pro was last checked. When a check fails (Transport Pro
+down, the password changed) the page says so in red, the board keeps working on what it has, the
+reason goes to the server's log, and the next check tries again. The scan reads everything from
+Transport Pro before it writes to the store, so the board is never kept waiting on Transport Pro.
 
 ### Timers and the daily summary
 
