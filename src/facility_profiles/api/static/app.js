@@ -1,12 +1,14 @@
 // Pickup appointments board, written for the account managers who follow their customers'
-// pickups. Home says what needs a person and what is coming; All pickups is the full list; the
-// Calendar shows the week; one pickup opens in a side panel that leads with what is happening
-// and what to do next. Admins also get the Access tab (/api/access).
+// pickups. Today says what needs a person and what is coming; All pickups is the full list; the
+// Calendar shows the week; one pickup opens in a side panel that says where it stands and what
+// to do. Admins also get the Access tab (/api/access).
 //
-// One colour per meaning on every page: green booked, blue asked the vendor, amber needs a
-// person, red missed, grey not started. Every value from the server is placed with text nodes
-// (vendor emails are untrusted text), never as HTML. With sign-in on, the server answers with
-// the signed-in person's customers only; what this page hides is for looks, the server refuses.
+// Kept plain on purpose. Every pickup sits in exactly one group (Needs you, Not asked yet, Asked
+// vendor, Booked, Vendor declined, Canceled), so the numbers agree on every page, and the only
+// colour that means something is a red dot on what needs a person. Every value from the server is
+// placed with text nodes (vendor emails are untrusted text), never as HTML. With sign-in on, the
+// server answers with the signed-in person's customers only; what this page hides is for looks,
+// the server refuses.
 
 const API = "/api/booking";
 const view = document.getElementById("view");
@@ -22,16 +24,16 @@ const attentionCount = document.getElementById("attention-count");
 const customerSelect = document.getElementById("customer");
 const stampEl = document.getElementById("stamp");
 
-// Plain words for each status, and the colour (tone) that goes with it.
+// Plain words for each status; the steps a pickup goes through.
 const STATUS = {
-  unscheduled: "Not booked yet",
+  unscheduled: "Not asked yet",
   pending: "Asked vendor",
   scheduled: "Booked",
   declined: "Vendor declined",
   canceled: "Canceled",
 };
-const STATUS_TONE = { unscheduled: "idle", pending: "asked", scheduled: "booked", declined: "late", canceled: "gone" };
-const STEP_NAMES = { unscheduled: "Not asked yet", pending: "Asked the vendor", scheduled: "Booked" };
+const GROUPS = { attention: "Needs you", ...STATUS };
+const STEPS = ["unscheduled", "pending", "scheduled"];
 const SOURCE = { requested: "the time we asked for", confirmed: "confirmed by the vendor" };
 const MESSAGE_KINDS = {
   request: "Booking request",
@@ -47,11 +49,11 @@ const MESSAGE_KINDS = {
   customer_desk: "From the customer",
 };
 const READING = {
-  confirmed: ["t-booked", "Vendor confirmed"],
-  counter_offer: ["t-todo", "Vendor offered another time"],
-  question: ["t-todo", "Vendor asked a question"],
-  rejected: ["t-late", "Vendor said no"],
-  deferred: ["t-asked", "Vendor will answer later"],
+  confirmed: "Vendor confirmed",
+  counter_offer: "Vendor offered another time",
+  question: "Vendor asked a question",
+  rejected: "Vendor said no",
+  deferred: "Vendor will answer later",
 };
 // What the agent is doing on its own, in plain words.
 const JOB = {
@@ -71,20 +73,9 @@ const LEVELS = { act: "View and act", view: "View", none: "No access" };
 
 // Simple line icons (24 x 24, drawn with strokes); "|" separates paths.
 const ICONS = {
-  home: "M3 11l9-8 9 8|M5 10v10h5v-6h4v6h5V10",
-  list: "M9 6h12|M9 12h12|M9 18h12|M4 6h.01|M4 12h.01|M4 18h.01",
-  calendar: "M4 6h16v15H4z|M4 10h16|M8 3v5|M16 3v5",
-  users: "M16 20v-2a4 4 0 0 0-4-4H7a4 4 0 0 0-4 4v2|M9.5 10a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7|M21 20v-2a4 4 0 0 0-3-3.8|M15.5 3.2a3.5 3.5 0 0 1 0 6.6",
-  alert: "M12 3l9.5 17h-19z|M12 10v4|M12 17h.01",
-  missed: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18z|M9 9l6 6|M15 9l-6 6",
-  inbox: "M4 5h16v14H4z|M4 13h4l2 3h4l2-3h4",
-  clock: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18z|M12 7v5l3 2",
   check: "M5 12.5l4.5 4.5L19 7.5",
   info: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18z|M12 16v-5|M12 8h.01",
   search: "M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14z|M20 20l-4-4",
-  mail: "M4 6h16v12H4z|M4 7l8 6 8-6",
-  arrow: "M5 12h14|M13 6l6 6-6 6",
-  filter: "M4 5h16l-6 7v6l-4 2v-8z",
 };
 
 // ------------------------------------------------------------------ small helpers
@@ -141,6 +132,7 @@ const cap = (text) => (text ? text[0].toUpperCase() + text.slice(1) : "");
 const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 const pos = (row) => (row.po_numbers && row.po_numbers.length ? row.po_numbers.join(", ") : "-");
 const show = (...parts) => parts.flat().filter(Boolean); // replaceChildren would print a null
+const sentence = (text) => (text ? cap(text).replace(/\.*$/, ".") : "");
 
 function debounce(fn, ms) {
   let timer;
@@ -166,11 +158,11 @@ function fmtSlot(local) {
   return `${p.weekday} ${pad(p.m)}/${pad(p.d)}${p.time ? ` ${p.time} ET` : ""}`;
 }
 
-// "Today", "Tomorrow", else "Wed 10/07".
+// "Today · Tue 10/06", "Tomorrow · Wed 10/07", else "Thu 10/08".
 function dayName(day) {
   const today = isoDay(startOfToday());
-  if (day === today) return "Today";
-  if (day === isoDay(addDays(startOfToday(), 1))) return "Tomorrow";
+  if (day === today) return `Today · ${fmtSlot(day)}`;
+  if (day === isoDay(addDays(startOfToday(), 1))) return `Tomorrow · ${fmtSlot(day)}`;
   return fmtSlot(day);
 }
 
@@ -281,42 +273,37 @@ function query(params) {
   return text ? `?${text}` : "";
 }
 
-// ------------------------------------------------------------------ meaning: colour and words
+// ------------------------------------------------------------------ where a pickup stands
 
-// The colour a pickup is shown in: red when its time passed unbooked, amber when it needs a
-// person, else its status's own.
-function tone(row) {
-  if (row.past_due) return "late";
-  if (row.open_exceptions && row.open_exceptions.length && row.status !== "canceled") return "todo";
-  return STATUS_TONE[row.status] || "idle";
+// A pickup needs a person when it has an open to-do, or its time passed and nobody booked it.
+const needsYou = (row) => row.status !== "canceled" && (row.past_due || row.open_exceptions.length > 0);
+const groupOf = (row) => (needsYou(row) ? "attention" : row.status);
+
+// Earliest pickup first; pickups with no date yet last.
+const byPickup = (a, b) =>
+  (a.pickup_local ? 0 : 1) - (b.pickup_local ? 0 : 1) ||
+  (a.pickup_local || "").localeCompare(b.pickup_local || "") ||
+  a.id - b.id;
+
+// What the person has to do, in a few words: the first to-do, and how many more.
+function needText(row) {
+  const labels = row.open_exceptions.map((e) => e.label);
+  if (row.past_due && !row.open_exceptions.some((e) => e.kind === "pickup_expired")) {
+    labels.unshift("Pickup time passed, not booked");
+  }
+  if (!labels.length) return "";
+  return labels.length > 1 ? `${labels[0]} (+${labels.length - 1} more)` : labels[0];
 }
 
-const statusPill = (status) => h("span", { class: `pill t-${STATUS_TONE[status] || "idle"}` }, STATUS[status] || cap(status));
+const statusText = (status) =>
+  h("span", { class: "status" }, status === "scheduled" ? icon("check", "sm") : null, STATUS[status] || cap(status));
 
-function flags(row) {
-  const items = [
-    row.past_due ? h("span", { class: "pill t-late" }, "Missed") : null,
-    row.draft_ready ? h("span", { class: "pill t-idle" }, "Email ready to send") : null,
-    ...row.open_exceptions.map((e) => h("span", { class: "pill t-todo", title: cap(e.description) }, e.label)),
-  ].filter(Boolean);
-  return items.length ? h("span", { class: "chips" }, items) : h("span", { class: "muted", "aria-label": "Nothing" }, "-");
-}
-
-function legend() {
-  return h(
-    "div",
-    { class: "legend", "aria-label": "What the colours mean" },
-    h("span", { class: "pill t-booked" }, "Booked"),
-    h("span", { class: "pill t-asked" }, "Asked vendor"),
-    h("span", { class: "pill t-todo" }, "Needs your attention"),
-    h("span", { class: "pill t-late" }, "Missed"),
-    h("span", { class: "pill t-idle" }, "Not booked yet"),
-  );
-}
+// The status, and under it, with the red dot, what the person has to do (when anything).
+const statusCell = (row) => [statusText(row.status), needsYou(row) ? h("div", { class: "need" }, needText(row)) : null];
 
 // ------------------------------------------------------------------ state and routing
 
-const defaultFilters = () => ({ status: "", attention: false, exception: "", q: "", start: "", end: "", pastDue: false });
+const defaultFilters = () => ({ group: "", exception: "", q: "", start: "", end: "" });
 
 const state = {
   tab: "overview",
@@ -331,7 +318,6 @@ const state = {
   references: [],
   refocus: null,
   summaryOpen: false,
-  howto: load("fp.howto", "shown") !== "hidden",
   viewer: { signed_in: false, admin: true, customers: [] }, // until /api/me answers
 };
 
@@ -359,7 +345,7 @@ async function route() {
 
 function showList(filter) {
   state.filters = { ...defaultFilters(), ...filter };
-  state.moreFilters = Boolean(filter.exception || filter.start || filter.end || filter.pastDue);
+  state.moreFilters = Boolean(filter.exception || filter.start || filter.end);
   if (state.tab === "appointments") renderTab();
   else go("appointments");
 }
@@ -370,16 +356,16 @@ function setFilter(patch, refocus = null) {
   renderTab();
 }
 
-// The number on Home in the top bar: pickups that need a person, on every page.
+// The red number next to Today: pickups that need a person, shown on every page.
 function showAttention(n) {
   attentionCount.textContent = n ? String(n) : "";
   attentionCount.hidden = !n;
-  attentionCount.title = n ? `${plural(n, "pickup")} need your attention` : "";
+  attentionCount.title = n ? `${plural(n, "pickup")} need you` : "";
 }
 
 async function refreshAttention() {
   try {
-    showAttention((await api(`/overview${query({ customer: state.customer })}`)).counts.needs_action);
+    showAttention((await api(`/cases${query({ customer: state.customer })}`)).filter(needsYou).length);
   } catch {
     /* the badge is a convenience; the page itself says what failed */
   }
@@ -399,7 +385,7 @@ async function renderTab() {
     view.replaceChildren(
       h(
         "section",
-        { class: "panel" },
+        { class: "box" },
         h("div", { class: "error" }, `The board could not load: ${err.message}`),
         h("div", { class: "empty" }, h("button", { class: "btn", type: "button", onclick: renderTab }, "Try again")),
       ),
@@ -409,30 +395,18 @@ async function renderTab() {
 
 // ------------------------------------------------------------------ shared pieces
 
-function panel(title, count, children, hint = null) {
+function box(title, count, children, hint = null) {
   return h(
     "section",
-    { class: "panel" },
-    h("header", {}, h("h2", {}, title), hint ? h("span", { class: "hint" }, hint) : null, count !== "" ? h("span", { class: "count" }, count) : null),
-    h("div", { class: "body" }, children),
+    { class: "box" },
+    h("header", {}, h("h2", {}, title), count !== null ? h("span", { class: "n" }, count) : null, hint ? h("span", { class: "hint" }, hint) : null),
+    h("div", {}, children),
   );
 }
 
 const empty = (text, good = false) => h("div", { class: "empty" }, good ? icon("check") : null, text);
 
-function caseRow(row, meta = null) {
-  const t = tone(row);
-  return h(
-    "button",
-    { class: `row ${t}`, type: "button", onclick: () => go(state.tab, row.id) },
-    h("span", { class: "bar", "aria-hidden": "true" }),
-    h("span", { class: "title" }, row.vendor || "Unknown vendor", statusPill(row.status)),
-    h("span", { class: "when" }, fmtSlot(row.pickup_local)),
-    h("span", { class: "meta" }, meta || `${row.stage} · PO ${pos(row)}`),
-  );
-}
-
-// ------------------------------------------------------------------ home
+// ------------------------------------------------------------------ today
 
 function greeting() {
   const first = (state.viewer.name || "").trim().split(/\s+/)[0];
@@ -441,47 +415,28 @@ function greeting() {
   return `Good ${hour < 12 ? "morning" : hour < 17 ? "afternoon" : "evening"}, ${first}`;
 }
 
-function howto() {
-  const step = (n, title, text) => h("div", { class: "step" }, h("span", { class: "num" }, String(n)), h("div", {}, h("b", {}, title), h("span", {}, text)));
-  return h(
-    "section",
-    { class: "howto", "aria-label": "How booking works" },
-    step(1, "We ask the vendor", "The agent emails the vendor's booking desk for a pickup time."),
-    step(2, "The vendor answers", "By replying, or by clicking a time in our email."),
-    step(3, "You check it", "Anything only a person can decide shows under Needs your attention."),
-    step(4, "Booked", "The pickup time is set. Green means done."),
-    h(
-      "button",
-      {
-        class: "btn small close",
-        type: "button",
-        onclick: () => {
-          state.howto = false;
-          save("fp.howto", "hidden");
-          renderTab();
-        },
-      },
-      "Got it",
-    ),
-  );
-}
-
 async function renderOverview() {
   const scope = query({ customer: state.customer });
-  const [data, summary] = await Promise.all([
+  const [data, all, summary] = await Promise.all([
     api(`/overview${scope}`),
+    api(`/cases${scope}`),
     state.summaryOpen ? api(`/today${scope}`) : null,
   ]);
+  const live = all.filter((r) => r.status !== "canceled");
+  const attention = live.filter(needsYou).sort(byPickup);
+  const inGroup = (g) => live.filter((r) => groupOf(r) === g);
+  const drafts = inGroup("unscheduled").filter((r) => r.draft_ready).length;
+  const bookedSoon = data.upcoming.filter((r) => groupOf(r) === "scheduled").length;
+  const several = new Set(all.map((r) => r.customer)).size > 1;
   const mail = data.mail || [];
-  const pickups = mail.length ? (await api(`/cases${scope}`)).filter((r) => r.status !== "canceled") : [];
-  const c = data.counts;
-  showAttention(c.needs_action);
-  const tile = (key, iconName, label, sub, filter, t) =>
+  showAttention(attention.length);
+
+  const stat = (g, n, sub) =>
     h(
       "button",
-      { class: `tile ${t}${c[key] ? "" : " zero"}`, type: "button", onclick: () => showList(filter) },
-      h("div", { class: "top" }, label, icon(iconName)),
-      h("div", { class: "value" }, c[key]),
+      { class: `stat${n ? (g === "attention" ? " alert" : "") : " zero"}`, type: "button", onclick: () => showList({ group: g }) },
+      h("div", { class: "label" }, GROUPS[g]),
+      h("div", { class: "num" }, n),
       h("div", { class: "sub" }, sub),
     );
   const whose = state.customer || (state.viewer.admin ? "All customers" : "Your customers");
@@ -495,81 +450,84 @@ async function renderOverview() {
         h(
           "div",
           { class: "acts" },
-          state.howto
-            ? null
-            : h(
-                "button",
-                {
-                  class: "btn ghost",
-                  type: "button",
-                  onclick: () => {
-                    state.howto = true;
-                    save("fp.howto", "shown");
-                    renderTab();
-                  },
-                },
-                icon("info"),
-                "How booking works",
-              ),
           h(
             "button",
             { class: "btn", type: "button", "aria-expanded": String(state.summaryOpen), onclick: toggleSummary },
-            icon("mail"),
-            state.summaryOpen ? "Hide daily summary" : "Daily summary to share",
+            state.summaryOpen ? "Hide daily summary" : "Daily summary",
           ),
         ),
       ),
-      state.howto ? howto() : null,
-      summary ? summaryPanel(summary) : null,
+      summary ? summaryBox(summary) : null,
       h(
         "section",
-        { class: "tiles", "aria-label": "Totals" },
-        tile("needs_action", "alert", "Needs your attention", "Pickups only a person can decide", { attention: true }, "todo"),
-        tile("past_due", "missed", "Missed pickups", "Pickup time passed, not booked", { pastDue: true }, "late"),
-        tile("not_requested", "inbox", "Not asked yet", `${plural(c.drafts_waiting, "email")} ready to send`, { status: "unscheduled" }, "idle"),
-        tile("waiting_on_vendor", "clock", "Waiting on vendor", "We asked, no answer yet", { status: "pending" }, "asked"),
-        tile("booked_upcoming", "check", "Booked", `Next ${data.days} days · ${c.booked} in all`, { status: "scheduled" }, "booked"),
+        { class: "stats", "aria-label": "Totals" },
+        stat("attention", attention.length, "Only a person can decide"),
+        stat("unscheduled", inGroup("unscheduled").length, drafts ? `${plural(drafts, "email")} ready to send` : "Request not sent yet"),
+        stat("pending", inGroup("pending").length, "Waiting for their answer"),
+        stat("scheduled", inGroup("scheduled").length, `${bookedSoon} in the next ${data.days} days`),
       ),
       h(
         "div",
-        { class: "grid2" },
-        panel(
-          "Needs your attention",
-          plural(data.todos.length, "to-do"),
-          data.todos.length ? data.todos.map(todoRow) : empty("Nothing needs you right now.", true),
-          data.todos.length ? "Open one to see what to do" : null,
+        { class: "cols" },
+        box(
+          "Needs you",
+          attention.length,
+          attention.length ? attention.map((r) => attentionRow(r, several)) : empty("Nothing needs you right now.", true),
+          attention.length ? "Open one to see what to do" : null,
         ),
-        panel(
+        box(
           `Coming up, next ${data.days} days`,
-          String(data.upcoming.length),
-          data.upcoming.length ? byDay(data.upcoming) : empty("No pickups in the next days."),
+          data.upcoming.length,
+          data.upcoming.length ? upcomingList(data.upcoming) : empty("No pickups in the next days."),
+          "Times are Eastern (ET)",
         ),
       ),
-      mail.length ? mailPanel(mail, pickups) : null,
-      h(
-        "div",
-        { class: "grid2" },
-        panel(
-          "Missed pickups",
-          String(data.past_due.length),
-          data.past_due.length ? data.past_due.map((r) => caseRow(r)) : empty("No pickup has been missed.", true),
-          data.past_due.length ? "The time passed and nobody booked it" : null,
-        ),
-        panel("What the to-dos are about", "", data.todos_by_kind.length ? bars(data.todos_by_kind) : empty("No open to-dos.", true)),
-      ),
+      mail.length ? mailBox(mail, live) : null,
+      helpBox(),
     ),
   );
 }
 
+function attentionRow(row, several) {
+  return h(
+    "button",
+    { class: "item", type: "button", onclick: () => go(state.tab, row.id) },
+    h("span", { class: "dot", "aria-hidden": "true" }),
+    h("span", { class: "name" }, row.vendor || "Unknown vendor"),
+    h("span", { class: "when" }, fmtSlot(row.pickup_local)),
+    h("span", { class: "what" }, [needText(row), `PO ${pos(row)}`, several ? row.customer : null].filter(Boolean).join(" · ")),
+    h("span", { class: "go" }, "Open"),
+  );
+}
+
+function upcomingList(rows) {
+  const out = [];
+  let last = null;
+  for (const row of rows) {
+    if (row.pickup_date !== last) {
+      last = row.pickup_date;
+      out.push(h("div", { class: "day-head" }, dayName(row.pickup_date)));
+    }
+    out.push(
+      h(
+        "button",
+        { class: "up", type: "button", onclick: () => go(state.tab, row.id) },
+        h("span", { class: "time" }, parseLocal(row.pickup_local)?.time || "Any time"),
+        h("span", { class: "name" }, row.vendor || "Unknown vendor"),
+        needsYou(row)
+          ? h("span", { class: "state alert" }, h("span", { class: "dot", "aria-hidden": "true" }), "Needs you")
+          : h("span", { class: "state" }, statusText(row.status)),
+        h("span", { class: "po" }, `PO ${pos(row)}`),
+      ),
+    );
+  }
+  return out;
+}
+
 // Emails the agent could not tie to any pickup: kept so none is lost. A person links each to its
 // pickup (the agent then reads it as that pickup's reply) or dismisses it.
-function mailPanel(items, pickups) {
-  return panel(
-    "Emails no pickup matched",
-    plural(items.length, "email"),
-    items.map((m) => mailItem(m, pickups)),
-    "Link each to its pickup, or dismiss it",
-  );
+function mailBox(items, pickups) {
+  return box("Emails we could not match", items.length, items.map((m) => mailItem(m, pickups)), "Link each to its pickup, or dismiss it");
 }
 
 function mailItem(m, pickups) {
@@ -620,13 +578,13 @@ function mailItem(m, pickups) {
       { class: "acts" },
       choose,
       h("button", { class: "btn small primary", type: "button", onclick: link }, "Link to pickup"),
-      h("button", { class: "btn small ghost", type: "button", onclick: dismiss }, "Dismiss"),
+      h("button", { class: "btn small link", type: "button", onclick: dismiss }, "Dismiss"),
     ),
   );
 }
 
 // The morning summary as text, ready to paste into an email or a chat.
-function summaryPanel(summary) {
+function summaryBox(summary) {
   const copy = async () => {
     try {
       await navigator.clipboard.writeText(summary.text);
@@ -637,7 +595,7 @@ function summaryPanel(summary) {
   };
   return h(
     "section",
-    { class: "panel summary", "aria-label": "Daily summary" },
+    { class: "box summary", "aria-label": "Daily summary" },
     h(
       "header",
       {},
@@ -653,51 +611,19 @@ function toggleSummary() {
   renderTab();
 }
 
-function todoRow(todo) {
-  const c = todo.case;
+function helpBox() {
+  const step = (title, text) => h("li", {}, h("b", {}, title), ` ${text}`);
   return h(
-    "button",
-    { class: `row ${c.past_due ? "late" : "todo"}`, type: "button", onclick: () => go(state.tab, c.id) },
-    h("span", { class: "bar", "aria-hidden": "true" }),
-    h("span", { class: "title" }, c.vendor || "Unknown vendor", h("span", { class: "pill t-todo" }, todo.label)),
-    h("span", { class: "go" }, "Open ", icon("arrow", "sm")),
-    h("span", { class: "meta" }, `${cap(todo.description)} · Pickup ${fmtSlot(c.pickup_local)} · PO ${pos(c)} · raised ${ago(todo.raised_at)}`),
-  );
-}
-
-function byDay(rows) {
-  const out = [];
-  let last = null;
-  const today = isoDay(startOfToday());
-  for (const row of rows) {
-    if (row.pickup_date !== last) {
-      last = row.pickup_date;
-      out.push(h("div", { class: `day-head${row.pickup_date === today ? " today" : ""}` }, dayName(row.pickup_date)));
-    }
-    const at = parseLocal(row.pickup_local)?.time;
-    const time = at ? `${at} ET` : "Any time";
-    out.push(caseRow(row, `${time} · ${row.stage} · PO ${pos(row)}`));
-  }
-  return out;
-}
-
-function bars(items) {
-  const max = Math.max(...items.map((i) => i.count));
-  return h(
-    "div",
-    { class: "bars" },
-    items.map((item) =>
-      h(
-        "button",
-        { class: "bar-row", type: "button", onclick: () => showList({ exception: item.kind }) },
-        h("span", {}, item.label),
-        h(
-          "span",
-          { class: "track", "aria-hidden": "true" },
-          h("span", { class: "fill", style: `width:${Math.max(6, Math.round((100 * item.count) / max))}%` }),
-        ),
-        h("span", { class: "n" }, item.count),
-      ),
+    "details",
+    { class: "section help" },
+    h("summary", {}, "How booking works"),
+    h(
+      "ol",
+      {},
+      step("We ask the vendor.", "The agent emails the vendor's booking desk for a pickup time."),
+      step("The vendor answers.", "By replying, or by clicking a time in our email."),
+      step("You check it.", "Anything only a person can decide shows under Needs you, with a red dot."),
+      step("Booked.", "The pickup time is set."),
     ),
   );
 }
@@ -707,41 +633,21 @@ function bars(items) {
 async function renderAppointments() {
   const f = state.filters;
   const all = await api(
-    `/cases${query({
-      customer: state.customer,
-      exception: f.exception,
-      q: f.q,
-      start: f.start,
-      end: f.end,
-      past_due: f.pastDue ? "true" : "",
-    })}`,
+    `/cases${query({ customer: state.customer, exception: f.exception, q: f.q, start: f.start, end: f.end })}`,
   );
-  const needs = (r) => r.open_exceptions.length > 0 && r.status !== "canceled";
-  const rows = all.filter((r) => (!f.status || r.status === f.status) && (!f.attention || needs(r)));
-  const tabs = [
-    ["all", "All", all.length, null],
-    ["attention", "Needs your attention", all.filter(needs).length, "var(--todo-line)"],
-    ...Object.entries(STATUS).map(([status, label]) => [
-      status,
-      label,
-      all.filter((r) => r.status === status).length,
-      `var(--${{ idle: "idle", asked: "asked", booked: "booked", late: "late", gone: "idle" }[STATUS_TONE[status]]}-line)`,
-    ]),
-  ];
-  const current = f.attention ? "attention" : f.status || "all";
-  const statusTabs = h(
+  const rows = all.filter((r) => !f.group || groupOf(r) === f.group);
+  const counts = Object.fromEntries(Object.keys(GROUPS).map((g) => [g, all.filter((r) => groupOf(r) === g).length]));
+  // Declined and Canceled are rare: their tab shows only when there is something in it.
+  const tabs = [["", "All", all.length], ...Object.entries(GROUPS).map(([g, label]) => [g, label, counts[g]])].filter(
+    ([g, , n]) => n || !["declined", "canceled"].includes(g) || f.group === g,
+  );
+  const groupTabs = h(
     "div",
-    { class: "status-tabs", role: "group", "aria-label": "Show" },
-    tabs.map(([key, label, n, colour]) =>
+    { class: "groups", role: "group", "aria-label": "Show" },
+    tabs.map(([g, label, n]) =>
       h(
         "button",
-        {
-          type: "button",
-          "aria-pressed": String(current === key),
-          onclick: () =>
-            setFilter({ status: ["all", "attention"].includes(key) ? "" : key, attention: key === "attention" }),
-        },
-        colour ? h("span", { class: "dot", style: `background:${colour}` }) : null,
+        { type: "button", class: g === "attention" && n ? "alert" : null, "aria-pressed": String(f.group === g), onclick: () => setFilter({ group: g }) },
         label,
         h("span", { class: "n" }, n),
       ),
@@ -757,35 +663,24 @@ async function renderAppointments() {
     "input",
     debounce(() => setFilter({ q: search.value }, "search"), 300),
   );
-  const filtered = Boolean(f.exception || f.start || f.end || f.pastDue || f.q || f.status || f.attention);
+  const filtered = Boolean(f.exception || f.start || f.end || f.q || f.group);
   const kindSelect = h(
     "select",
-    { "aria-label": "To-do", onchange: (e) => setFilter({ exception: e.target.value }) },
-    h("option", { value: "" }, "Any to-do or none"),
+    { "aria-label": "What is needed", onchange: (e) => setFilter({ exception: e.target.value }) },
+    h("option", { value: "" }, "Anything"),
     state.kinds.map((k) => h("option", { value: k.kind }, k.label)),
   );
   kindSelect.value = f.exception;
   const more = h(
     "div",
-    { class: "more-filters" },
-    h("label", {}, "To-do", kindSelect),
-    h(
-      "label",
-      {},
-      "Pickup from",
-      h("input", { type: "date", value: f.start, onchange: (e) => setFilter({ start: e.target.value }) }),
-    ),
+    { class: "filters" },
+    h("label", {}, "What is needed", kindSelect),
+    h("label", {}, "Pickup from", h("input", { type: "date", value: f.start, onchange: (e) => setFilter({ start: e.target.value }) })),
     h("label", {}, "to", h("input", { type: "date", value: f.end, onchange: (e) => setFilter({ end: e.target.value }) })),
-    h(
-      "label",
-      { class: "toggle" },
-      h("input", { type: "checkbox", checked: f.pastDue, onchange: (e) => setFilter({ pastDue: e.target.checked }) }),
-      "Missed pickups only",
-    ),
   );
   more.hidden = !state.moreFilters;
   const several = new Set(all.map((r) => r.customer)).size > 1;
-  const headers = ["Pickup", "Vendor", "Status", "Needs", "PO", "Pickup number", ...(several ? ["Customer"] : [])];
+  const headers = ["Pickup", "Vendor", "Status", "PO", "Pickup number", ...(several ? ["Customer"] : [])];
   const table = rows.length
     ? h(
         "div",
@@ -797,13 +692,12 @@ async function renderAppointments() {
           h("tbody", {}, rows.map((r) => tableRow(r, several))),
         ),
       )
-    : h("section", { class: "panel" }, empty(filtered ? "No pickups match. Try Clear to see them all." : "No pickups yet."));
+    : h("section", { class: "box" }, empty(filtered ? "No pickups match. Try Clear to see them all." : "No pickups yet."));
   view.replaceChildren(
     h(
       "div",
       { class: "page-head" },
-      h("div", {}, h("h1", {}, "All pickups"), h("p", { class: "sub" }, "Click a pickup to see what is happening and what to do.")),
-      legend(),
+      h("div", {}, h("h1", {}, "All pickups"), h("p", { class: "sub" }, "Click a pickup to see where it stands and what to do. Times are Eastern (ET).")),
     ),
     h(
       "div",
@@ -820,14 +714,12 @@ async function renderAppointments() {
             renderTab();
           },
         },
-        icon("filter"),
-        state.moreFilters ? "Fewer filters" : "More filters",
+        state.moreFilters ? "Hide filters" : "Filters",
       ),
-      filtered ? h("button", { class: "btn ghost", type: "button", onclick: () => setFilter(defaultFilters()) }, "Clear") : null,
+      filtered ? h("button", { class: "btn link", type: "button", onclick: () => setFilter(defaultFilters()) }, "Clear") : null,
     ),
     more,
-    statusTabs,
-    h("p", { class: "result-count" }, plural(rows.length, "pickup")),
+    groupTabs,
     table,
   );
   if (state.refocus === "search") {
@@ -842,7 +734,6 @@ function tableRow(row, several) {
   return h(
     "tr",
     {
-      class: tone(row),
       tabindex: "0",
       onclick: open,
       onkeydown: (e) => {
@@ -851,19 +742,12 @@ function tableRow(row, several) {
     },
     h(
       "td",
-      { class: "nowrap mono first" },
-      h("div", { class: `strong${row.past_due ? " late-text" : ""}` }, fmtSlot(row.pickup_local)),
+      { class: "nowrap mono", "data-label": "Pickup" },
+      h("span", { class: "strong" }, fmtSlot(row.pickup_local)),
       h("div", { class: "sub" }, cap(SOURCE[row.pickup_source] || row.pickup_source)),
     ),
-    h("td", {}, h("div", { class: "strong" }, row.vendor || "Unknown vendor"), h("div", { class: "sub" }, row.vendor_city || "")),
-    h(
-      "td",
-      {},
-      statusPill(row.status),
-      h("div", { class: "sub" }, row.stage),
-      row.last_activity ? h("div", { class: "sub" }, `Updated ${ago(row.last_activity)}`) : null,
-    ),
-    h("td", { "data-label": "Needs" }, flags(row)),
+    h("td", { "data-label": "Vendor" }, h("span", { class: "strong" }, row.vendor || "Unknown vendor"), h("div", { class: "sub" }, row.vendor_city || "")),
+    h("td", { "data-label": "Status" }, statusCell(row)),
     h("td", { class: "mono", "data-label": "PO" }, pos(row)),
     h("td", { class: "mono", "data-label": "Pickup #" }, row.pickup_number || h("span", { class: "muted" }, "-")),
     several ? h("td", { "data-label": "Customer" }, row.customer || "") : null,
@@ -887,22 +771,30 @@ async function renderWeek() {
     h(
       "div",
       { class: "week-head" },
-      h("div", {}, h("h1", {}, "Calendar"), h("p", { class: "sub muted" }, `Week of ${fmtSlot(isoDay(start))} · ${plural(rows.length, "pickup")}`)),
-      h("button", { class: "btn small", type: "button", onclick: () => shift(-7) }, "← Previous week"),
       h(
-        "button",
-        {
-          class: "btn small",
-          type: "button",
-          onclick: () => {
-            state.weekStart = mondayOf(startOfToday());
-            renderTab();
-          },
-        },
-        "This week",
+        "div",
+        {},
+        h("h1", {}, "Calendar"),
+        h("p", { class: "sub" }, `Week of ${fmtSlot(isoDay(start))} · ${plural(rows.length, "pickup")} · times are Eastern (ET)`),
       ),
-      h("button", { class: "btn small", type: "button", onclick: () => shift(7) }, "Next week →"),
-      legend(),
+      h(
+        "div",
+        { class: "nav" },
+        h("button", { class: "btn small", type: "button", onclick: () => shift(-7) }, "← Previous"),
+        h(
+          "button",
+          {
+            class: "btn small",
+            type: "button",
+            onclick: () => {
+              state.weekStart = mondayOf(startOfToday());
+              renderTab();
+            },
+          },
+          "This week",
+        ),
+        h("button", { class: "btn small", type: "button", onclick: () => shift(7) }, "Next →"),
+      ),
     ),
     h(
       "div",
@@ -913,7 +805,7 @@ async function renderWeek() {
         return h(
           "section",
           { class: `day${key === today ? " today" : ""}`, "aria-label": fmtSlot(key) },
-          h("header", {}, key === today ? `Today · ${fmtSlot(key)}` : fmtSlot(key), h("span", { class: "n" }, items.length ? plural(items.length, "pickup") : "")),
+          h("header", {}, key === today ? `Today · ${fmtSlot(key)}` : fmtSlot(key), h("span", { class: "n" }, items.length || "")),
           h("div", { class: "items" }, items.length ? items.map(card) : h("div", { class: "none" }, "No pickups")),
         );
       }),
@@ -922,19 +814,12 @@ async function renderWeek() {
 }
 
 function card(row) {
-  const todos = row.open_exceptions.length;
   return h(
     "button",
-    { class: `card ${tone(row)}`, type: "button", title: row.stage, onclick: () => go("week", row.id) },
-    h(
-      "div",
-      { class: "t" },
-      parseLocal(row.pickup_local)?.time ? `${parseLocal(row.pickup_local).time} ET` : "Any time",
-      todos ? h("span", { class: "flag" }, ` · ${plural(todos, "to-do")}`) : null,
-    ),
+    { class: "card", type: "button", title: row.stage, onclick: () => go("week", row.id) },
+    h("div", { class: "t" }, parseLocal(row.pickup_local)?.time || "Any time"),
     h("div", { class: "v" }, row.vendor || "Unknown vendor"),
-    h("div", { class: "s" }, row.past_due ? "Missed, not booked" : STATUS[row.status]),
-    h("div", { class: "s" }, `PO ${pos(row)}`),
+    needsYou(row) ? h("div", { class: "need" }, "Needs you") : h("div", { class: "s" }, STATUS[row.status] || cap(row.status)),
   );
 }
 
@@ -977,28 +862,39 @@ function renderDrawer(d) {
   const head = h(
     "div",
     { class: "head" },
-    h("div", { class: "top" }, h("h2", { id: "case-title", tabindex: "-1" }, d.vendor || "Unknown vendor"), statusPill(d.status), closeButton()),
+    h("div", { class: "top" }, h("h2", { id: "case-title", tabindex: "-1" }, d.vendor || "Unknown vendor"), closeButton()),
     h("div", { class: "ids" }, [d.vendor_city, `PO ${pos(d)}`, d.customer].filter(Boolean).join(" · ")),
-    steps(d.status),
+    progress(d.status),
   );
   drawer.replaceChildren(
     head,
-    h("div", { class: "content" }, ...show(happening(d), todoSection(d), actionSection(d), keyFacts(d), messagesSection(d), timelineSection(d), moreDetails(d))),
+    h("div", { class: "content" }, ...show(happening(d), whatToDo(d), keyFacts(d), messagesSection(d), timelineSection(d), moreDetails(d))),
   );
   if (!sameCase) drawer.scrollTop = 0;
   drawer.querySelector("#case-title").focus({ preventScroll: sameCase });
 }
 
-// One sentence, in the pickup's colour: where it stands and whose move it is.
+// Not asked yet → Asked vendor → Booked, with the step it is on in bold.
+function progress(status) {
+  const at = status === "declined" ? 1 : STEPS.indexOf(status);
+  const parts = [];
+  STEPS.forEach((name, i) => {
+    if (i) parts.push(h("span", { "aria-hidden": "true" }, "→"));
+    const done = at > i || status === "scheduled";
+    parts.push(h("span", { class: at === i ? "now" : done ? "done" : null }, done ? "✓ " : "", STATUS[name]));
+  });
+  if (status === "declined" || status === "canceled") parts.push(h("span", { class: "now" }, `· ${STATUS[status]}`));
+  return h("div", { class: "progress", "aria-label": `Progress: ${STATUS[status] || status}` }, parts);
+}
+
+// One sentence: where it stands and whose move it is.
 function happening(d) {
-  const t = tone(d);
-  const iconName = { late: "missed", todo: "alert", booked: "check", asked: "clock" }[t] || "info";
-  const text = d.past_due ? `${d.stage}. The pickup time has passed and it is not booked.` : `${d.stage}.`;
   return h(
     "div",
-    { class: `callout t-${t === "gone" ? "idle" : t}` },
-    icon(iconName, "lg"),
-    h("div", {}, h("span", { class: "label" }, "What's happening"), h("span", { class: "text" }, text.replace(/\.\.$/, "."))),
+    { class: "section now-box" },
+    h("div", { class: "label" }, "What's happening"),
+    h("div", { class: "say" }, sentence(d.stage)),
+    d.past_due ? h("div", { class: "late" }, "The pickup time has passed and it is not booked.") : null,
   );
 }
 
@@ -1027,60 +923,67 @@ function nameField() {
   return h("label", { class: "toggle me-field" }, "Your name", input);
 }
 
-function steps(status) {
-  const order = ["unscheduled", "pending", "scheduled"];
-  const at = status === "declined" ? 1 : order.indexOf(status);
-  const items = [];
-  order.forEach((name, i) => {
-    if (i) items.push(h("span", { class: "step-line", "aria-hidden": "true" }));
-    const done = status === "scheduled" ? true : at > i;
-    const now = status !== "scheduled" && at === i;
-    items.push(
-      h(
-        "span",
-        { class: `step${done ? " done" : ""}${now ? " now" : ""}` },
-        h("span", { class: "dot", "aria-hidden": "true" }, done ? "✓" : String(i + 1)),
-        STEP_NAMES[name],
-      ),
-    );
-  });
-  if (status === "declined" || status === "canceled") items.push(statusPill(status));
-  return h("div", { class: "steps", "aria-label": `Progress: ${STATUS[status] || status}` }, items);
-}
-
-function todoSection(d) {
+// Everything a person can do on this pickup, in one place: each open to-do with its own
+// buttons, then booking it by hand or canceling it.
+function whatToDo(d) {
   const open = d.exceptions.filter((e) => e.open);
-  if (!open.length) return null;
-  return h(
-    "div",
-    { class: "section" },
-    h("h3", {}, icon("alert"), `Needs your attention (${open.length})`),
-    h("div", { class: "todos" }, open.map((e) => todoCard(d, e))),
+  const section = h("div", { class: "section" }, h("h3", {}, open.length > 1 ? `What to do (${open.length})` : "What to do"));
+  if (open.length) {
+    section.append(h("div", {}, open.map((e) => todoItem(d, e))));
+  } else {
+    let text = "Nothing for you right now. The agent is handling it.";
+    if (d.status === "scheduled") text = "Nothing. This pickup is booked.";
+    else if (d.status === "canceled") text = "Nothing. This pickup is canceled.";
+    else if (d.past_due) text = "The pickup time passed and nobody booked it. If the truck picked up, mark it booked; if it is no longer needed, cancel it.";
+    section.append(h("div", { class: "nothing" }, d.past_due ? null : icon("check"), text));
+  }
+  if (d.can_act === false) {
+    section.append(
+      h("div", { class: "view-only" }, icon("info"), "You can follow this customer's pickups. To approve, book or cancel, ask an admin for View and act."),
+    );
+    return section;
+  }
+  const canceled = d.status === "canceled";
+  section.append(
+    h(
+      "div",
+      { class: "actionbar" },
+      h(
+        "button",
+        { class: "btn", type: "button", disabled: canceled, onclick: () => toggleForm(section, bookedForm(d)) },
+        d.status === "scheduled" ? "Change the booking…" : "I booked it myself…",
+      ),
+      h(
+        "button",
+        { class: "btn danger", type: "button", disabled: canceled, onclick: () => toggleForm(section, cancelForm(d)) },
+        "Cancel this pickup…",
+      ),
+      nameField(),
+    ),
   );
+  return section;
 }
 
-function todoCard(d, e) {
-  const box = h(
+function todoItem(d, e) {
+  const item = h(
     "div",
-    { class: "todo-card" },
+    { class: "todo" },
     h("div", { class: "k" }, e.label),
-    h("div", { class: "d" }, cap(e.description)),
-    e.hint ? h("div", { class: "hint" }, icon("info", "sm"), h("span", {}, e.hint)) : null,
+    h("div", { class: "d" }, sentence(e.description)),
+    e.hint ? h("div", { class: "how" }, h("b", {}, "How: "), e.hint) : null,
     h("div", { class: "by" }, `Raised by ${e.raised_by} · ${fmtInstant(e.raised_at)} (${ago(e.raised_at)})`),
   );
-  if (d.can_act === false) return box; // view only: the to-do is shown, not worked
+  if (d.can_act === false) return item; // view only: the to-do is shown, not worked
   const acts = h("div", { class: "acts" });
   if (e.kind === "confirmation_review" && d.can_approve) {
-    acts.append(h("button", { class: "btn good small", type: "button", onclick: () => approveCase(d) }, icon("check", "sm"), "Approve the vendor's time"));
+    acts.append(h("button", { class: "btn primary small", type: "button", onclick: () => approveCase(d) }, "Approve the vendor's time"));
   }
   if (e.kind === "missing_reference") {
-    acts.append(
-      h("button", { class: "btn primary small", type: "button", onclick: () => toggleForm(box, referenceForm(d, e)) }, "Add the number…"),
-    );
+    acts.append(h("button", { class: "btn primary small", type: "button", onclick: () => toggleForm(item, referenceForm(d, e)) }, "Add the number…"));
   }
-  acts.append(h("button", { class: "btn small", type: "button", onclick: () => toggleForm(box, resolveForm(d, e)) }, "Mark as handled…"));
-  box.append(acts);
-  return box;
+  acts.append(h("button", { class: "btn small", type: "button", onclick: () => toggleForm(item, resolveForm(d, e)) }, "Mark as handled…"));
+  item.append(acts);
+  return item;
 }
 
 function toggleForm(container, form) {
@@ -1168,7 +1071,7 @@ function bookedForm(d) {
     ),
   );
   form.dataset.kind = "booked";
-  form.append(formButtons(form, "Save as booked", "good"));
+  form.append(formButtons(form, "Save as booked"));
   form.addEventListener("submit", (ev) => {
     ev.preventDefault();
     act(
@@ -1198,35 +1101,6 @@ function cancelForm(d) {
     act(d.id, "cancel", { reason: reason.value }, "Pickup canceled");
   });
   return form;
-}
-
-function actionSection(d) {
-  const section = h("div", { class: "section" }, h("h3", {}, "What you can do"));
-  if (d.can_act === false) {
-    section.append(
-      h("div", { class: "view-only" }, icon("info"), "You can follow this customer's pickups. To approve, book or cancel, ask an admin for View and act."),
-    );
-    return section;
-  }
-  const canceled = d.status === "canceled";
-  section.append(
-    h(
-      "div",
-      { class: "actionbar" },
-      h(
-        "button",
-        { class: "btn", type: "button", disabled: canceled, onclick: () => toggleForm(section, bookedForm(d)) },
-        d.status === "scheduled" ? "Change the booking…" : "I booked it myself…",
-      ),
-      h(
-        "button",
-        { class: "btn danger", type: "button", disabled: canceled, onclick: () => toggleForm(section, cancelForm(d)) },
-        "Cancel this pickup…",
-      ),
-      nameField(),
-    ),
-  );
-  return section;
 }
 
 // The few facts everyone needs, big and first.
@@ -1337,11 +1211,10 @@ function messagesSection(d) {
     else if (out) when = "not sent yet";
     const r = m.reading || {};
     let reading = null;
-    if (!out && r.skipped) reading = h("span", { class: "pill t-idle" }, `Not read as an answer: ${r.skipped}`);
+    if (!out && r.skipped) reading = `Not read as an answer: ${r.skipped}`;
     else if (!out && r.status) {
-      const [cls, label] = READING[r.status] || ["t-idle", cap(r.status.replace("_", " "))];
       const bits = [r.pickup_date, r.pickup_time, r.pickup_number ? `pickup number ${r.pickup_number}` : null].filter(Boolean);
-      reading = h("span", { class: `pill ${cls}` }, `${label}${bits.length ? ` · ${bits.join(" ")}` : ""}`);
+      reading = `${READING[r.status] || cap(r.status.replace("_", " "))}${bits.length ? ` · ${bits.join(" ")}` : ""}`;
     }
     return h(
       "div",
@@ -1349,21 +1222,21 @@ function messagesSection(d) {
       h(
         "div",
         { class: "line" },
-        h("span", { class: `dir ${out ? "out" : "in"}` }, out ? "Sent" : "Received"),
+        h("span", { class: "dir" }, out ? "Sent" : "Received"),
         h("span", { class: "subj" }, MESSAGE_KINDS[m.kind] || cap(m.kind)),
         h("span", { class: "who" }, out ? `to ${m.to || "?"}` : `from ${m.from || "?"}`),
         h("span", { class: "who" }, when),
       ),
       m.subject ? h("div", { class: "who" }, m.subject) : null,
-      reading ? h("div", { class: "reading" }, reading) : null,
+      reading ? h("div", { class: "reading" }, h("b", {}, "The agent read it as: "), reading) : null,
       out && !m.sent_at && m.draft_ref ? h("div", { class: "who" }, `Draft saved: ${m.draft_ref}`) : null,
       m.body ? h("details", {}, h("summary", {}, "Read the email"), h("pre", {}, m.body)) : null,
     );
   });
   return h(
     "details",
-    { class: "section", open: d.messages.length > 0 && d.messages.length <= 3 },
-    h("summary", {}, icon("mail"), `Emails (${d.messages.length})`),
+    { class: "section" },
+    h("summary", {}, `Emails (${d.messages.length})`),
     items.length ? items : empty("No emails yet."),
   );
 }
@@ -1372,7 +1245,7 @@ function timelineSection(d) {
   return h(
     "details",
     { class: "section" },
-    h("summary", {}, icon("clock"), "History"),
+    h("summary", {}, "History"),
     h(
       "ol",
       { class: "tl" },
@@ -1396,7 +1269,7 @@ function decisionBy() {
   const by = state.me.trim();
   if (!by) {
     toast("Type your name first (Your name); it is kept with every decision.", true);
-    (drawer.querySelector(".me-inline") || meInput).focus();
+    (drawer.hidden ? meInput : drawer.querySelector(".me-inline") || meInput).focus();
     return null;
   }
   return { by };
@@ -1500,7 +1373,7 @@ async function renderAccess() {
       "tr",
       {},
       h("td", {}, h("div", { class: "strong" }, email), h("div", { class: "sub" }, "Admin (FP_BOARD_ADMINS)")),
-      h("td", { colspan: String(grid.customers.length + 1) }, h("span", { class: "pill t-booked" }, "Every customer, gives access")),
+      h("td", { colspan: String(grid.customers.length + 1) }, "Every customer, and gives access"),
     ),
   );
   const personRows = grid.people.map((p) =>
@@ -1588,12 +1461,7 @@ async function renderAccess() {
       ),
       grid.people.length ? null : empty("Nobody else is on the board yet. Add someone by email above."),
       h("div", { class: "save-bar" }, pendingText, discardBtn, saveBtn),
-      h(
-        "section",
-        { class: "panel history" },
-        h("header", {}, h("h2", {}, "History"), h("span", { class: "count" }, String(changes.length))),
-        h("div", { class: "body" }, changes.length ? h("ol", { class: "changes" }, changes.map(line)) : empty("No changes yet.")),
-      ),
+      box("History", changes.length, changes.length ? h("ol", { class: "changes" }, changes.map(line)) : empty("No changes yet.")),
     ),
   );
   showPending();
@@ -1607,29 +1475,20 @@ async function loadMe() {
   try {
     state.viewer = await request("/api/me");
   } catch (err) {
-    view.replaceChildren(h("section", { class: "panel" }, h("div", { class: "error" }, err.message)));
+    view.replaceChildren(h("section", { class: "box" }, h("div", { class: "error" }, err.message)));
     return false;
   }
   const v = state.viewer;
   accessTab.hidden = !v.admin;
   meLabel.hidden = v.signed_in;
   whoEl.hidden = signoutForm.hidden = !v.signed_in;
-  if (v.signed_in) {
-    const name = v.name || v.email;
-    const initials = name
-      .split(/[\s.@]+/)
-      .filter(Boolean)
-      .slice(0, 2)
-      .map((p) => p[0].toUpperCase())
-      .join("");
-    whoEl.replaceChildren(h("span", { class: "avatar", "aria-hidden": "true" }, initials), name, v.admin ? h("span", { class: "role" }, "· admin") : null);
-  }
+  if (v.signed_in) whoEl.replaceChildren(v.name || v.email, v.admin ? h("span", { class: "role" }, " · admin") : "");
   if (v.signed_in && !v.admin && !v.customers.length) {
     const ask = v.admins.length ? ` Ask ${v.admins.join(" or ")} to give you your customers.` : "";
     view.replaceChildren(
       h(
         "section",
-        { class: "panel" },
+        { class: "box" },
         h("div", { class: "empty" }, `You're signed in as ${v.email}, but no customer has been given to you yet.${ask}`),
       ),
     );
@@ -1661,7 +1520,6 @@ async function loadKinds() {
   }
 }
 
-for (const link of document.querySelectorAll(".tabs a[data-icon]")) link.prepend(icon(link.dataset.icon));
 meInput.value = state.me;
 meInput.addEventListener("input", () => setMe(meInput.value));
 customerSelect.addEventListener("change", () => {

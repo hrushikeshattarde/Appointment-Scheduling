@@ -9,15 +9,12 @@
   </head>
   <body>
     <header class="topbar">
-      <a class="brand" href="#overview" aria-label="Pickup appointments, home">
-        <span class="mark" aria-hidden="true"></span>
-        <span class="words"><span class="company">Circle Logistics</span><span class="product">Pickup appointments</span></span>
-      </a>
+      <a class="brand" href="#overview" aria-label="Pickup appointments, today">Pickup appointments</a>
       <nav class="tabs" aria-label="Pages">
-        <a href="#overview" data-tab="overview" data-icon="home">Home <span id="attention-count" class="count" hidden></span></a>
-        <a href="#appointments" data-tab="appointments" data-icon="list">All pickups</a>
-        <a href="#week" data-tab="week" data-icon="calendar">Calendar</a>
-        <a href="#access" data-tab="access" data-icon="users" id="access-tab" hidden>Access</a>
+        <a href="#overview" data-tab="overview">Today <span id="attention-count" class="count" hidden></span></a>
+        <a href="#appointments" data-tab="appointments">All pickups</a>
+        <a href="#week" data-tab="week">Calendar</a>
+        <a href="#access" data-tab="access" id="access-tab" hidden>Access</a>
       </nav>
       <div class="tools">
         <label>Customer
@@ -26,7 +23,7 @@
         <label id="me-label">Your name
           <input id="me" type="text" placeholder="for the record" autocomplete="name" size="12" />
         </label>
-        <span id="who" class="who-chip" hidden></span>
+        <span id="who" class="who" hidden></span>
         <form id="signout" method="post" action="/auth/logout" hidden>
           <button class="btn small" type="submit">Sign out</button>
         </form>
