@@ -123,6 +123,7 @@ def morgan_load(load_id: int, *, pos: tuple[str, str], pickup_open: str) -> dict
             **PYE,  # type: ignore[arg-type]
         ),
         terminal=1089,
+        load_status="Ready To Dispatch",
     )
     load["reference"] = {
         "equipmentType": "Van",

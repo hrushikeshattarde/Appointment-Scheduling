@@ -86,6 +86,7 @@ def lidl_load(load_id: int, *, po: str, pickup_status: str = "Not Required") -> 
             **PYE,  # type: ignore[arg-type]
         ),
         terminal=1089,
+        load_status="Ready To Dispatch",  # as live loads still to pick up show
     )
     load["reference"] = {
         "equipmentType": "Reefer",

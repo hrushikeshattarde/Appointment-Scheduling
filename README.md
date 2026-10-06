@@ -359,6 +359,14 @@ Without `--scan-customer` it scans the customers in `FP_CUSTOMERS`, else the pod
 `FP_PILOT_TERMINAL_IDS`; with neither it refuses to start, as it would take every load in
 Transport Pro. It is off unless asked for.
 
+A load Transport Pro shows **Delivered** (or in transit or completed, should it use those) has
+been picked up, so it needs nobody: an open pickup is marked booked, its to-dos are closed, and the
+board lists it under **Picked up**, apart from what is still to happen. A load already delivered
+when the scan first sees it is not put on the board. "Dispatched" can still be before the pickup,
+so it is not taken as picked up. Pickups whose day has passed leave the scan's window, so each
+scan also reads back, by load number, the ones still on the board from the last 30 days
+(`RECHECK_DAYS`); a delivered or canceled load among them is settled the same way.
+
 Today on the board says when Transport Pro was last checked. When a check fails (Transport Pro
 down, the password changed) the page says so in red, the board keeps working on what it has, the
 reason goes to the server's log, and the next check tries again. The scan reads everything from

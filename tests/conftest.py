@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from facility_profiles.config import RunMode, Settings
 from facility_profiles.storage.db import init_db, make_engine, session_factory
 from facility_profiles.storage.repository import Repository
+from facility_profiles.tpro.errors import TransportProApiError
 from facility_profiles.tpro.models import (
     Dispatch,
     Facility,
@@ -117,6 +118,7 @@ def make_load(
     *,
     terminal: int = 1160,
     created: str = "2026-09-01T10:00:00Z",
+    load_status: str = "Delivered",  # a harvested load is history; a load to book is not yet
 ) -> dict[str, Any]:
     return {
         "id": load_id,
@@ -129,7 +131,7 @@ def make_load(
         "assignedTerminal": terminal,
         "waypoints": [shipper, consignee],
         "status": {
-            "loadStatus": "Delivered",
+            "loadStatus": load_status,
             "documentStatus": "Documents Received",
             "billingStatus": "Billed",
         },
@@ -255,6 +257,14 @@ class FakeTPro:
     def get_facility(self, location_id: int) -> Facility:
         self.calls.append(f"get_facility {location_id}")
         return self._facilities[location_id]
+
+    def get_load(self, load_id: int) -> Load:
+        """One load by its number, canceled or not; an unknown number fails as Transport Pro's."""
+        self.calls.append(f"get_load {load_id}")
+        for load in self._loads:
+            if load.id == load_id:
+                return load
+        raise TransportProApiError(404, None, f"GET /load/{load_id}")
 
     def get_load_notes(self, load_id: int) -> list[LoadNote]:
         self.calls.append(f"get_load_notes {load_id}")

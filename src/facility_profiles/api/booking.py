@@ -51,6 +51,7 @@ from facility_profiles.booking.service import (
     close_case,
     has_request,
     mark_booked,
+    picked_up,
 )
 from facility_profiles.booking.timers import fmt_slot, pickup_passed
 from facility_profiles.booking.today import pickup_slot, render_today, stage, today_summary
@@ -82,6 +83,7 @@ EVENTS: dict[str, str] = {
     "delivery_updated": "Delivery moved",
     "delivery_from_tpro": "Delivery slot from Transport Pro",
     "booked_in_tpro": "Booked in Transport Pro",
+    "picked_up_in_tpro": "Picked up (Transport Pro shows the load delivered)",
     "auto_confirmed": "Booked by the agent",
     "auto_confirm_held": "Left for a person to approve",
     "reply_not_sent": "Answer kept as a draft",
@@ -163,6 +165,10 @@ def case_summary(case: BookingCase, *, now: datetime) -> dict[str, Any]:
         "pickup_source": source,
         "pickup_date": local.partition(" ")[0] if local else None,
         "past_due": pickup_passed(case, now),
+        # What Transport Pro last said about the load, and whether that means the truck has
+        # picked up: the board lists those apart, as done.
+        "load_status": (case.tpro_seen or {}).get("load_status"),
+        "picked_up": picked_up((case.tpro_seen or {}).get("load_status")),
         "pickup_number": case.pickup_number,
         # Every number the case has carried, so any of them finds it.
         "numbers": sorted({r.value for r in case.references}),

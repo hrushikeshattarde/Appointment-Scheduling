@@ -15,7 +15,7 @@ import math
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -131,6 +131,7 @@ from facility_profiles.pipeline.harvest import iter_terminal_loads, stop_identit
 from facility_profiles.storage.db import session_scope
 from facility_profiles.storage.repository import Repository, as_utc
 from facility_profiles.tpro.client import TransportProClient
+from facility_profiles.tpro.errors import TransportProError
 from facility_profiles.tpro.models import Load, Waypoint
 
 log = get_logger(__name__)
@@ -142,6 +143,14 @@ REFRESH_ACTOR = "agent"
 # Transport Pro's load search leaves canceled loads out unless asked for this status (checked
 # live on 2026-10-05: pod 1089, Lidl inbound), so the scan asks for them separately.
 CANCELED_STATUS = "Canceled"
+# Load statuses that mean the pickup has happened. Live on 2026-10-06 (pods 1089 and 1160, the
+# last 40 days) Transport Pro showed only Ready To Dispatch, Planned, Dispatched and Delivered;
+# "Dispatched" can still be before the pickup, so only Delivered counts, with the in-transit and
+# completed names should Transport Pro use them.
+PICKED_UP = frozenset({"delivered", "in transit", "intransit", "completed"})
+# How far back a scan rechecks pickups still on the board whose day has passed: their loads have
+# left the scan's window, so each is read from Transport Pro by its load number.
+RECHECK_DAYS = 30
 OPEN_STATUSES = (
     CaseStatus.UNSCHEDULED.value,
     CaseStatus.PENDING.value,
@@ -182,6 +191,8 @@ class ScanStats:
     cases_canceled: int = 0  # load canceled before anything was written: case canceled
     load_canceled: int = 0  # load canceled after a request or a booking: raised for a person
     booked_in_tpro: int = 0  # a pickup number or a confirmed stop appeared in Transport Pro
+    picked_up: int = 0  # Transport Pro shows the load delivered: the pickup happened
+    rechecked: int = 0  # earlier pickups still on the board, read again by load number
     case_ids: list[int] = field(default_factory=list)
 
 
@@ -248,6 +259,11 @@ def load_canceled(load: Load) -> bool:
     """True when Transport Pro shows the load canceled (its load status "Canceled")."""
     status = (load.status.load_status if load.status else None) or ""
     return status.strip().lower().startswith("cancel")
+
+
+def picked_up(load_status: str | None) -> bool:
+    """True when a Transport Pro load status means the truck has picked up (see PICKED_UP)."""
+    return (load_status or "").strip().lower() in PICKED_UP
 
 
 def _iso_utc(value: datetime | None) -> str | None:
@@ -415,6 +431,10 @@ def scan(  # noqa: PLR0912 - one branch per kind of load
             extra_filters={"load_status": CANCELED_STATUS},
         )
     )
+    in_window = {load.id for load in loads} | {load.id for load in canceled}
+    earlier = _read_loads(
+        client, [i for i in due_for_recheck(sessions, today=start) if i not in in_window]
+    )
     with session_scope(sessions) as session:
         repo = Repository(session)
         seen_loads: set[int] = set()
@@ -444,6 +464,9 @@ def scan(  # noqa: PLR0912 - one branch per kind of load
                 continue
             if load_canceled(load):
                 stats.canceled_loads += 1
+                continue
+            if picked_up(load.status.load_status if load.status else None):
+                stats.picked_up += 1  # delivered before the board knew it: nothing to book
                 continue
             appt = wp.appointment_time
             if appt and (appt.appointment_status or "").lower() == "confirmed":
@@ -533,6 +556,9 @@ def scan(  # noqa: PLR0912 - one branch per kind of load
             elif blocker is not None:
                 stats.needs_profile += 1
         _canceled_pass(session, settings, canceled, skip=seen_loads, now=now, stats=stats)
+        for load in earlier:
+            if _refresh_stop(session, settings, load, now=now, stats=stats):
+                stats.rechecked += 1
     return stats
 
 
@@ -558,26 +584,66 @@ def _canceled_pass(
 
     Transport Pro only returns canceled loads when asked for them (:data:`CANCELED_STATUS`).
     """
-    known = customers(settings)
     for load in loads:
         if load.id in skip or not load_canceled(load):
             continue
-        found = pickup_waypoint(load)
-        existing = _case_for_stop(session, load.id, found[0]) if found else None
-        if found is None or existing is None:
+        if not _refresh_stop(session, settings, load, now=now, stats=stats):
             stats.canceled_loads += 1
-            continue
-        customer_id = load.billing_info.customer_id if load.billing_info else None
-        refresh_case(
-            session,
-            existing,
-            load,
-            found[1],
-            customer=known.for_customer(customer_id, load.customer_name),
-            settings=settings,
-            now=now,
-            stats=stats,
-        )
+
+
+def _refresh_stop(
+    session: Session, settings: Settings, load: Load, *, now: datetime, stats: ScanStats
+) -> bool:
+    """Bring the case for the load's pickup stop up to date; False when the board has none."""
+    found = pickup_waypoint(load)
+    existing = _case_for_stop(session, load.id, found[0]) if found else None
+    if found is None or existing is None:
+        return False
+    customer_id = load.billing_info.customer_id if load.billing_info else None
+    refresh_case(
+        session,
+        existing,
+        load,
+        found[1],
+        customer=customers(settings).for_customer(customer_id, load.customer_name),
+        settings=settings,
+        now=now,
+        stats=stats,
+    )
+    return True
+
+
+def due_for_recheck(sessions: sessionmaker[Session], *, today: date) -> list[int]:
+    """Loads of the pickups still on the board whose day passed in the last RECHECK_DAYS days.
+
+    The scan's window starts today, so these are no longer in it: without a recheck, a load
+    delivered (or canceled) after its day would sit on the board as a missed pickup. One already
+    seen picked up is not read again.
+    """
+    oldest, first = (today - timedelta(days=RECHECK_DAYS)).isoformat(), today.isoformat()
+    due: set[int] = set()
+    with session_scope(sessions) as session:
+        live = select(BookingCase).where(BookingCase.status != CaseStatus.CANCELED.value)
+        for case in session.scalars(live):
+            if picked_up((case.tpro_seen or {}).get("load_status")):
+                continue
+            local = case.confirmed_local or case.requested_local
+            tender = case.tendered_pickup_utc
+            day = local[:10] if local else (tender.date().isoformat() if tender else None)
+            if day and oldest <= day < first:
+                due.add(case.load_id)
+    return sorted(due)
+
+
+def _read_loads(client: TransportProClient, load_ids: list[int]) -> list[Load]:
+    """Each load by its number; one Transport Pro cannot read is logged and left for next time."""
+    loads: list[Load] = []
+    for load_id in load_ids:
+        try:
+            loads.append(client.get_load(load_id))
+        except TransportProError:
+            log.warning("booking.recheck_failed", load_id=load_id, exc_info=True)
+    return loads
 
 
 # ------------------------------------------------------------------ refresh
@@ -636,6 +702,8 @@ def refresh_case(
     seen = _Seen(tpro_view(load, wp, customer), case.tpro_seen)
     if load_canceled(load):
         done = _refresh_canceled(session, case, seen, now=now, stats=stats)
+    elif picked_up(seen.view["load_status"]):
+        done = _refresh_picked_up(session, case, seen, stats=stats)
     else:
         booked = _refresh_booking(session, case, wp, seen, now=now, stats=stats)
         delivery = _refresh_delivery(session, case, seen, now=now)
@@ -674,6 +742,31 @@ def _refresh_canceled(
     )
     stats.load_canceled += 1
     return ["load_canceled"]
+
+
+def _refresh_picked_up(
+    session: Session, case: BookingCase, seen: _Seen, *, stats: ScanStats
+) -> list[str]:
+    """The load was delivered, so the pickup happened: it needs nobody any more.
+
+    An open case is booked (someone booked it outside the agent) and its to-dos are closed; a
+    booked one only keeps the status. Once seen, it is not done again.
+    """
+    if picked_up((seen.before or {}).get("load_status")):
+        return []
+    status = seen.view["load_status"]
+    if case.status in OPEN_STATUSES:
+        case.status = CaseStatus.SCHEDULED.value
+        case.reason = f"picked up: Transport Pro shows the load {status}"[:255]
+    resolve_all(
+        session,
+        case,
+        resolution=f"picked up: Transport Pro shows the load {status}",
+        by=REFRESH_ACTOR,
+    )
+    _event(session, case, "picked_up_in_tpro", load_status=status, reason=case.reason)
+    stats.picked_up += 1
+    return ["picked_up"]
 
 
 def _refresh_booking(

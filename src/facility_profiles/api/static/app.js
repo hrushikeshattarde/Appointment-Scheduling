@@ -32,7 +32,16 @@ const STATUS = {
   declined: "Vendor declined",
   canceled: "Canceled",
 };
-const GROUPS = { attention: "Needs you", ...STATUS };
+// Picked up: Transport Pro shows the load delivered, so the pickup is done and only history.
+const GROUPS = {
+  attention: "Needs you",
+  unscheduled: STATUS.unscheduled,
+  pending: STATUS.pending,
+  scheduled: STATUS.scheduled,
+  done: "Picked up",
+  declined: STATUS.declined,
+  canceled: STATUS.canceled,
+};
 const STEPS = ["unscheduled", "pending", "scheduled"];
 const SOURCE = { requested: "the time we asked for", confirmed: "confirmed by the vendor" };
 const MESSAGE_KINDS = {
@@ -283,7 +292,10 @@ function query(params) {
 
 // A pickup needs a person when it has an open to-do, or its time passed and nobody booked it.
 const needsYou = (row) => row.status !== "canceled" && (row.past_due || row.open_exceptions.length > 0);
-const groupOf = (row) => (needsYou(row) ? "attention" : row.status);
+function groupOf(row) {
+  if (needsYou(row)) return "attention";
+  return row.picked_up && row.status !== "canceled" ? "done" : row.status;
+}
 
 // Earliest pickup first; pickups with no date yet last.
 const byPickup = (a, b) =>
@@ -301,11 +313,18 @@ function needText(row) {
   return labels.length > 1 ? `${labels[0]} (+${labels.length - 1} more)` : labels[0];
 }
 
-const statusText = (status) =>
-  h("span", { class: "status" }, status === "scheduled" ? icon("check", "sm") : null, STATUS[status] || cap(status));
+// Where the pickup stands in a word or two: Transport Pro's own word ("Delivered") once the
+// truck has picked up, else the status.
+function statusLabel(row) {
+  if (row.picked_up && row.status !== "canceled") return cap((row.load_status || "picked up").toLowerCase());
+  return STATUS[row.status] || cap(row.status);
+}
+
+const statusText = (row) =>
+  h("span", { class: "status" }, row.status === "scheduled" ? icon("check", "sm") : null, statusLabel(row));
 
 // The status, and under it, with the red dot, what the person has to do (when anything).
-const statusCell = (row) => [statusText(row.status), needsYou(row) ? h("div", { class: "need" }, needText(row)) : null];
+const statusCell = (row) => [statusText(row), needsYou(row) ? h("div", { class: "need" }, needText(row)) : null];
 
 // ------------------------------------------------------------------ state and routing
 
@@ -535,7 +554,7 @@ function upcomingList(rows) {
         h("span", { class: "name" }, row.vendor || "Unknown vendor"),
         needsYou(row)
           ? h("span", { class: "state alert" }, h("span", { class: "dot", "aria-hidden": "true" }), "Needs you")
-          : h("span", { class: "state" }, statusText(row.status)),
+          : h("span", { class: "state" }, statusText(row)),
         h("span", { class: "po" }, `PO ${pos(row)}`),
       ),
     );
@@ -656,9 +675,9 @@ async function renderAppointments() {
   );
   const rows = all.filter((r) => !f.group || groupOf(r) === f.group);
   const counts = Object.fromEntries(Object.keys(GROUPS).map((g) => [g, all.filter((r) => groupOf(r) === g).length]));
-  // Declined and Canceled are rare: their tab shows only when there is something in it.
+  // Picked up, Declined and Canceled show only when there is something in them.
   const tabs = [["", "All", all.length], ...Object.entries(GROUPS).map(([g, label]) => [g, label, counts[g]])].filter(
-    ([g, , n]) => n || !["declined", "canceled"].includes(g) || f.group === g,
+    ([g, , n]) => n || !["done", "declined", "canceled"].includes(g) || f.group === g,
   );
   const groupTabs = h(
     "div",
@@ -838,7 +857,7 @@ function card(row) {
     { class: "card", type: "button", title: row.stage, onclick: () => go("week", row.id) },
     h("div", { class: "t" }, parseLocal(row.pickup_local)?.time || "Any time"),
     h("div", { class: "v" }, row.vendor || "Unknown vendor"),
-    needsYou(row) ? h("div", { class: "need" }, "Needs you") : h("div", { class: "s" }, STATUS[row.status] || cap(row.status)),
+    needsYou(row) ? h("div", { class: "need" }, "Needs you") : h("div", { class: "s" }, statusLabel(row)),
   );
 }
 
@@ -883,7 +902,7 @@ function renderDrawer(d) {
     { class: "head" },
     h("div", { class: "top" }, h("h2", { id: "case-title", tabindex: "-1" }, d.vendor || "Unknown vendor"), closeButton()),
     h("div", { class: "ids" }, [d.vendor_city, `PO ${pos(d)}`, d.customer].filter(Boolean).join(" · ")),
-    progress(d.status),
+    progress(d),
   );
   drawer.replaceChildren(
     head,
@@ -894,16 +913,20 @@ function renderDrawer(d) {
 }
 
 // Not asked yet → Asked vendor → Booked, with the step it is on in bold.
-function progress(status) {
-  const at = status === "declined" ? 1 : STEPS.indexOf(status);
+// Once Transport Pro shows the load delivered, that is the last step.
+function progress(d) {
+  const status = d.status;
+  const gone = d.picked_up && status !== "canceled";
+  const at = gone ? STEPS.length : status === "declined" ? 1 : STEPS.indexOf(status);
   const parts = [];
   STEPS.forEach((name, i) => {
     if (i) parts.push(h("span", { "aria-hidden": "true" }, "→"));
     const done = at > i || status === "scheduled";
     parts.push(h("span", { class: at === i ? "now" : done ? "done" : null }, done ? "✓ " : "", STATUS[name]));
   });
+  if (gone) parts.push(h("span", { "aria-hidden": "true" }, "→"), h("span", { class: "now" }, `✓ ${statusLabel(d)}`));
   if (status === "declined" || status === "canceled") parts.push(h("span", { class: "now" }, `· ${STATUS[status]}`));
-  return h("div", { class: "progress", "aria-label": `Progress: ${STATUS[status] || status}` }, parts);
+  return h("div", { class: "progress", "aria-label": `Progress: ${statusLabel(d)}` }, parts);
 }
 
 // One sentence: where it stands and whose move it is.
@@ -951,7 +974,8 @@ function whatToDo(d) {
     section.append(h("div", {}, open.map((e) => todoItem(d, e))));
   } else {
     let text = "Nothing for you right now. The agent is handling it.";
-    if (d.status === "scheduled") text = "Nothing. This pickup is booked.";
+    if (d.picked_up && d.status !== "canceled") text = `Nothing. Transport Pro shows the load ${(d.load_status || "picked up").toLowerCase()}.`;
+    else if (d.status === "scheduled") text = "Nothing. This pickup is booked.";
     else if (d.status === "canceled") text = "Nothing. This pickup is canceled.";
     else if (d.past_due) text = "The pickup time passed and nobody booked it. If the truck picked up, mark it booked; if it is no longer needed, cancel it.";
     section.append(h("div", { class: "nothing" }, d.past_due ? null : icon("check"), text));
