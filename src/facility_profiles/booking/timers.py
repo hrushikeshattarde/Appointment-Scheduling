@@ -38,6 +38,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from facility_profiles.booking.memory import take_desk
 from facility_profiles.booking.models import (
+    PERSON_MAIL,
     BookingCase,
     BookingMessage,
     CaseException,
@@ -69,7 +70,7 @@ UNANSWERED_LIMITS: tuple[tuple[ExceptionType, int], ...] = (
 )
 _UNANSWERED = frozenset(k.value for k in UNANSWERED)
 # Notes to the customer's desk are not a question to the vendor.
-NOT_TO_VENDOR = frozenset({"escalate_to_customer", "notify_customer_desk"})
+NOT_TO_VENDOR = frozenset({"escalate_to_customer", "notify_customer_desk", PERSON_MAIL})
 # Open exceptions that already say what to do about a slot that will not happen: an expiry on
 # top of them would only repeat it.
 EXPIRY_DEFERS_TO = frozenset(

@@ -348,6 +348,9 @@ class Dispatch(TProModel):
     date_created: str | None = None
     waypoints: list[Waypoint] | None = None
     internal_contacts: list[InternalContact] = Field(default_factory=list)
+    # Who hauls it: {"type": "brokerCarrier", "carrier": {companyName, mcNumber, usDOT, ...},
+    # "contacts": [{"type": "DRIVER", "name", "phoneNumber"}, ...], "tractorNumber", ...}
+    assigned_to: dict[str, Any] | None = None
 
 
 class Terminal(TProModel):

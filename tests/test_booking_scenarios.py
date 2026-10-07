@@ -111,6 +111,7 @@ class World:
                 inbox=FakeInbox(messages),
                 classifier=FakeReplyClassifier(script),
                 client=self.tpro,
+                facts=self.tpro,
             )
         return report, [d.body.split("\n\n")[0] for d in self.sender.drafts[before:]]
 
@@ -418,11 +419,23 @@ def test_a_booked_pickup_confirmed_again_changes_nothing(world: World) -> None:
 
 def test_a_question_on_a_booked_pickup_is_answered_and_the_booking_stands(world: World) -> None:
     _book(world)
+    world.tpro.dispatches[LOAD] = [
+        {
+            "id": 91,
+            "status": "Dispatched",
+            "dateCreated": "2026-09-30T15:00:00Z",
+            "assignedTo": {
+                "type": "brokerCarrier",
+                "carrier": {"companyName": "Ridgeway Freight LLC"},
+            },
+        }
+    ]
     later = DAY + timedelta(hours=1)
     body = "Which carrier is picking this up?"
     reading = ReplyClassification(status=ReplyStatus.QUESTION, question=body, quotes=[body])
     _, sent = world.run([reply(body, world.sent_id, later, mid="b4")], {"Which": reading}, later)
-    assert sent == ["The carrier is Circle Logistics, Inc. Thank you!"]
+    # The trucking company on the load's dispatch, as Transport Pro has it when the reply is read.
+    assert sent == ["The carrier is Ridgeway Freight LLC. Thank you!"]
     case = world.case()
     assert case["status"] == CaseStatus.SCHEDULED.value and case["open"] == []
 

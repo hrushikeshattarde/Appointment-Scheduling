@@ -495,5 +495,5 @@ def test_the_board_shows_what_the_link_offered(page) -> None:  # type: ignore[no
     assert offer["answer"] == "Thu 10/01 09:00 ET"
     titles = [row["title"] for row in detail["timeline"]]
     assert "Vendor picked a time from the link" in titles
-    assert detail["messages"][-1]["kind"] == "link"
+    assert [m["kind"] for m in detail["messages"]].count("link") == 1
     assert re.search(r"vendor picked Thu 10/01 09:00 ET from the link", detail["stage"], re.I)

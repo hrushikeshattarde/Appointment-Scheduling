@@ -56,6 +56,7 @@ const MESSAGE_KINDS = {
   notify_customer_desk: "Note to the customer",
   reply: "Vendor's reply",
   customer_desk: "From the customer",
+  by_person: "Sent by a person",
 };
 const READING = {
   confirmed: "Vendor confirmed",
@@ -470,12 +471,16 @@ async function renderOverview() {
   let checked = null;
   if (scan && scan.ok) checked = `New loads checked in Transport Pro at ${clock(scan.at)}`;
   else if (scan && scan.ok === null) checked = "Checking Transport Pro for new loads…";
+  const mailCheck = data.mail_check;
+  let mailed = null;
+  if (mailCheck && mailCheck.ok) mailed = `Emails read at ${clock(mailCheck.at)}`;
+  else if (mailCheck && mailCheck.ok === null) mailed = "Reading the emails…";
   view.replaceChildren(
     ...show(
       h(
         "div",
         { class: "page-head" },
-        h("div", {}, h("h1", {}, greeting()), h("p", { class: "sub" }, [today, whose, checked].filter(Boolean).join(" · "))),
+        h("div", {}, h("h1", {}, greeting()), h("p", { class: "sub" }, [today, whose, checked, mailed].filter(Boolean).join(" · "))),
         h(
           "div",
           { class: "acts" },
@@ -493,6 +498,15 @@ async function renderOverview() {
             h("span", { class: "dot", "aria-hidden": "true" }),
             `Could not check Transport Pro for new loads at ${clock(scan.at)}, so new pickups may be missing. ` +
               `It tries again every ${plural(scan.every, "minute")}; the reason is in the server's log.`,
+          )
+        : null,
+      mailCheck && mailCheck.ok === false
+        ? h(
+            "div",
+            { class: "notice alert", role: "alert" },
+            h("span", { class: "dot", "aria-hidden": "true" }),
+            `Could not read the emails at ${clock(mailCheck.at)}, so new ones may be missing. ` +
+              `It tries again every ${plural(mailCheck.every, "minute")}; the reason is in the server's log.`,
           )
         : null,
       summary ? summaryBox(summary) : null,
@@ -520,6 +534,7 @@ async function renderOverview() {
           "Times are Eastern (ET)",
         ),
       ),
+      updatesBox(data.updates || []),
       mail.length ? mailBox(mail, live) : null,
       helpBox(),
     ),
@@ -560,6 +575,28 @@ function upcomingList(rows) {
     );
   }
   return out;
+}
+
+// Every email on a pickup, whoever sent it, and what Transport Pro changed, newest first. One
+// row per email or change; it opens the pickup, whose emails and history hold the rest.
+function updatesBox(rows) {
+  return box(
+    "Latest updates",
+    rows.length,
+    rows.length ? rows.map(updateRow) : empty("No emails or Transport Pro changes in the last two weeks."),
+    "Emails and Transport Pro changes, newest first",
+  );
+}
+
+function updateRow(u) {
+  return h(
+    "button",
+    { class: "item upd", type: "button", onclick: () => go(state.tab, u.case_id) },
+    h("span", { class: "name" }, `${u.vendor || "Unknown vendor"} · PO ${u.po || "-"}`),
+    h("span", { class: "when" }, fmtInstant(u.at)),
+    h("span", { class: "what" }, [u.what, u.about].filter(Boolean).join(" · ")),
+    h("span", { class: "go" }, u.source === "email" ? "Email" : "Transport Pro"),
+  );
 }
 
 // Emails the agent could not tie to any pickup: kept so none is lost. A person links each to its
@@ -1267,7 +1304,15 @@ function messagesSection(d) {
         { class: "line" },
         h("span", { class: "dir" }, out ? "Sent" : "Received"),
         h("span", { class: "subj" }, MESSAGE_KINDS[m.kind] || cap(m.kind)),
-        h("span", { class: "who" }, out ? `to ${m.to || "?"}` : `from ${m.from || "?"}`),
+        h(
+          "span",
+          { class: "who" },
+          m.kind === "by_person"
+            ? `${m.from || "?"} to ${m.to || "?"}`
+            : out
+              ? `to ${m.to || "?"}`
+              : `from ${m.from || "?"}`,
+        ),
         h("span", { class: "who" }, when),
       ),
       m.subject ? h("div", { class: "who" }, m.subject) : null,

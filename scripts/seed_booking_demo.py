@@ -409,7 +409,7 @@ def build(demo: Demo) -> int:
         desk="appts@granitestate.example",
     )
     d.send(c, d.at(-2, "08:30"))
-    question = "Which carrier is picking this up?"
+    question = "What is your load number for this one?"
     d.reply(
         c,
         d.ago(5),
@@ -716,6 +716,9 @@ def build(demo: Demo) -> int:
     )
     with d.step(c, c.created_at):
         c.miles = 1450
+        # Due the next morning whatever the day (a Friday pickup is not given the weekend).
+        due = d.day(2) + timedelta(days=1)
+        c.delivery_at_utc = datetime(due.year, due.month, due.day, 7, 30, tzinfo=ET).astimezone(UTC)
         plan_request(s, c, d.settings, now=c.created_at)
     made += 1
 

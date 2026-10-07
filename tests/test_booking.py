@@ -269,7 +269,9 @@ def test_scan_draft_reply_and_approve_round_trip(settings, sessions):
     ]
     with session_scope(sessions) as session:
         stats2 = ingest(session, inbound, classifier, internal_domains=["circledelivers.com"])
-        assert stats2.skipped_internal == 1 and stats2.duplicates == 1 and stats2.proposed == 1
+        # Megan's own "Thanks!" on the group is kept on the case as sent by a person.
+        assert stats2.by_person == 1 and stats2.skipped_internal == 0
+        assert stats2.duplicates == 1 and stats2.proposed == 1
         case = session.get(BookingCase, case_id)
         # Confirmed by the vendor, still pending until a person approves what the agent read.
         assert case is not None and case.status == CaseStatus.PENDING.value
@@ -298,6 +300,7 @@ def test_scan_draft_reply_and_approve_round_trip(settings, sessions):
             "scanned",
             "drafted",
             "sent",
+            "sent_by_person",  # Megan's "Thanks!" on the group, kept on the case
             "vendor_confirmed",
             "approved",
             "desk_remembered",

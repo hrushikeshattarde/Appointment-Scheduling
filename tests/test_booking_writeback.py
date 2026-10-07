@@ -28,7 +28,7 @@ from facility_profiles.booking.writeback import OFF, queue_write, write_appointm
 from facility_profiles.config import Settings, get_settings
 from facility_profiles.storage.db import init_db, make_engine, session_factory, session_scope
 from facility_profiles.tpro.errors import TransportProApiError
-from facility_profiles.tpro.models import Load
+from facility_profiles.tpro.models import Dispatch, Load
 from tests.conftest import FakeTPro
 from tests.test_booking import NOW, lidl_load, seed_vendor
 
@@ -48,6 +48,10 @@ class FakeLoads:
         self.notes: list[tuple[int, str]] = []
         self.note_fails = 0
         self.reads = 0
+        self.dispatches: dict[int, list[dict[str, Any]]] = {}
+
+    def search_dispatches(self, load_id: int) -> list[Dispatch]:
+        return [Dispatch.model_validate(d) for d in self.dispatches.get(load_id, [])]
 
     def get_load(self, load_id: int) -> Load:
         self.reads += 1

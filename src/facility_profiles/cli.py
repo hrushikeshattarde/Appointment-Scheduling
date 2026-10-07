@@ -173,6 +173,40 @@ def _serve_scan_scope(
     return chosen
 
 
+def _say_loops(
+    settings: Settings,
+    timers_every: float,
+    autopilot_every: float,
+    mail_every: float,
+    scan_every: float,
+    scan_scope: tuple[list[int], list[int]],
+) -> None:
+    """Say what the board does on its own besides serving, and refuse what it cannot do."""
+    if timers_every > 0:
+        typer.echo(f"booking timers run every {timers_every:g} min")
+    if autopilot_every > 0:
+        typer.echo(f"the agent runs on its own every {autopilot_every:g} min (booking run)")
+    if mail_every > 0:
+        if not settings.booking_inbox:
+            typer.echo("--mail-every needs FP_BOOKING_INBOX (s3://bucket or gmail) to read")
+            raise typer.Exit(code=2)
+        typer.echo(
+            f"the group mail ({settings.booking_inbox}) is read onto the board every "
+            f"{mail_every:g} min; nothing is drafted or sent"
+        )
+    if scan_every > 0:
+        terminals, customer_ids = scan_scope
+        whose = "; ".join(
+            f"{label} {', '.join(map(str, ids))}"
+            for label, ids in (("terminals", terminals), ("customers", customer_ids))
+            if ids
+        )
+        typer.echo(
+            f"Transport Pro is checked for new pickups every {scan_every:g} min ({whose}); "
+            f"pickups up to {settings.booking_days_ahead} days ahead"
+        )
+
+
 @app.command()
 def serve(
     host: Annotated[str, typer.Option(help="Interface to listen on")] = "127.0.0.1",
@@ -199,6 +233,13 @@ def serve(
         typer.Option(
             help="Check Transport Pro for new and changed pickups every this many minutes "
             "(booking scan; reads only); 0, the default, is off"
+        ),
+    ] = 0,
+    mail_every: Annotated[
+        float,
+        typer.Option(
+            help="Read the customers' group mail onto the board every this many minutes "
+            "(FP_BOOKING_INBOX; reads only: nothing is drafted or sent); 0, the default, is off"
         ),
     ] = 0,
     scan_customer: Annotated[
@@ -255,27 +296,14 @@ def serve(
             "warning: no sign-in (FP_GOOGLE_CLIENT_ID and FP_GOOGLE_CLIENT_SECRET unset), so "
             "anyone who can reach this address sees every customer"
         )
-    if timers_every > 0:
-        typer.echo(f"booking timers run every {timers_every:g} min")
-    if autopilot_every > 0:
-        typer.echo(f"the agent runs on its own every {autopilot_every:g} min (booking run)")
-    if scan_every > 0:
-        terminals, customer_ids = scan_scope
-        whose = "; ".join(
-            f"{label} {', '.join(map(str, ids))}"
-            for label, ids in (("terminals", terminals), ("customers", customer_ids))
-            if ids
-        )
-        typer.echo(
-            f"Transport Pro is checked for new pickups every {scan_every:g} min ({whose}); "
-            f"pickups up to {settings.booking_days_ahead} days ahead"
-        )
+    _say_loops(settings, timers_every, autopilot_every, mail_every, scan_every, scan_scope)
     app_ = create_app(
         settings,
         timers_every=timers_every if timers_every > 0 else None,
         autopilot_every=autopilot_every if autopilot_every > 0 else None,
         scan_every=scan_every if scan_every > 0 else None,
         scan_scope=scan_scope,
+        mail_every=mail_every if mail_every > 0 else None,
     )
     uvicorn.run(app_, host=host, port=port, log_level="warning")
 
@@ -1006,25 +1034,29 @@ def booking_inbox(
         typer.echo("reply classification needs FP_LLM_PROVIDER=openrouter (or --fake)")
         raise typer.Exit(code=2)
     responder = None
-    if respond:
-        from facility_profiles.booking.mail import LocalDraftMailer
-        from facility_profiles.booking.respond import OpenRouterAnswerComposer, Responder
+    with ExitStack() as stack:
+        if respond:
+            from facility_profiles.booking.mail import LocalDraftMailer
+            from facility_profiles.booking.respond import Responder
+            from facility_profiles.booking.writer import OpenRouterReplyWriter
 
-        composer = None
-        if not fake and settings.llm_provider == "openrouter" and settings.openrouter_api_key:
-            composer = OpenRouterAnswerComposer(
-                settings.openrouter_api_key.get_secret_value(),
-                model=settings.llm_model,
-                base_url=settings.openrouter_base_url,
+            writer = facts = None
+            if not fake and settings.llm_provider == "openrouter" and settings.openrouter_api_key:
+                writer = OpenRouterReplyWriter(
+                    settings.openrouter_api_key.get_secret_value(),
+                    model=settings.llm_model,
+                    base_url=settings.openrouter_base_url,
+                )
+                facts = stack.enter_context(_client(settings))  # the load's facts, read only
+            responder = Responder(
+                settings,
+                LocalDraftMailer(
+                    Path(settings.booking_drafts_dir), sender=settings.booking_sender or ""
+                ),
+                writer=writer,
+                facts=facts,
             )
-        responder = Responder(
-            settings,
-            LocalDraftMailer(
-                Path(settings.booking_drafts_dir), sender=settings.booking_sender or ""
-            ),
-            composer=composer,
-        )
-    with session_scope(_sessions(settings)) as session:
+        session = stack.enter_context(session_scope(_sessions(settings)))
         stats = ingest(
             session,
             messages,
@@ -1423,7 +1455,10 @@ def booking_run(
         if settings.booking_tpro_writeback and not dry_run:
             client = stack.enter_context(_client(settings, allow_writes=True))
         inbox = inbox_from_settings(settings)
-        classifier, composer = reader_tools(settings) if inbox is not None else (None, None)
+        classifier, writer = reader_tools(settings) if inbox is not None else (None, None)
+        facts = client
+        if facts is None and writer is not None:  # the load's facts for the answers, read only
+            facts = stack.enter_context(_client(settings))
         report = run_once(
             session,
             settings,
@@ -1433,7 +1468,8 @@ def booking_run(
             client=client,
             inbox=inbox,
             classifier=classifier,
-            composer=composer,
+            writer=writer,
+            facts=facts,
         )
         for line in report.lines:
             typer.echo(line)
@@ -1611,13 +1647,17 @@ def booking_link_mail(
     from facility_profiles.booking.unmatched import link_unmatched
 
     settings = _settings()
-    classifier, composer = reader_tools(settings)
-    responder = Responder(
-        settings,
-        LocalDraftMailer(Path(settings.booking_drafts_dir), sender=settings.booking_sender or ""),
-        composer=composer,
-    )
-    with session_scope(_sessions(settings)) as session:
+    classifier, writer = reader_tools(settings)
+    with ExitStack() as stack:
+        responder = Responder(
+            settings,
+            LocalDraftMailer(
+                Path(settings.booking_drafts_dir), sender=settings.booking_sender or ""
+            ),
+            writer=writer,
+            facts=stack.enter_context(_client(settings)) if writer is not None else None,
+        )
+        session = stack.enter_context(session_scope(_sessions(settings)))
         item = session.get(UnmatchedMail, mail_id)
         if item is None:
             typer.echo(f"no mail {mail_id}")

@@ -4,10 +4,16 @@ The policy is deliberately narrow. The agent only ever does five things in a thr
 
 1. accept a counter-offer that still makes the customer's delivery slot,
 2. ask for alternatives inside a stated window when it does not,
-3. answer a factual question from data already on the case,
+3. answer the facility's questions from the facts: the case's, and the load's and its dispatch's
+   read from Transport Pro (weight, pallets, equipment, load notes, trucking company, driver),
 4. nudge once when a request goes unanswered,
 5. draft a note to the customer's inbound desk when the vendor cannot ship on the day asked
    (the order is not ready, no slots, closed): moving the delivery fixes that, and nothing else.
+
+The code decides the move; a writer (``booking/writer.py``) writes the words for what the
+facility actually wrote, answering every question it asked in the same reply, and its draft goes
+out only when every value in it is in the facts. Without a writer, or when a draft fails that
+check, the pod's fixed wording goes. A question nothing answered is raised in Needs you.
 
 Everything else, and anything that mentions money, is handed to a person: the exception the
 reply raised stays open with the agent's reason added to it. So is any change to a pickup that
@@ -26,19 +32,27 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
+from collections.abc import Iterable
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any
 from zoneinfo import ZoneInfo
 
-import httpx
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from facility_profiles import __version__
+from facility_profiles.booking.facts import (
+    FACT_KEYS,
+    FORBIDDEN_TOPICS,
+    FactsSource,
+    case_facts,
+    read_load_facts,
+    with_load,
+)
 from facility_profiles.booking.mail import Mailer, OutboundDraft, Sender
 from facility_profiles.booking.models import (
+    PERSON_MAIL,
     BookingCase,
     BookingEvent,
     BookingMessage,
@@ -58,6 +72,7 @@ from facility_profiles.booking.schema import (
     RejectReason,
     ReplyClassification,
     ReplyStatus,
+    questions_of,
 )
 from facility_profiles.booking.templates import (
     TemplateKind,
@@ -73,23 +88,15 @@ from facility_profiles.booking.worklist import (
     open_exceptions,
     resolve,
 )
-from facility_profiles.clock import local_to_eastern, slot_text, stamp, to_eastern
+from facility_profiles.booking.writer import ReplySituation, ReplyWriter, check_reply
+from facility_profiles.clock import slot_text, stamp, to_eastern
 from facility_profiles.config import Settings
 from facility_profiles.customers import customer_of
 from facility_profiles.extraction.llm import ExtractionError
-from facility_profiles.extraction.openrouter import (
-    DEFAULT_BASE_URL,
-    OpenRouterExtractor,
-    qualify_model,
-    strict_json_schema,
-)
+from facility_profiles.logging import get_logger
 from facility_profiles.storage.repository import Repository, as_utc
 
-FORBIDDEN_TOPICS = re.compile(
-    r"\b(rate|rates|detention|accessorial|tonu|invoice|charge|charges|fee|fees|payment|pay|"
-    r"claim|damage|lumper)\b|\$\s?\d",
-    re.I,
-)
+log = get_logger(__name__)
 # A facility that cannot book for a reason other than the day: moving the delivery would not help,
 # so nothing goes to the customer's desk and a person reads the reply.
 NOT_THE_DAY: dict[RejectReason, str] = {
@@ -101,18 +108,6 @@ NOT_THE_DAY: dict[RejectReason, str] = {
     ),
     RejectReason.OTHER: "the facility cannot book, and not because of the day; read their reply",
 }
-ANSWER_FACT_KEYS = (
-    "po_numbers",
-    "carrier",
-    "equipment",
-    "customer",
-    "delivery_site",
-    "delivery_date",
-    "delivery_ref",
-    "requested_pickup",
-    "load_id",
-    "pickup_number",
-)
 
 
 class ResponseIntent(StrEnum):
@@ -137,27 +132,15 @@ class ResponsePlan:
     to_addr: str | None = None
     proposed_local: str | None = None
     signed: bool = False  # the body already ends with the signature (it came from a template)
+    # What the reply tells the facility, for the writer, with the dates and times it must carry.
+    decision: str = ""
+    must_include: tuple[str, ...] = ()
+    # The facility's questions this reply leaves for a person; they are raised in Needs you.
+    unanswered: tuple[str, ...] = ()
+    written: bool = False  # the body was written for the situation (and passed its check)
 
 
 # ------------------------------------------------------------------ facts and feasibility
-
-
-def case_facts(case: BookingCase, settings: Settings) -> dict[str, Any]:
-    """The only facts an answer may contain. Every date and time is Eastern."""
-    delivery = as_utc(case.delivery_at_utc)
-    requested = local_to_eastern(case.requested_local, case.vendor_timezone)
-    return {
-        "po_numbers": [str(p) for p in case.po_numbers],
-        "carrier": settings.booking_carrier_name,
-        "equipment": None,
-        "customer": customer_of(case, settings).label(case.customer_name),
-        "delivery_site": case.delivery_site,
-        "delivery_date": to_eastern(delivery).strftime("%m/%d") if delivery else None,
-        "delivery_ref": case.delivery_ref,
-        "requested_pickup": f"{requested} ET" if requested and " " in requested else requested,
-        "load_id": case.load_id,
-        "pickup_number": case.pickup_number,
-    }
 
 
 def local_dt(day: str, clock: str | None, timezone: str | None) -> datetime:
@@ -207,15 +190,17 @@ def alternative_days(case: BookingCase, settings: Settings, *, now: datetime) ->
 
 
 def rounds_so_far(case: BookingCase) -> int:
-    """Outbound messages in the thread after the first request."""
-    return max(0, sum(1 for m in case.messages if m.direction == "out") - 1)
+    """The agent's outbound messages in the thread after the first request (not a person's)."""
+    return max(
+        0, sum(1 for m in case.messages if m.direction == "out" and m.kind != PERSON_MAIL) - 1
+    )
 
 
 # ------------------------------------------------------------------ answers to questions
 
 
 class AnswerDraft(BaseModel):
-    """Structured answer from the model: only allowed facts, or a refusal."""
+    """An answer from the fixed rules: only allowed facts, or a refusal."""
 
     answerable: bool
     message: str | None = Field(None, description="Short reply text, or null")
@@ -223,17 +208,9 @@ class AnswerDraft(BaseModel):
     reason: str | None = None
 
 
-class AnswerComposer(Protocol):
-    """Anything that turns a vendor question plus facts into a reply."""
-
-    def compose(self, question: str, facts: dict[str, Any], history: list[str]) -> AnswerDraft:
-        """Compose the answer or say it cannot be answered."""
-        ...
-
-
 # The questions the case itself answers. Each is narrow on purpose: a question that only looks
 # like one ("What is the delivery number for this PO?" names a PO but does not ask which PO) must
-# not get its answer. Anything else goes to the model, which may use only the facts, or a person.
+# not get its answer. Without a writer, anything else goes to a person.
 _DELIVERY_NUMBER = re.compile(
     r"\b(?:delivery|dct|receiving)\s*(?:appointment\s*|appt\.?\s*)?"
     r"(?:number|#|no\.?|ref\w*|confirmation)",
@@ -296,6 +273,7 @@ def answer_from_rules(question: str, facts: dict[str, Any]) -> AnswerDraft | Non
         _WHICH_CARRIER.search(q)
         and not _ABOUT_TIME.search(q)
         and not _ABOUT_CARRIER_DETAIL.search(q)
+        and facts.get("carrier")  # the trucking company on the dispatch; none assigned, no answer
     ):
         carrier = str(facts["carrier"])
         return AnswerDraft(
@@ -347,96 +325,31 @@ def answer_is_safe(draft: AnswerDraft, facts: dict[str, Any]) -> tuple[bool, str
     for number in re.findall(r"\d{4,}", draft.message):
         if number not in allowed:
             return False, f"answer contains a number not on the case: {number}"
-    unknown = [k for k in draft.facts_used if k not in ANSWER_FACT_KEYS]
+    unknown = [k for k in draft.facts_used if k not in FACT_KEYS]
     if unknown:
         return False, f"answer used facts that do not exist: {', '.join(unknown)}"
     return True, "ok"
 
 
-ANSWER_SYSTEM_PROMPT = """You draft a one- or two-sentence email reply from a freight broker to a \
-shipping facility that asked a question about a pickup appointment request.
+def raise_questions(
+    session: Session, case: BookingCase, questions: Iterable[str], *, replied: bool = False
+) -> None:
+    """Put what the facility asked and the agent did not answer in Needs you.
 
-Rules:
-- Use only the facts given. If the question needs anything else (driver name, truck number, \
-rates, times not listed), set answerable=false and explain in reason.
-- Never mention rates, charges, detention, fees or payment.
-- Keep the same plain tone as the example: "The carrier is Circle Logistics, Inc."
-- List every fact key you used in facts_used."""
-
-
-class OpenRouterAnswerComposer:
-    """Model-drafted answers for questions the rules do not cover."""
-
-    def __init__(
-        self,
-        api_key: str,
-        *,
-        model: str,
-        base_url: str = DEFAULT_BASE_URL,
-        transport: httpx.BaseTransport | None = None,
-    ) -> None:
-        self.model = qualify_model(model)
-        self._url = f"{base_url.rstrip('/')}/chat/completions"
-        self._schema = strict_json_schema(AnswerDraft)
-        self._http = httpx.Client(
-            timeout=60.0,
-            transport=transport,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "X-Title": f"facility-profiles-booking/{__version__}",
-            },
-        )
-
-    def compose(self, question: str, facts: dict[str, Any], history: list[str]) -> AnswerDraft:
-        """One strict-schema call."""
-        user = (
-            f"Facts:\n{json.dumps(facts, indent=2)}\n\nThread so far:\n"
-            + "\n---\n".join(history[-4:])
-            + f"\n\nThe vendor asked: {question}"
-        )
-        body = {
-            "model": self.model,
-            "max_tokens": 600,
-            "temperature": 0,
-            "messages": [
-                {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
-                {"role": "user", "content": user},
-            ],
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {"name": "answer_draft", "strict": True, "schema": self._schema},
-            },
-            "provider": {"require_parameters": True},
-        }
-        try:
-            response = self._http.post(self._url, json=body)
-        except httpx.TransportError as exc:
-            raise ExtractionError(f"could not reach OpenRouter: {exc}", retryable=True) from exc
-        data = OpenRouterExtractor._parse_envelope(response)
-        content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
-        if isinstance(content, list):
-            content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
-        if not isinstance(content, str) or not content.strip():
-            raise ExtractionError("OpenRouter returned empty content")
-        try:
-            return AnswerDraft.model_validate(json.loads(content))
-        except (json.JSONDecodeError, ValidationError) as exc:
-            raise ExtractionError(f"answer draft invalid: {exc}") from exc
-
-
-@dataclass
-class FakeAnswerComposer:
-    """Scripted composer for tests."""
-
-    drafts: dict[str, AnswerDraft] = field(default_factory=dict)
-    calls: list[str] = field(default_factory=list)
-
-    def compose(self, question: str, facts: dict[str, Any], history: list[str]) -> AnswerDraft:
-        """Return the scripted draft for the question, else not answerable."""
-        del facts, history
-        self.calls.append(question)
-        return self.drafts.get(question, AnswerDraft(answerable=False, reason="not scripted"))
+    ``replied`` says the agent's reply went out with the rest answered and told them someone
+    will get back to them on these.
+    """
+    asked = "; ".join(q.strip() for q in questions if q.strip())
+    if not asked:
+        return
+    told = "; the reply said someone will get back to them" if replied else ""
+    flag(
+        session,
+        case,
+        ExceptionType.FACILITY_QUESTION,
+        f"vendor asked: {asked}"[: 255 - len(told)] + told,
+        question=asked,
+    )
 
 
 # ------------------------------------------------------------------ the responder
@@ -453,13 +366,19 @@ class Responder:
 
     ``mailer`` drafts (or, passed a sender, sends everything through the gate). ``sender``
     sends what the customer's rule says to send, in send mode; the rest is drafted.
+
+    ``writer`` writes each reply for its situation (``booking/writer.py``) from the facts:
+    the case's, and the load's read through ``facts`` (Transport Pro, read only). Without a
+    writer, or when its draft fails its check, the pod's fixed wording goes out instead.
     """
 
     settings: Settings
     mailer: Mailer | Sender
-    composer: AnswerComposer | None = None
+    writer: ReplyWriter | None = None
     now: datetime | None = None
     sender: Sender | None = None
+    facts: FactsSource | None = None
+    _loads_read: dict[int, dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
 
     def _now(self) -> datetime:
         return self.now or datetime.now(tz=UTC)
@@ -493,12 +412,14 @@ class Responder:
                 "the facility named no time zone; a person checks which clock they meant",
             )
         if result.status == ReplyStatus.COUNTER_OFFER:
-            return self._plan_counter_offer(case, result)
-        if result.status == ReplyStatus.QUESTION:
-            return self._plan_question(case, result, text)
-        if result.status == ReplyStatus.REJECTED:
+            plan = self._plan_counter_offer(case, result)
+        elif result.status == ReplyStatus.QUESTION:
+            plan = self._plan_question(case, result, text)
+        elif result.status == ReplyStatus.REJECTED:
             return self._plan_rejection(case, result, text)
-        return ResponsePlan(ResponseIntent.HANDOFF, f"no policy for a {result.status} reply")
+        else:
+            return ResponsePlan(ResponseIntent.HANDOFF, f"no policy for a {result.status} reply")
+        return self._write(case, reply, result, plan)
 
     def _plan_counter_offer(self, case: BookingCase, result: ReplyClassification) -> ResponsePlan:
         if not result.pickup_date:
@@ -506,17 +427,19 @@ class Responder:
         clock = result.pickup_time
         offered = local_dt(result.pickup_date, clock, case.vendor_timezone)
         feasible, why = offer_is_feasible(case, offered, self.settings, now=self._now())
+        mmdd, hhmm = vendor_when(
+            f"{result.pickup_date} {clock or ''}".strip(), case.vendor_timezone
+        )
+        when = mmdd + (f" @ {hhmm}" if hhmm else "")
         if feasible:
-            mmdd, hhmm = vendor_when(
-                f"{result.pickup_date} {clock or ''}".strip(), case.vendor_timezone
-            )
-            when = mmdd + (f" @ {hhmm}" if hhmm else "")
             return ResponsePlan(
                 ResponseIntent.ACCEPT_OFFER,
                 f"offer {when} {why}",
                 body=f"Yes, {when} works. Thank you!",
                 to_addr=case.contact_email,
                 proposed_local=f"{result.pickup_date} {clock or ''}".strip(),
+                decision=f"Accept the pickup time they offered, {when}: tell them it works.",
+                must_include=tuple(x for x in (mmdd, hhmm) if x),
             )
         days = alternative_days(case, self.settings, now=self._now())
         if not days:
@@ -529,33 +452,114 @@ class Responder:
             f"What do you have available on {' or '.join(days)}? Thank you!"
         )
         return ResponsePlan(
-            ResponseIntent.ASK_ALTERNATIVE, f"offer {why}", body=body, to_addr=case.contact_email
+            ResponseIntent.ASK_ALTERNATIVE,
+            f"offer {why}",
+            body=body,
+            to_addr=case.contact_email,
+            decision=(
+                f"Their offer of {when} would not make our delivery appointment on "
+                f"{deliver_on}{ref}. Ask what they have available on {' or '.join(days)}."
+            ),
+            must_include=tuple(days) + ((deliver_on,) if delivery else ()),
         )
 
     def _plan_question(
         self, case: BookingCase, result: ReplyClassification, text: str
     ) -> ResponsePlan:
+        """Answer from the fixed rules; the writer, when there is one, answers every question."""
         question = (result.question or text).strip()
-        facts = case_facts(case, self.settings)
+        facts = self._facts(case)
         draft = answer_from_rules(question, facts)
-        if draft is None and self.composer is not None:
-            history = [
-                f"{'us' if m.direction == 'out' else 'vendor'}: {m.body or ''}"
-                for m in case.messages
-            ]
-            draft = self.composer.compose(question, facts, history)
-        if draft is None:
-            return ResponsePlan(ResponseIntent.HANDOFF, f"no rule answers: {question[:120]}")
-        ok, why = answer_is_safe(draft, facts)
-        if not ok:
+        why = f"no rule answers: {question[:120]}"
+        if draft is not None:
+            ok, why = answer_is_safe(draft, facts)
+            draft = draft if ok else None
+        if draft is None and self.writer is None:
             return ResponsePlan(ResponseIntent.HANDOFF, why)
-        assert draft.message is not None
         return ResponsePlan(
             ResponseIntent.ANSWER_QUESTION,
-            f"answered from {', '.join(draft.facts_used) or 'facts'}",
-            body=f"{draft.message} Thank you!",
+            f"answered from {', '.join(draft.facts_used) or 'facts'}" if draft else why,
+            body=f"{draft.message} Thank you!" if draft else None,
             to_addr=case.contact_email,
+            decision="Answer their questions.",
         )
+
+    # -- writing for the situation
+
+    def _facts(self, case: BookingCase) -> dict[str, Any]:
+        """The fact sheet for ``case``: its own facts now, its load's read once per responder."""
+        facts = case_facts(case, self.settings)
+        if self.facts is None:
+            return facts
+        if case.load_id not in self._loads_read:
+            self._loads_read[case.load_id] = read_load_facts(case, self.facts)
+        return with_load(facts, self._loads_read[case.load_id])
+
+    @staticmethod
+    def _history(case: BookingCase) -> tuple[str, ...]:
+        recent = [m for m in case.messages if (m.body or "").strip()][-4:]
+        return tuple(
+            f"{'us' if m.direction == 'out' else 'facility'}: {(m.body or '').strip()[:800]}"
+            for m in recent
+        )
+
+    def _write(
+        self,
+        case: BookingCase,
+        reply: BookingMessage | None,
+        result: ReplyClassification | None,
+        plan: ResponsePlan,
+    ) -> ResponsePlan:
+        """The plan with its words written for what the facility wrote, or the fixed wording.
+
+        The writer states the decision and answers every question it can from the facts; the
+        ones it cannot are left for a person (``unanswered``). Its draft goes out only when it
+        passes its check. Otherwise the fixed wording goes, and every question but the one a
+        fixed rule answered is left for a person; an answer with no fixed wording is handed off.
+        """
+        if plan.intent == ResponseIntent.HANDOFF or result is None:
+            return plan
+        asked = questions_of(result)
+        if plan.intent == ResponseIntent.ANSWER_QUESTION and not asked:
+            asked = [((result.question or (reply.body if reply else "")) or "").strip()]
+        asked = [q for q in asked if q]
+        # A fixed rule answered the main question (the reading's own, else the first listed).
+        fixed = plan.intent == ResponseIntent.ANSWER_QUESTION and plan.body is not None
+        main = (result.question or "").strip()
+        main = main if main in asked else (asked[0] if asked else "")
+        fallback = replace(plan, unanswered=tuple(q for q in asked if not (fixed and q == main)))
+        if self.writer is None:
+            return fallback
+        situation = ReplySituation(
+            intent=plan.intent.value,
+            decision=plan.decision or "Thank them.",
+            must_include=plan.must_include,
+            their_words=(reply.body or "") if reply else "",
+            questions=tuple(asked),
+            conditions=tuple(result.conditions),
+            facts=self._facts(case),
+            history=self._history(case),
+        )
+        try:
+            checked = check_reply(self.writer.write(situation), situation)
+            problems = checked.problems
+        except ExtractionError as exc:
+            checked, problems = None, [f"the writer failed: {exc}"]
+        if checked is not None and checked.ok and fixed and not checked.answered:
+            return fallback  # a holding reply is worse than the fixed answer the rules have
+        if checked is not None and checked.ok:
+            return replace(
+                plan,
+                body=checked.body,
+                unanswered=tuple(checked.unanswered),
+                written=True,
+                reason=f"{plan.reason}; written for the situation",
+            )
+        note = "; ".join(problems)[:200]
+        log.warning("booking.reply_not_written", case=case.id, intent=plan.intent, why=note)
+        if plan.body is None:
+            return ResponsePlan(ResponseIntent.HANDOFF, f"no answer passed its check: {note}")
+        return replace(fallback, reason=f"{plan.reason}; fixed wording ({note})")
 
     def _plan_rejection(
         self, case: BookingCase, result: ReplyClassification, text: str
@@ -653,9 +657,18 @@ class Responder:
                 flag(session, case, ExceptionType.HANDOFF, note[:255])
             self._event(session, case, "reply_not_sent", reason=refused, draft_ref=ref)
         self._settle(session, case, plan, sent=delivery.sent)
+        if plan.unanswered:
+            raise_questions(session, case, plan.unanswered, replied=plan.written)
         session.flush()
         self._event(
-            session, case, plan.intent.value, reason=plan.reason, to=draft.to_addr, draft_ref=ref
+            session,
+            case,
+            plan.intent.value,
+            reason=plan.reason,
+            to=draft.to_addr,
+            draft_ref=ref,
+            written=plan.written,
+            unanswered=list(plan.unanswered),
         )
         return message
 
@@ -813,21 +826,33 @@ class Responder:
         return None
 
     def acknowledge(
-        self, session: Session, case: BookingCase, reply: BookingMessage
+        self,
+        session: Session,
+        case: BookingCase,
+        reply: BookingMessage,
+        result: ReplyClassification | None = None,
     ) -> BookingMessage | None:
-        """The pod always answers a confirmation with "Thank you!"; so does the agent, once."""
+        """The pod always answers a confirmation with "Thank you!"; so does the agent, once.
+
+        Given the reading, the thanks is written for the situation: it also answers what the
+        confirmation asked ("Confirmed for 9am. What's the trailer number?").
+        """
         if any(
             m.direction == "out" and m.kind == ResponseIntent.ACKNOWLEDGE.value
             for m in case.messages
         ):
             return None
+        slot = case.confirmed_local or case.requested_local
+        mmdd, hhmm = vendor_when(slot, case.vendor_timezone) if slot else ("", "")
+        when = f" for {mmdd}" + (f" @ {hhmm}" if hhmm else "") if mmdd else ""
         plan = ResponsePlan(
             ResponseIntent.ACKNOWLEDGE,
             "vendor confirmed",
             body="Thank you!",
             to_addr=reply.from_addr or case.contact_email,
+            decision=f"They confirmed the pickup{when}. Thank them.",
         )
-        return self.act(session, case, reply, plan)
+        return self.act(session, case, reply, self._write(case, reply, result, plan))
 
     # -- helpers
 
@@ -879,7 +904,12 @@ class Responder:
             pos = " & ".join(str(p) for p in case.po_numbers) or f"load {case.load_id}"
             return f"RESCHEDULE {pos}"
         base = (reply.subject if reply and reply.subject else None) or next(
-            (m.subject for m in case.messages if m.direction == "out" and m.subject), ""
+            (
+                m.subject
+                for m in case.messages
+                if m.direction == "out" and m.kind != PERSON_MAIL and m.subject
+            ),
+            "",
         )
         base = base or f"Pick Up Appointment: {' & '.join(str(p) for p in case.po_numbers)}"
         return base if base.lower().startswith("re:") else f"Re: {base}"

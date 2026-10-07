@@ -37,6 +37,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from facility_profiles.booking.classify import ReplyClassifier
+from facility_profiles.booking.facts import FactsSource
 from facility_profiles.booking.inbox import Inbox
 from facility_profiles.booking.mail import Mailer, Sender
 from facility_profiles.booking.models import (
@@ -48,7 +49,7 @@ from facility_profiles.booking.models import (
     JobStatus,
 )
 from facility_profiles.booking.outbox import SendRefusedError
-from facility_profiles.booking.respond import AnswerComposer, Responder
+from facility_profiles.booking.respond import Responder
 from facility_profiles.booking.rules import check_desk_rules, request_opens, vendor_profile
 from facility_profiles.booking.service import (
     IngestStats,
@@ -61,6 +62,7 @@ from facility_profiles.booking.service import (
 from facility_profiles.booking.timers import fmt_slot, slot_at, sweep
 from facility_profiles.booking.worklist import flag, open_kinds
 from facility_profiles.booking.writeback import LoadWriter, write_appointments
+from facility_profiles.booking.writer import ReplyWriter
 from facility_profiles.clock import stamp
 from facility_profiles.config import Settings
 from facility_profiles.customers import customers
@@ -91,6 +93,7 @@ class RunReport:
     closed: int = 0
     written_to_tpro: int = 0
     mail_read: int = 0  # new replies read from the inbox
+    mail_by_person: int = 0  # emails people at Circle sent on the group, kept on their pickups
     mail_answered: int = 0  # answers the agent wrote to them (sent or drafted)
     auto_confirmed: int = 0  # confirmations it booked itself
     mail_failed: int = 0  # replies that failed (retried on the next pass) or an unreadable inbox
@@ -390,13 +393,14 @@ def _read_inbox(
     classifier: ReplyClassifier,
     *,
     settings: Settings,
-    mailer: Mailer,
-    sender: Sender | None,
-    composer: AnswerComposer | None,
-    now: datetime,
+    responder: Responder | None,
     report: RunReport,
 ) -> None:
-    """Read the new replies and answer each, one at a time; a failure leaves that one for later."""
+    """Read the new mail, oldest first, one email at a time; a failure leaves that one for later.
+
+    With a ``responder`` each vendor reply is also answered; without one the mail is only read:
+    kept on its pickups, which move and raise their to-dos, and nothing is drafted or sent.
+    """
     try:
         messages = inbox.fetch()
     except Exception as exc:  # an unreadable inbox must not stop the rest of the pass
@@ -404,8 +408,7 @@ def _read_inbox(
         report.mail_failed += 1
         report.lines.append(f"inbox: could not read the mail ({exc})")
         return
-    responder = Responder(settings, mailer, composer=composer, now=now, sender=sender)
-    for message in messages:
+    for message in sorted(messages, key=lambda m: m.sent_at):
         try:
             with session.begin_nested():
                 stats: IngestStats = ingest(
@@ -422,6 +425,7 @@ def _read_inbox(
             report.lines.append(f"inbox: could not handle {message.subject!r}; trying next pass")
             continue
         report.mail_read += stats.new_mail
+        report.mail_by_person += stats.by_person
         report.mail_answered += stats.responded
         report.auto_confirmed += stats.auto_confirmed
         report.mail_unmatched += stats.unmatched_kept
@@ -438,6 +442,20 @@ def _read_inbox(
             )
 
 
+def read_mail(
+    session: Session, settings: Settings, *, inbox: Inbox, classifier: ReplyClassifier
+) -> RunReport:
+    """Read the new mail onto the board and answer nothing (``serve --mail-every``).
+
+    Every email on the customer's group is kept on its pickup: the vendor's (read, so the
+    pickup moves and its to-dos are raised), the customer desk's, and the ones people at Circle
+    sent. Nothing is drafted, sent or written to Transport Pro.
+    """
+    report = RunReport()
+    _read_inbox(session, inbox, classifier, settings=settings, responder=None, report=report)
+    return report
+
+
 def run_once(
     session: Session,
     settings: Settings,
@@ -449,13 +467,15 @@ def run_once(
     client: LoadWriter | None = None,
     inbox: Inbox | None = None,
     classifier: ReplyClassifier | None = None,
-    composer: AnswerComposer | None = None,
+    writer: ReplyWriter | None = None,
+    facts: FactsSource | None = None,
 ) -> RunReport:
     """One pass of the agent on its own: read new replies, plan open requests, write what's due.
 
     ``client`` writes the booked pickups to Transport Pro; pass one only while write-back is on.
-    ``inbox`` and ``classifier`` read and answer the vendors' replies (``composer`` answers the
-    questions no rule answers); without them replies wait for ``booking inbox``.
+    ``inbox`` and ``classifier`` read and answer the vendors' replies; without them replies wait
+    for ``booking inbox``. ``writer`` writes each answer for its situation from the facts, the
+    load's read through ``facts`` (Transport Pro, read only); without it the fixed wording goes.
     """
     report = RunReport()
     if timers:
@@ -466,10 +486,14 @@ def run_once(
             inbox,
             classifier,
             settings=settings,
-            mailer=mailer,
-            sender=sender if settings.booking_mode == "send" else None,
-            composer=composer,
-            now=now,
+            responder=Responder(
+                settings,
+                mailer,
+                writer=writer,
+                now=now,
+                sender=sender if settings.booking_mode == "send" else None,
+                facts=facts,
+            ),
             report=report,
         )
     known = customers(settings)

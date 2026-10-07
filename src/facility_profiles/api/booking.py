@@ -17,8 +17,9 @@ decision (marking a pickup booked) is Eastern too.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from datetime import UTC, datetime, timedelta
+from email.utils import getaddresses
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -32,6 +33,7 @@ from facility_profiles.booking.inbox import reader_tools
 from facility_profiles.booking.links import offer_state
 from facility_profiles.booking.memory import desk_history
 from facility_profiles.booking.models import (
+    PERSON_MAIL,
     AutomationJob,
     BookingCase,
     BookingEvent,
@@ -112,6 +114,40 @@ EVENTS: dict[str, str] = {
     "booked_changed": "Vendor changed a booked pickup",
     "thanks_held": "No thank-you sent",
     "mail_linked": "Email linked to this pickup",
+    "sent_by_person": "Email sent by a person",
+}
+# Transport Pro changes the board's "Latest updates" lists beside the emails.
+LOAD_UPDATES = frozenset(
+    {
+        "scanned",
+        "delivery_from_tpro",
+        "tender_changed",
+        "booked_in_tpro",
+        "picked_up_in_tpro",
+        "closed",
+        "written_to_tpro",
+    }
+)
+UPDATES_DAYS = 14
+UPDATES_SHOWN = 25
+# What the agent made of a vendor's email, in a few words.
+READ_AS = {
+    "confirmed": "confirmed",
+    "counter_offer": "offered another time",
+    "question": "asked a question",
+    "rejected": "cannot book",
+    "deferred": "asked to check back",
+}
+# What the agent's own emails did, in a few words: "The agent asked for the pickup".
+AGENT_MAIL = {
+    "request": "asked for the pickup",
+    "reschedule": "asked for a new time",
+    "follow_up": "sent a reminder",
+    "acknowledge": "thanked the vendor",
+    "accept_offer": "accepted the vendor's time",
+    "ask_alternative": "asked for other days",
+    "answer_question": "answered a question",
+    "escalate_to_customer": "wrote to the customer's desk",
 }
 
 
@@ -181,6 +217,106 @@ def case_summary(case: BookingCase, *, now: datetime) -> dict[str, Any]:
         "reschedule_count": case.reschedule_count or 0,
         "open_exceptions": [exception_view(e) for e in case.open_exceptions],
         "last_activity": last.isoformat() if last else None,
+    }
+
+
+def _in_order(messages: list[BookingMessage]) -> list[BookingMessage]:
+    """A pickup's emails as one chain, oldest first: by when each was sent (or written)."""
+    epoch = datetime.min.replace(tzinfo=UTC)
+    return sorted(
+        messages, key=lambda m: (as_utc(m.sent_at) or as_utc(m.created_at) or epoch, m.id)
+    )
+
+
+def _who(header: str | None, *, outside: Iterable[str] = ()) -> str:
+    """A name from an address header; with ``outside``, the first address not on those domains.
+
+    "To: _US_Mail_Inbound <inbound@lidl.us>, Lidl Group <lidl@circledelivers.com>" is the
+    customer's desk, not our own group.
+    """
+    pairs = [(n, a) for n, a in getaddresses([header or ""]) if a and "@" in a]
+    theirs = [p for p in pairs if p[1].lower().rpartition("@")[2] not in set(outside)]
+    name, address = (theirs or pairs or [("", "")])[0]
+    return name.strip().strip('"') or address or "someone"
+
+
+def _email_update(
+    message: BookingMessage, internal: Iterable[str]
+) -> tuple[datetime, str, str] | None:
+    """An email as a line of "Latest updates": when, what happened, about what."""
+    at = as_utc(message.sent_at) or as_utc(message.created_at)
+    if at is None:
+        return None
+    subject = message.subject or "(no subject)"
+    if message.direction == "out" and message.kind == PERSON_MAIL:
+        to = _who(message.to_addr, outside=internal)
+        return at, f"{_who(message.from_addr)} emailed {to}", subject
+    if message.direction == "out":
+        if message.sent_at is None:
+            return None  # a draft is not a conversation yet; "Not asked yet" counts the drafts
+        what = AGENT_MAIL.get(message.kind, message.kind.replace("_", " "))
+        return at, f"The agent {what}", subject
+    if message.kind == "customer_desk":
+        return at, f"{_who(message.from_addr)} (the customer's desk) wrote", subject
+    if message.kind == "link":
+        return at, "The vendor answered with the link", subject
+    reading = message.classification or {}
+    said = READ_AS.get(str(reading.get("status") or ""))
+    read = f", read as {said}" if said and not reading.get("skipped") else ""
+    return at, f"{_who(message.from_addr)} wrote{read}", subject
+
+
+def latest_updates(
+    cases: list[BookingCase], *, now: datetime, internal: Iterable[str] = ("circledelivers.com",)
+) -> list[dict[str, Any]]:
+    """The newest emails and Transport Pro changes across the pickups, newest first.
+
+    Every email on a pickup counts, whoever sent it (the vendor, the agent, a person at Circle,
+    the customer's desk), at the time it was sent; a change Transport Pro showed counts at the
+    time the board saw it.
+    """
+    since = now - timedelta(days=UPDATES_DAYS)
+    domains = {d.lower() for d in internal}
+    rows: list[dict[str, Any]] = []
+    # One email that covered several pickups (a batched request, its reply) is one row.
+    by_email: dict[str, dict[str, Any]] = {}
+    for case in cases:
+        pos = [str(p) for p in case.po_numbers]
+        for message in case.messages:
+            line = _email_update(message, domains)
+            if line is None or line[0] < since:
+                continue
+            key = message.rfc_message_id or message.message_id or f"#{message.id}"
+            if key in by_email:
+                by_email[key]["po"] += [p for p in pos if p not in by_email[key]["po"]]
+                continue
+            by_email[key] = _update(line[0], case, pos, source="email", what=line[1], about=line[2])
+            rows.append(by_email[key])
+        for event in case.events:
+            at = as_utc(event.created_at)
+            if event.action in LOAD_UPDATES and at is not None and at >= since:
+                said = EVENTS.get(event.action, event.action.replace("_", " "))
+                reason = str((event.detail or {}).get("reason") or "")
+                if reason.lower().startswith(("picked up", "booked in transport pro")):
+                    reason = ""  # the title already says it
+                rows.append(_update(at, case, pos, source="load", what=said, about=reason))
+    rows.sort(key=lambda row: (row["at"], row["case_id"]), reverse=True)
+    for row in rows:
+        row["po"] = ", ".join(row["po"])
+    return rows[:UPDATES_SHOWN]
+
+
+def _update(
+    at: datetime, case: BookingCase, pos: list[str], *, source: str, what: str, about: str
+) -> dict[str, Any]:
+    return {
+        "at": _iso(at),
+        "case_id": case.id,
+        "vendor": case.vendor_name,
+        "po": list(pos),
+        "source": source,
+        "what": what,
+        "about": about,
     }
 
 
@@ -361,7 +497,7 @@ def case_detail(
         "facility_key": case.facility_key,
         "references": [n.as_dict() for n in case_numbers(case)],
         "exceptions": [exception_view(e) for e in case.exceptions],
-        "messages": [_message_view(m, case.vendor_timezone) for m in case.messages],
+        "messages": [_message_view(m, case.vendor_timezone) for m in _in_order(case.messages)],
         "offers": [offer_view(o, now=now) for o in case.offers],
         "jobs": [job_view(j) for j in case.jobs],
         "timeline": timeline(case),
@@ -645,6 +781,8 @@ def get_overview(
     data["mail"] = [mail_view(m) for m in open_unmatched(session) if _sees_mail(viewer, m)]
     data["counts"]["unmatched_mail"] = len(data["mail"])
     data["scan"] = getattr(request.app.state, "scan", None)
+    data["mail_check"] = getattr(request.app.state, "mail_check", None)
+    data["updates"] = latest_updates(cases, now=now, internal=settings.internal_email_domains)
     return data
 
 

@@ -5,16 +5,15 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from facility_profiles.booking.classify import FakeReplyClassifier, ReplyContext
+from facility_profiles.booking.facts import case_facts
 from facility_profiles.booking.mail import InboundMessage, RecordingMailer
 from facility_profiles.booking.models import BookingCase, CaseStatus, ExceptionType
 from facility_profiles.booking.respond import (
     AnswerDraft,
-    FakeAnswerComposer,
     Responder,
     alternative_days,
     answer_from_rules,
     answer_is_safe,
-    case_facts,
     offer_is_feasible,
 )
 from facility_profiles.booking.schema import RejectReason, ReplyClassification, ReplyStatus
@@ -145,29 +144,16 @@ def test_counter_offer_that_misses_delivery_asks_for_alternatives_then_caps(sett
         )
 
 
-def test_questions_are_answered_from_facts_or_handed_off(settings, sessions):
+def test_without_a_writer_the_fixed_rules_answer_and_the_rest_is_handed_off(settings, sessions):
     settings = settings.model_copy(update={"pilot_terminal_ids": [1089]})
     mailer = RecordingMailer()
     case_id = _prepared_case(settings, sessions, mailer)
-    composer = FakeAnswerComposer(
-        {
-            "Is this a reefer or a dry van?": AnswerDraft(
-                answerable=True, message="This is a Reefer load.", facts_used=["equipment"]
-            ),
-            "Please send the driver name and truck number.": AnswerDraft(
-                answerable=False, reason="driver details are not on the case"
-            ),
-            "Confirm PO 999999999 please?": AnswerDraft(
-                answerable=True, message="Yes, PO 999999999 is correct.", facts_used=["po_numbers"]
-            ),
-        }
-    )
 
     def script(ctx: ReplyContext) -> ReplyClassification:
         return ReplyClassification(status=ReplyStatus.QUESTION, question=ctx.body.strip())
 
     classifier = FakeReplyClassifier(script)
-    responder = Responder(settings, mailer, composer=composer, now=NOW)
+    responder = Responder(settings, mailer, now=NOW)
     with session_scope(sessions) as session:
         case = session.get(BookingCase, case_id)
         assert case is not None
@@ -181,34 +167,25 @@ def test_questions_are_answered_from_facts_or_handed_off(settings, sessions):
                 responder=responder,
             )
 
-        ask("Which carrier is picking up?", "q1")
+        ask("Both orders?", "q1")
         assert case.status == CaseStatus.PENDING.value and open_kinds(case) == []
-        assert case.exceptions[0].resolution == "agent answered from carrier"
-        assert mailer.drafts[-1].body.startswith("The carrier is Circle Logistics, Inc. Thank you!")
-        ask("Both orders?", "q2")
-        assert mailer.drafts[-1].body.startswith("Just PO# 226321092660.")
-        ask("Where is this delivering to?", "q3")
+        assert case.exceptions[0].resolution == "agent answered from po_numbers"
+        assert mailer.drafts[-1].body.startswith("Just PO# 226321092660. Thank you!")
+        ask("Where is this delivering to?", "q2")
         assert "Lidl (Perryville, MD) on 10/02 (PYE_021026123)" in mailer.drafts[-1].body
-        assert composer.calls == []  # rules covered all of those
-
-        settings2 = settings.model_copy(update={"booking_max_rounds": 10})
-        responder.settings = settings2
-        ask("Is this a reefer or a dry van?", "q4")
-        assert composer.calls[-1] == "Is this a reefer or a dry van?"
-        assert mailer.drafts[-1].body.startswith("This is a Reefer load.")
-        ask("Please send the driver name and truck number.", "q5")
-        assert case.status == CaseStatus.PENDING.value and open_kinds(case) == ["facility_question"]
-        assert "driver details" in case.open_exceptions[0].description
-        resolve(
-            session,
-            case,
-            [ExceptionType.FACILITY_QUESTION],
-            resolution="sent the driver details",
-            by="megan",
-        )
-        ask("Confirm PO 999999999 please?", "q6")
+        drafted = len(mailer.drafts)
+        # No trucking company is on the case without the load's dispatch: no fixed answer.
+        ask("Which carrier is picking up?", "q3")
+        assert len(mailer.drafts) == drafted
         assert open_kinds(case) == ["facility_question"]
-        assert "number not on the case: 999999999" in case.events[-1].detail["reason"]
+        assert "no rule answers" in case.events[-1].detail["reason"]
+        resolve(
+            session, case, [ExceptionType.FACILITY_QUESTION], resolution="told them", by="megan"
+        )
+        responder.settings = settings.model_copy(update={"booking_max_rounds": 10})
+        ask("Confirm PO 999999999 please?", "q4")
+        assert open_kinds(case) == ["facility_question"]
+        assert len(mailer.drafts) == drafted
 
 
 def test_rejection_drafts_a_note_to_the_customer_desk_and_money_talk_is_handed_off(

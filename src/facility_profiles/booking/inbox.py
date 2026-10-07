@@ -15,7 +15,7 @@ from typing import Protocol
 
 from facility_profiles.booking.classify import OpenRouterReplyClassifier, ReplyClassifier
 from facility_profiles.booking.mail import GmailReader, InboundMessage
-from facility_profiles.booking.respond import AnswerComposer, OpenRouterAnswerComposer
+from facility_profiles.booking.writer import OpenRouterReplyWriter, ReplyWriter
 from facility_profiles.config import Settings
 from facility_profiles.customers import customers
 
@@ -86,8 +86,8 @@ def inbox_from_settings(settings: Settings) -> Inbox | None:
     return GmailInbox(Path(settings.booking_gmail_key), settings.booking_gmail_user, query)
 
 
-def reader_tools(settings: Settings) -> tuple[ReplyClassifier | None, AnswerComposer | None]:
-    """What reads a reply and composes an answer: the model, when OpenRouter is set up."""
+def reader_tools(settings: Settings) -> tuple[ReplyClassifier | None, ReplyWriter | None]:
+    """What reads a reply and writes the answer: the model, when OpenRouter is set up."""
     key = settings.openrouter_api_key
     if settings.llm_provider != "openrouter" or key is None:
         return None, None
@@ -95,5 +95,5 @@ def reader_tools(settings: Settings) -> tuple[ReplyClassifier | None, AnswerComp
     model, base = settings.llm_model, settings.openrouter_base_url
     return (
         OpenRouterReplyClassifier(secret, model=model, base_url=base),
-        OpenRouterAnswerComposer(secret, model=model, base_url=base),
+        OpenRouterReplyWriter(secret, model=model, base_url=base),
     )

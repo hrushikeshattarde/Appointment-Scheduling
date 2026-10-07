@@ -17,7 +17,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from facility_profiles.booking.mail import Delivery, Mailer, OutboundDraft, Sender, deliver
-from facility_profiles.booking.models import BookingCase, BookingEvent, BookingMessage
+from facility_profiles.booking.models import PERSON_MAIL, BookingCase, BookingEvent, BookingMessage
 from facility_profiles.config import Settings
 
 
@@ -67,7 +67,11 @@ def check_send_gate(
     sent_today = session.scalar(
         select(func.count())
         .select_from(BookingMessage)
-        .where(BookingMessage.direction == "out", BookingMessage.sent_at >= since)
+        .where(
+            BookingMessage.direction == "out",
+            BookingMessage.kind != PERSON_MAIL,  # what people send is not the agent's to count
+            BookingMessage.sent_at >= since,
+        )
     )
     if (sent_today or 0) >= settings.booking_send_daily_cap:
         msg = f"daily send cap of {settings.booking_send_daily_cap} reached; nothing more goes out"

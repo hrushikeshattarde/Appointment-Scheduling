@@ -34,7 +34,7 @@ from facility_profiles.extraction.openrouter import (
     strict_json_schema,
 )
 
-PROMPT_VERSION = "reply-v4"
+PROMPT_VERSION = "reply-v5"
 
 SYSTEM_PROMPT = """You read one email reply from a shipping facility to a freight broker's pickup \
 appointment request and return a JSON object describing it.
@@ -70,6 +70,11 @@ ready or released for that day), "no_capacity" (no appointments left that day), 
 facility is closed that day), "po_not_found" (the PO or order is not in their system, or is \
 wrong), "order_canceled", or "other". Null for every other status.
 - conditions are rules the vendor states (arrive early, bring load bars, register at gate).
+- questions lists every question or request for information the facility puts to us, one per \
+entry, in their own words from the reply's own text, whatever the status: "Both orders?", "What \
+is the weight?", "Please send the driver name and cell". A confirmation or an offer can carry \
+questions too; question is the main one. Questions inside quoted earlier messages are not \
+listed.
 - When the reply answers several PO lines separately (one line per PO or PO pair, each with \
 its own date, time, pickup number or verdict), fill items with one entry per line: that line's \
 PO numbers as written, its status, date, time, pickup number and reject_reason, and quotes from \
@@ -308,7 +313,7 @@ def _validate_slot(
         if value and not time_is_backed(str(value), backing):
             issues.append(ClassificationIssue(prefix + name, "no quote backs this value", value))
             data[name] = None
-    question = data.get("question")
+    question = data.get("question") or (data.get("questions") or [None])[0]
     if data["status"] == ReplyStatus.CONFIRMED and not own_quotes:
         issues.append(
             ClassificationIssue(
@@ -353,10 +358,18 @@ def validate_classification(
             )
             continue
         item["question"] = None  # lines carry verdicts and values, the reply carries the question
+        item["questions"] = []
         issues.extend(_validate_slot(item, own, history, label=label))
         item.pop("question", None)
+        item.pop("questions", None)
         kept_items.append(item)
     data["items"] = kept_items
+    asked = [str(q) for q in data.get("questions") or []]
+    data["questions"] = [q for q in asked if _asked_in(q, own)]
+    for dropped in (q for q in asked if q not in data["questions"]):
+        issues.append(
+            ClassificationIssue("questions", "question not in the reply's own words", dropped)
+        )
     named = data.get("time_zone")
     if named and not _zone_in_text(str(named), everything):
         issues.append(ClassificationIssue("time_zone", "zone not in the message", named))
@@ -367,6 +380,21 @@ def validate_classification(
         elif not reading.get("reject_reason"):
             reading["reject_reason"] = "other"
     return ReplyClassification.model_validate(data), issues
+
+
+_WORD_RE = re.compile(r"[a-z0-9#]{3,}")
+
+
+def _asked_in(question: str, own: str) -> bool:
+    """Whether a listed question comes from the reply's own words, not the quoted history.
+
+    The model may tidy a question, so half its words (3+ letters) in the own words will do.
+    """
+    words = set(_WORD_RE.findall(question.lower()))
+    if not words:
+        return False
+    seen = set(_WORD_RE.findall(own.lower()))
+    return len(words & seen) * 2 >= len(words)
 
 
 def _zone_in_text(word: str, text: str) -> bool:
@@ -465,6 +493,7 @@ def for_case(result: ReplyClassification, po_numbers: list[str]) -> ReplyClassif
         conditions=list(chosen.conditions)
         + [c for c in result.conditions if c not in chosen.conditions],
         question=result.question,
+        questions=list(result.questions),
         quotes=list(chosen.quotes),
         items=[],
         confidence=result.confidence,

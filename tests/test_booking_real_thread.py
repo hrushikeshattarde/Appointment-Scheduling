@@ -247,8 +247,9 @@ def test_replay_of_the_morgan_foods_thread(settings, sessions):
         mark_sent(session, case, by="megan", thread_id=THREAD, sent_at=messages[0].sent_at)
         case_id = case.id
 
-    # Day 1: Megan's request (internal, skipped); Vera books one line and pushes ours to 10/2
-    # ("cannot schedule early pickups"); Megan's "Thank you!" (internal).
+    # Day 1: Megan's request and her "Thank you!" (internal: kept on the case as sent by a
+    # person, never read as replies); Vera books one line and pushes ours to 10/2 ("cannot
+    # schedule early pickups").
     with session_scope(sessions) as session:
         case = session.get(BookingCase, case_id)
         assert case is not None
@@ -256,7 +257,7 @@ def test_replay_of_the_morgan_foods_thread(settings, sessions):
         stats = ingest(
             session, messages[:3], classifier, internal_domains=INTERNAL, responder=responder
         )
-        assert stats.skipped_internal == 2 and stats.classified == 1
+        assert stats.by_person == 2 and stats.skipped_internal == 0 and stats.classified == 1
         assert stats.needs_human == 1 and stats.responded == 1
         # 10/02 09:00 still makes the 10/06 delivery, so the agent accepts, pickup number kept.
         assert awaiting_approval(case)
@@ -283,7 +284,7 @@ def test_replay_of_the_morgan_foods_thread(settings, sessions):
         stats = ingest(
             session, messages[3:7], classifier, internal_domains=INTERNAL, responder=responder
         )
-        assert stats.skipped_internal == 2 and stats.classified == 2
+        assert stats.by_person == 2 and stats.skipped_internal == 0 and stats.classified == 2
         outbound = [m for m in case.messages if m.direction == "out"]
         # "Both orders?" is answered from the case, the way the pod answered it.
         answer = next(m for m in outbound if m.kind == "answer_question")
@@ -311,7 +312,9 @@ def test_replay_of_the_morgan_foods_thread(settings, sessions):
         stats = ingest(
             session, messages[7:], classifier, internal_domains=INTERNAL, responder=responder
         )
-        assert stats.skipped_internal == 6 and stats.after_decision == 0 and stats.classified == 4
+        # The pod's own six emails in the thread (ETAs, "Thank you!") are kept as sent by a person.
+        assert stats.by_person == 6 and stats.skipped_internal == 0
+        assert stats.after_decision == 0 and stats.classified == 4
         assert stats.booked_changed == 0
         assert len(classifier.calls) == calls_so_far + 4
         assert case.status == CaseStatus.SCHEDULED.value

@@ -92,6 +92,14 @@ class ReplyClassification(BaseModel):
     )
     conditions: list[str] = Field(default_factory=list, description="Rules the vendor stated")
     question: str | None = Field(None, description="What the vendor asked, if anything")
+    questions: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Every question or request for information the facility puts to us, one per entry, "
+            "in their own words (driver name and cell, carrier MC, weight, both orders?); also "
+            "inside a confirmation or an offer"
+        ),
+    )
     quotes: list[str] = Field(
         default_factory=list, description="Verbatim snippets from the reply that back the values"
     )
@@ -103,3 +111,11 @@ class ReplyClassification(BaseModel):
         ),
     )
     confidence: float = Field(0.0, description="0 to 1")
+
+
+def questions_of(result: ReplyClassification) -> list[str]:
+    """Everything the facility asked us, in order: the listed questions, else the one question."""
+    asked = [q.strip() for q in result.questions if q and q.strip()]
+    if not asked and result.question and result.question.strip():
+        asked = [result.question.strip()]
+    return list(dict.fromkeys(asked))

@@ -14,10 +14,10 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable, Iterator
-from contextlib import asynccontextmanager, suppress
+from contextlib import ExitStack, asynccontextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -38,6 +38,9 @@ from facility_profiles.api import links as links_api
 from facility_profiles.booking.service import ScanStats, scan
 from facility_profiles.booking.timers import sweep
 from facility_profiles.config import Settings, get_settings
+
+if TYPE_CHECKING:
+    from facility_profiles.booking.automation import RunReport
 from facility_profiles.logging import get_logger
 from facility_profiles.pipeline.collect import identity_from_record
 from facility_profiles.pipeline.digest import render_digest
@@ -113,35 +116,33 @@ def run_autopilot(sessions: sessionmaker[Session], settings: Settings) -> None:
     ):
         user = settings.booking_gmail_user
         sender = GmailSender(Path(settings.booking_gmail_key), user, user)
-    inbox = inbox_from_settings(settings)
-    classifier, composer = reader_tools(settings) if inbox is not None else (None, None)
-    conversation: dict[str, Any] = {"inbox": inbox, "classifier": classifier, "composer": composer}
-    if settings.booking_tpro_writeback:
-        from facility_profiles.tpro.client import TransportProClient  # noqa: PLC0415
+    from facility_profiles.tpro.client import TransportProClient  # noqa: PLC0415
 
-        with (
-            TransportProClient.from_settings(settings, allow_writes=True) as client,
-            session_scope(sessions) as session,
-        ):
-            report = run_once(
-                session,
-                settings,
-                now=datetime.now(tz=UTC),
-                mailer=mailer,
-                sender=sender,
-                client=client,
-                **conversation,
+    inbox = inbox_from_settings(settings)
+    classifier, writer = reader_tools(settings) if inbox is not None else (None, None)
+    with ExitStack() as stack:
+        client = None
+        if settings.booking_tpro_writeback:
+            client = stack.enter_context(
+                TransportProClient.from_settings(settings, allow_writes=True)
             )
-    else:
-        with session_scope(sessions) as session:
-            report = run_once(
-                session,
-                settings,
-                now=datetime.now(tz=UTC),
-                mailer=mailer,
-                sender=sender,
-                **conversation,
-            )
+        # The writer answers from the load as Transport Pro has it now (read only).
+        facts = client
+        if facts is None and writer is not None:
+            facts = stack.enter_context(TransportProClient.from_settings(settings))
+        session = stack.enter_context(session_scope(sessions))
+        report = run_once(
+            session,
+            settings,
+            now=datetime.now(tz=UTC),
+            mailer=mailer,
+            sender=sender,
+            client=client,
+            inbox=inbox,
+            classifier=classifier,
+            writer=writer,
+            facts=facts,
+        )
     log.info("booking.autopilot", **report.counts())
 
 
@@ -176,6 +177,48 @@ async def _every(minutes: float, name: str, job: Callable[[], object]) -> None:
         except Exception:  # keep the board serving; the next pass retries
             log.exception(f"booking.{name}_failed")
         await asyncio.sleep(minutes * 60)
+
+
+def run_mail(sessions: sessionmaker[Session], settings: Settings) -> RunReport:
+    """One read of the group mail onto the board: kept on its pickups, nothing answered."""
+    from facility_profiles.booking.automation import read_mail  # noqa: PLC0415 - optional loop
+    from facility_profiles.booking.inbox import inbox_from_settings, reader_tools  # noqa: PLC0415
+
+    inbox = inbox_from_settings(settings)
+    if inbox is None:
+        msg = "no mail to read: FP_BOOKING_INBOX is unset, or its Gmail key and user are missing"
+        raise RuntimeError(msg)
+    classifier, _ = reader_tools(settings)
+    if classifier is None:
+        msg = "no reader for the replies: set FP_LLM_PROVIDER=openrouter and its key"
+        raise RuntimeError(msg)
+    with session_scope(sessions) as session:
+        report = read_mail(session, settings, inbox=inbox, classifier=classifier)
+    log.info("booking.mail", **report.counts())
+    return report
+
+
+def _mail_job(
+    app: FastAPI, sessions: sessionmaker[Session], settings: Settings, minutes: float
+) -> Callable[[], object]:
+    """One read of the mail, remembered on ``app.state.mail_check`` for the board."""
+
+    def job() -> None:
+        at = datetime.now(tz=UTC).isoformat()
+        try:
+            report = run_mail(sessions, settings)
+        except Exception:
+            app.state.mail_check = {"every": minutes, "at": at, "ok": False}
+            raise
+        app.state.mail_check = {
+            "every": minutes,
+            "at": at,
+            "ok": report.mail_failed == 0,
+            "read": report.mail_read,
+            "by_person": report.mail_by_person,
+        }
+
+    return job
 
 
 def _scan_job(
@@ -216,13 +259,15 @@ def create_app(
     autopilot_every: float | None = None,
     scan_every: float | None = None,
     scan_scope: tuple[list[int], list[int]] = ([], []),
+    mail_every: float | None = None,
 ) -> FastAPI:
     """Build the application.
 
     With ``timers_every`` (minutes) it also runs the booking timers; with ``autopilot_every``,
     the agent's own pass by each customer's rules; with ``scan_every``, a scan of Transport Pro
-    for new pickups over ``scan_scope`` (terminals, customer ids). The last two are off unless
-    asked for.
+    for new pickups over ``scan_scope`` (terminals, customer ids); with ``mail_every``, a read
+    of the customers' group mail onto the board that answers nothing. The last three are off
+    unless asked for.
     """
     settings = settings or get_settings()
     if signin_enabled(settings) and not settings.board_admins:
@@ -243,6 +288,8 @@ def create_app(
             (timers_every, "timers", lambda: run_timers(sessions, settings)),
             (autopilot_every, "autopilot", lambda: run_autopilot(sessions, settings)),
         ]
+        if mail_every:  # the mail after the loads: a reply can name a pickup the scan just found
+            loops.insert(0, (mail_every, "mail", _mail_job(app_, sessions, settings, mail_every)))
         if scan_every:
             scanning = _scan_job(app_, sessions, settings, scan_every, scan_scope)
             loops.insert(0, (scan_every, "scan", scanning))
@@ -272,6 +319,8 @@ def create_app(
     app.state.session_secret = secret
     # The scan's last pass, for the board (None: this server does not scan Transport Pro).
     app.state.scan = {"every": scan_every, "at": None, "ok": None} if scan_every else None
+    # The mail's last read, for the board (None: this server does not read the mail).
+    app.state.mail_check = {"every": mail_every, "at": None, "ok": None} if mail_every else None
     if signin_enabled(settings):
 
         @app.middleware("http")

@@ -145,15 +145,22 @@ class BookingCase(Base):
         return [e for e in self.exceptions if e.resolved_at is None]
 
 
+# Mail a person at Circle sent with the customer's group on it about a pickup (a request by hand,
+# a chaser, a "Thank you!", a question to the customer's desk): kept on the case so its emails
+# read as one chain, whoever sent them. Never read as a vendor's reply, and never counted as the
+# agent's own (rounds, the daily cap, the no-reply clock).
+PERSON_MAIL = "by_person"
+
+
 class BookingMessage(Base):
-    """An email the agent composed or read for a case."""
+    """An email the agent composed or read for a case, or one a person sent on the group."""
 
     __tablename__ = "booking_messages"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     case_id: Mapped[int] = mapped_column(ForeignKey("booking_cases.id"), index=True)
     direction: Mapped[str] = mapped_column(String(8))  # out | in
-    kind: Mapped[str] = mapped_column(String(24))  # request | reply | follow_up
+    kind: Mapped[str] = mapped_column(String(24))  # request | reply | follow_up | by_person ...
     to_addr: Mapped[str | None] = mapped_column(String(512))
     cc_addr: Mapped[str | None] = mapped_column(String(512))
     from_addr: Mapped[str | None] = mapped_column(String(255))

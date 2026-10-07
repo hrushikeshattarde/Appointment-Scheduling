@@ -31,6 +31,7 @@ from facility_profiles.booking.classify import (
     validate_classification,
     zone_doubt,
 )
+from facility_profiles.booking.facts import FORBIDDEN_TOPICS
 from facility_profiles.booking.links import (
     create_offer,
     html_body,
@@ -47,6 +48,7 @@ from facility_profiles.booking.mail import (
 )
 from facility_profiles.booking.memory import VIA_METHODS, Learned, remember_booking
 from facility_profiles.booking.models import (
+    PERSON_MAIL,
     BookingCase,
     BookingEvent,
     BookingMessage,
@@ -75,10 +77,10 @@ from facility_profiles.booking.references import (
     record_reference,
 )
 from facility_profiles.booking.respond import (
-    FORBIDDEN_TOPICS,
     Responder,
     local_dt,
     offer_is_feasible,
+    raise_questions,
 )
 from facility_profiles.booking.rules import (
     REFERENCE_LABELS,
@@ -95,6 +97,7 @@ from facility_profiles.booking.schema import (
     RejectReason,
     ReplyClassification,
     ReplyStatus,
+    questions_of,
 )
 from facility_profiles.booking.templates import (
     BUILT_IN,
@@ -122,7 +125,13 @@ from facility_profiles.booking.worklist import (
 from facility_profiles.booking.writeback import appointment_payload, queue_write
 from facility_profiles.clock import EASTERN_ZONE, local_to_eastern, slot_text, stamp
 from facility_profiles.config import Settings
-from facility_profiles.customers import Customer, built_in_customers, customer_of, customers
+from facility_profiles.customers import (
+    Customer,
+    Customers,
+    built_in_customers,
+    customer_of,
+    customers,
+)
 from facility_profiles.domain.resolution import FacilityResolver
 from facility_profiles.domain.schema import ReferenceType
 from facility_profiles.logging import get_logger
@@ -213,6 +222,7 @@ class IngestStats:
     delivery_updates: int = 0
     after_decision: int = 0  # mail on scheduled or canceled cases, recorded but not classified
     linked_outbound: int = 0  # a person's own send of a drafted request, recognised and linked
+    by_person: int = 0  # other mail a person at Circle sent on the group, kept on its pickups
     not_about_case: int = 0  # a reply that named other POs than this case's
     own_outbound: int = 0  # the agent's own sent mail seen again in the archive
     auto_confirmed: int = 0  # confirmations the agent booked itself (the rule's confirm = auto)
@@ -1310,7 +1320,14 @@ def reschedule_case(
     _, body = render(
         template, reschedule_values(case, settings, profile, previous=previous, note=note)
     )
-    original = next((m.subject for m in case.messages if m.direction == "out" and m.subject), None)
+    original = next(
+        (
+            m.subject
+            for m in case.messages
+            if m.direction == "out" and m.kind != PERSON_MAIL and m.subject
+        ),
+        None,
+    )
     subject = original or f"Pick Up Appointment: {' & '.join(str(p) for p in case.po_numbers)}"
     subject = subject if subject.lower().startswith("re:") else f"Re: {subject}"
     last_in = next((m for m in reversed(case.messages) if m.direction == "in"), None)
@@ -1390,7 +1407,10 @@ def mark_sent(
     if case.status != CaseStatus.UNSCHEDULED.value and not unlinked:
         msg = f"case {case.id} is {case.status}; nothing to mark as sent"
         raise ValueError(msg)
-    request = next((m for m in reversed(case.messages) if m.direction == "out"), None)
+    request = next(
+        (m for m in reversed(case.messages) if m.direction == "out" and m.kind != PERSON_MAIL),
+        None,
+    )
     if request is not None:
         request.sent_at = sent_at or request.sent_at or datetime.now(tz=UTC)
         request.thread_id = thread_id or request.thread_id
@@ -1540,9 +1560,23 @@ def _first_words(text: str, limit: int = 150) -> str:
     return sentence[:limit]
 
 
+def _same_number(case: BookingCase, result: ReplyClassification) -> bool:
+    mine = (case.pickup_number or "").strip().upper()
+    return bool(mine) and (result.pickup_number or "").strip().upper() == mine
+
+
 def _same_slot(case: BookingCase, result: ReplyClassification) -> bool:
-    """The reply restates the booked time: the same day, and the same time when it gives one."""
-    booked_day, _, booked_clock = (case.confirmed_local or "").partition(" ")
+    """The reply restates the booked time: the same day, and the same time when it gives one.
+
+    A pickup booked outside the agent (Transport Pro carries the vendor's pickup number) has no
+    booked time on file: a confirmation carrying that same pickup number is the booking itself,
+    and otherwise the stop's time in Transport Pro is what was booked.
+    """
+    if not case.confirmed_local and _same_number(case, result):
+        return True
+    booked_day, _, booked_clock = (case.confirmed_local or case.requested_local or "").partition(
+        " "
+    )
     if not booked_day:
         return False
     day = result.pickup_date or booked_day
@@ -1600,6 +1634,17 @@ def _apply_to_booked(
         _event(session, case, "question", actor=actor, reason=asked, booked=case.confirmed_local)
         return "question"
     if result.status == ReplyStatus.CONFIRMED and _same_slot(case, result):
+        if not case.confirmed_local and (result.pickup_date or booked_day):
+            # Booked outside the agent: the vendor's own confirmation says for when.
+            day = result.pickup_date or booked_day
+            clock = result.pickup_time or (case.requested_local or "").partition(" ")[2] or None
+            case.confirmed_local = f"{day} {clock}" if clock else day
+            case.confirmed_start_utc = _local_to_utc(day, clock, tz)
+            case.confirmed_end_utc = (
+                _local_to_utc(day, result.pickup_time_end, tz)
+                if result.pickup_time_end
+                else case.confirmed_start_utc
+            )
         record_reference(
             session,
             case,
@@ -1889,7 +1934,8 @@ def ingest(  # noqa: PLR0912 - one branch per reply outcome
     settings = settings or (responder.settings if responder is not None else None)
     known = customers(settings) if settings is not None else built_in_customers()
     extra_desk = (customer_desk or "").strip().lower()
-    for message in messages:
+    # Oldest first: a reply is read after the email it answers, so the chain builds in order.
+    for message in sorted(messages, key=lambda m: m.sent_at):
         stats.messages += 1
         if message.from_domain in internal:
             outcome = link_outbound(session, message)
@@ -1897,6 +1943,8 @@ def ingest(  # noqa: PLR0912 - one branch per reply outcome
                 stats.own_outbound += 1
             elif outcome == "linked":
                 stats.linked_outbound += 1
+            elif attach_circle_mail(session, message, known):
+                stats.by_person += 1
             else:
                 stats.skipped_internal += 1
             continue
@@ -1933,6 +1981,10 @@ def ingest(  # noqa: PLR0912 - one branch per reply outcome
         for case in cases:
             if case.status == CaseStatus.CANCELED.value:
                 _record_after_decision(session, case, message)
+                stats.after_decision += 1
+            elif picked_up((case.tpro_seen or {}).get("load_status")):
+                # The truck has the load: the email is part of the history, not a new to-do.
+                _record_after_decision(session, case, message, why="the load was already picked up")
                 stats.after_decision += 1
             else:
                 live.append(case)  # a booked pickup is read too: a facility can still move it
@@ -2112,13 +2164,20 @@ def _answer_once(
             log.info(
                 "booking.responded", case=case.id, intent=plan.intent.value, reason=plan.reason
             )
+    if not drafted_any:
+        for case, inbound, reading in answered:
+            if reading.status == ReplyStatus.CONFIRMED and case.id in (thank or set()):
+                if responder.acknowledge(session, case, inbound, reading) is not None:
+                    stats.responded += 1
+                    drafted_any = True
+                break
     if drafted_any:
         return
-    for case, inbound, reading in answered:
-        if reading.status == ReplyStatus.CONFIRMED and case.id in (thank or set()):
-            if responder.acknowledge(session, case, inbound) is not None:
-                stats.responded += 1
-            return
+    # Nothing went back, so nothing answered what a confirmation or a "check back" asked
+    # ("Confirmed for 9am. What's the trailer number?"): a person does.
+    for case, _, reading in answered:
+        if reading.status in (ReplyStatus.CONFIRMED, ReplyStatus.DEFERRED):
+            raise_questions(session, case, questions_of(reading))
 
 
 def _inbound_record(
@@ -2201,8 +2260,8 @@ def link_outbound(session: Session, message: InboundMessage) -> str:
     for case in candidates:
         if case.status == CaseStatus.PENDING.value and case.thread_id:
             continue
-        if case.status == CaseStatus.UNSCHEDULED.value and not has_request(case):
-            continue  # only a drafted request is linked to a person's send
+        if not has_request(case):
+            continue  # only a drafted request is linked to a person's send; other mail is kept
         same_subject = any(
             normalize_subject(m.subject).lower() == subject
             for m in case.messages
@@ -2223,11 +2282,108 @@ def link_outbound(session: Session, message: InboundMessage) -> str:
     return "linked" if linked else ""
 
 
-def _record_after_decision(session: Session, case: BookingCase, message: InboundMessage) -> None:
+def _match_circle_mail(session: Session, message: InboundMessage) -> list[BookingCase]:
+    """The pickups a Circle person's email is about, whatever their status.
+
+    By the email it answers (any email on a case, the vendor's or the customer desk's), its
+    thread, a PO it names, or the case's delivery number ("Delivery# PYE_021026123" in a note to
+    the customer's desk asking for the PO). Who sent it never ties it: that is Circle.
+    """
+    referenced = message.referenced_ids
+    if referenced:
+        answered = session.scalars(
+            select(BookingMessage).where(func.lower(BookingMessage.rfc_message_id).in_(referenced))
+        )
+        cases = _distinct(m.case for m in answered)
+        if cases:
+            return cases
+    if message.thread_id:
+        on_case = session.scalars(
+            select(BookingCase).where(BookingCase.thread_id == message.thread_id)
+        )
+        in_thread = session.scalars(
+            select(BookingMessage).where(BookingMessage.thread_id == message.thread_id)
+        )
+        cases = _distinct([*on_case, *(m.case for m in in_thread)])
+        if cases:
+            return cases
+    text = f"{message.subject}\n{message.body}"
+    everything = list(session.scalars(select(BookingCase).order_by(BookingCase.id)))
+    numbers = set(PO_RE.findall(text))
+    hits = [c for c in everything if numbers & {str(p) for p in c.po_numbers}]
+    if hits:
+        return hits
+    upper = text.upper()
+    return [
+        c
+        for c in everything
+        if c.delivery_ref
+        and re.search(rf"(?<![A-Z0-9_]){re.escape(c.delivery_ref.upper())}(?![A-Z0-9])", upper)
+    ]
+
+
+def attach_circle_mail(session: Session, message: InboundMessage, known: Customers) -> int:
+    """Keep a Circle person's email on every pickup it is about; how many it was kept on.
+
+    Only mail with the pickup's customer group on it (To or Cc) counts as part of the pickup's
+    conversation; a private note between colleagues is not. The email is kept as sent by a
+    person (``PERSON_MAIL``): shown in the pickup's emails, never read as a vendor's reply and
+    never counted as the agent's own.
+    """
+    on_group = participants(message.to_addr, message.cc_addr)
+    kept = 0
+    for case in _match_circle_mail(session, message):
+        group = (known.for_case(case).group or "").strip().lower()
+        if group and group not in on_group:
+            continue
+        rfc = (message.rfc_message_id or "").lower()
+        if any(
+            m.message_id == message.message_id or (rfc and (m.rfc_message_id or "").lower() == rfc)
+            for m in case.messages
+        ):
+            continue
+        case.messages.append(
+            BookingMessage(
+                case_id=case.id,
+                direction="out",
+                kind=PERSON_MAIL,
+                to_addr=(message.to_addr or "")[:512] or None,
+                cc_addr=(message.cc_addr or "")[:512] or None,
+                from_addr=(message.from_addr or "")[:255] or None,
+                subject=(message.subject or "")[:512] or None,
+                body=message.body,
+                message_id=message.message_id[:255],
+                thread_id=(message.thread_id or "")[:128] or None,
+                rfc_message_id=(message.rfc_message_id or "")[:255] or None,
+                in_reply_to=message.in_reply_to,
+                references_header=message.references,
+                sent_at=message.sent_at,
+                classification={},
+            )
+        )
+        _event(
+            session,
+            case,
+            "sent_by_person",
+            actor=message.from_email or "a person",
+            subject=message.subject,
+            to=message.to_addr,
+        )
+        kept += 1
+    session.flush()
+    return kept
+
+
+def _record_after_decision(
+    session: Session, case: BookingCase, message: InboundMessage, *, why: str | None = None
+) -> None:
     """Keep a message that arrived after approval or closure without reading it as an answer."""
     case.messages.append(
         _inbound_record(
-            case, message, kind="reply", classification={"skipped": f"case is {case.status}"}
+            case,
+            message,
+            kind="reply",
+            classification={"skipped": why or f"case is {case.status}"},
         )
     )
     session.flush()

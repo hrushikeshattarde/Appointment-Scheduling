@@ -635,6 +635,26 @@ With `FP_BOOKING_INBOX` set, each pass also reads the new replies, the way Bigge
   company when only one pickup is open with it (too weak to book on). Every email the agent
   sends asks for answers to go to the customer's group (`Reply-To`), so a plain Reply reaches the
   group as well as Reply All.
+- **One chain per pickup, whoever wrote**: mail a person at Circle sends with the customer's
+  group on it (To or Cc) is kept on the pickup it is about, found by the email it answers, its
+  thread, a PO or the pickup's delivery number. The request typed by hand, a chaser, a "Thank
+  you!", or a note asking the customer's desk for the PO all count. It shows in the pickup's
+  Emails as "Sent by a person", from whom and to whom, in time order with the vendor's and the
+  agent's mail. It is never read as a vendor's reply, and never counted as the agent's own
+  (rounds, the daily cap, the no-reply clock). Mail without the group on it stays private. A
+  vendor's confirmation that carries the pickup number already on the load is read as the
+  booking itself, not a change, and gives a pickup booked outside the agent its booked time.
+- **Reading the mail onto the board without the agent acting**: `serve --mail-every 15` (with
+  `FP_BOOKING_INBOX`) reads the group mail every 15 minutes. Every email is kept on its pickup,
+  the vendor's are read so the pickup moves and its to-dos are raised, and nothing is drafted or
+  sent. Today shows when the mail was last read, and a red notice when it could not be. Mail
+  about a load Transport Pro already shows picked up is kept but not read: it is history, not a
+  new to-do.
+- **Latest updates** on Today lists the newest emails, whoever sent them (the vendor, the agent,
+  a person at Circle, the customer's desk), and the Transport Pro changes the scan saw (found,
+  delivery or tender moved, booked there, picked up), newest first, over the last two weeks. An
+  email that covered several pickups is one row; each row opens its pickup. Drafts are left
+  out: "Not asked yet" counts them.
 - **Mail no pickup matches** is kept for a person (table `booking_unmatched_mail`) when it is
   about booking (a pickup subject, a known desk or its company, a PO-shaped number): the board's
   Home shows "Emails no pickup matched" to link each to its pickup (the agent then reads it) or
@@ -644,12 +664,35 @@ With `FP_BOOKING_INBOX` set, each pass also reads the new replies, the way Bigge
 - **What it does with a reply**: matches it to its pickup, reads it, and answers by the
   conversation policy:
   - accept an offer that still makes the delivery, or ask for other days;
-  - answer a question from what's on the pickup (PO, delivery number, delivery site, load
-    number, carrier, customer);
+  - answer the facility's questions (see below);
   - thank the vendor for a confirmation;
   - write a note to the customer's desk when the vendor cannot ship.
 
   Money, claims and the third back-and-forth go to a person.
+- **Replies written for the situation** (`booking/writer.py`): the code decides the move, and
+  the model writes the words for what the facility actually wrote. One reply states the move and
+  answers every question in their email, a confirmation's too ("Confirmed for 9am. What's the
+  trailer number?" gets "Thank you!" and the trailer number). It answers from a fact sheet
+  (`booking/facts.py`):
+  - the pickup itself: POs, load number, customer, pickup and delivery times, delivery number;
+  - the load in Transport Pro, read when the reply is written: weight, piece count, equipment,
+    commodity, temperature, hazmat, BOL, seal, the stops' notes and addresses;
+  - the load's dispatch: the trucking company with its MC, DOT and dispatch phone, and the driver's
+    name and cell, truck and trailer.
+
+  Rates, max buy, charges and insurance are never read, so no reply can carry them. Load notes are
+  given as notes ("Our load notes call for load bars"), never as promises for the driver.
+- **The check on a draft**: before it goes, every date, time, number, phone number and email
+  address in the draft must be in the facts or the decision, it must not touch money, it must
+  carry the decision's own dates and times, and each answer must cite facts that are known. A
+  draft that fails is never sent: the fixed wording goes ("Yes, 10/01 @ 1100 works. Thank you!"),
+  or a question with no fixed answer goes to a person.
+- **What it cannot answer** (no driver assigned yet, a temperature the load does not hold, "Can
+  the driver come at 7am?") is left out: the reply says "I will get back to you on the rest" and
+  the question is raised in Needs you. When nothing can be answered the reply only says so, and
+  every question waits for a person. Without a model the fixed answers still work: which PO,
+  the delivery number, where it delivers, the load number, the customer, and the trucking company
+  once the load is dispatched.
 - **What goes out**: with `FP_BOOKING_MODE=send` and a sender, an answer is sent where the
   customer's rule says `replies = "send"` (and a note to the customer's desk where it says
   `customer_notes = "send"`). Every send passes the send gate:
