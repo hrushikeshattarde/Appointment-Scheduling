@@ -181,7 +181,7 @@ def test_the_reschedule_and_follow_up_wording_comes_from_templates_too(settings,
             "Hello CCI desk,\n\nAny update on PO# 226321092660 for 10/01?\n\n" + SIGNATURE
         )  # signed once: the template carries the signature
         assert _event(session, case_id, "follow_up").detail["reason"] == (
-            "no reply for 24 hours (default wording)"
+            "no reply for 24 weekday hours (default wording)"
         )
 
         message = reschedule_case(

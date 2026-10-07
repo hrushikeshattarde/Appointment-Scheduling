@@ -119,6 +119,9 @@ EVENTS: dict[str, str] = {
     "email_bounced": "Email sent back by the mail server",
     "auto_reply": "Automatic reply",
     "delivery_delayed": "Delivery delayed",
+    "eta_requested": "Facility asked for the driver's ETA",
+    "work_in_offered": "Facility offered a late arrival",
+    "on_hold": "Facility put the pickup on hold",
 }
 # Transport Pro changes the board's "Latest updates" lists beside the emails.
 LOAD_UPDATES = frozenset(
@@ -141,6 +144,12 @@ READ_AS = {
     "question": "asked a question",
     "rejected": "cannot book",
     "deferred": "asked to check back",
+}
+# What the facility's email was about besides the slot (schema.ReplyTopic), in a few words.
+READ_TOPIC = {
+    "eta": "asked for the driver's ETA",
+    "work_in": "offered a late arrival",
+    "hold": "put the pickup on hold",
 }
 # What the agent's own emails did, in a few words: "The agent asked for the pickup".
 AGENT_MAIL = {
@@ -272,7 +281,9 @@ def _email_update(
         return at, f"{_who(message.from_addr)} sent an automatic reply", subject
     if message.kind == "delivery_delayed":
         return at, "The mail server is still trying to deliver an email", subject
-    said = READ_AS.get(str(reading.get("status") or ""))
+    said = READ_TOPIC.get(str(reading.get("topic") or "")) or READ_AS.get(
+        str(reading.get("status") or "")
+    )
     read = f", read as {said}" if said and not reading.get("skipped") else ""
     return at, f"{_who(message.from_addr)} wrote{read}", subject
 

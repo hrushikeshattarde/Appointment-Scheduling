@@ -90,6 +90,7 @@ from facility_profiles.booking.respond import (
     local_dt,
     offer_is_feasible,
     raise_questions,
+    transit_hours,
 )
 from facility_profiles.booking.rules import (
     REFERENCE_LABELS,
@@ -106,6 +107,7 @@ from facility_profiles.booking.schema import (
     RejectReason,
     ReplyClassification,
     ReplyStatus,
+    ReplyTopic,
     questions_of,
 )
 from facility_profiles.booking.templates import (
@@ -714,7 +716,7 @@ def refresh_case(
       there; the case is scheduled and nothing is queued to write back (it is there already);
     - a new or moved delivery slot (the delivery reference in the delivery stop's notes, the
       stop's time): kept on the case. Once a request is out, a moved slot raises
-      ``delivery_moved``;
+      ``delivery_moved``; so does one the booked pickup can no longer make;
     - a new tender time, and new POs while no request is written: kept on the case. Before any
       request, the pickup time is chosen again from what changed, and the desk's rules rechecked.
     """
@@ -728,7 +730,7 @@ def refresh_case(
         done = _refresh_picked_up(session, case, seen, stats=stats)
     else:
         booked = _refresh_booking(session, case, wp, seen, now=now, stats=stats)
-        delivery = _refresh_delivery(session, case, seen, now=now)
+        delivery = _refresh_delivery(session, case, seen, now=now, settings=settings)
         request = _refresh_request(
             session, case, seen, customer, settings, now=now, replan=bool(delivery)
         )
@@ -823,9 +825,18 @@ def _refresh_booking(
 
 
 def _refresh_delivery(
-    session: Session, case: BookingCase, seen: _Seen, *, now: datetime
+    session: Session,
+    case: BookingCase,
+    seen: _Seen,
+    *,
+    now: datetime,
+    settings: Settings | None = None,
 ) -> list[str]:
-    """A new or moved delivery slot in Transport Pro; once a request is out, a move is raised."""
+    """A new or moved delivery slot in Transport Pro; once a request is out, a move is raised.
+
+    A booked pickup is checked against the new slot: one that can no longer make it is raised
+    for a person, who asks the facility for an earlier pickup.
+    """
     new_ref = seen.changed("delivery_ref", case.delivery_ref)
     new_at = seen.changed("delivery_at", _iso_utc(case.delivery_at_utc))
     if not (new_ref or new_at):
@@ -858,17 +869,45 @@ def _refresh_delivery(
     asked = case.status in (CaseStatus.PENDING.value, CaseStatus.DECLINED.value) or (
         case.status == CaseStatus.UNSCHEDULED.value and has_request(case)
     )
-    if asked and had_slot:
+    late = _booked_misses_delivery(case, settings) if had_slot else None
+    if (asked and had_slot) or late:
+        what = late or "check the pickup still makes it"
         flag(
             session,
             case,
             ExceptionType.DELIVERY_MOVED,
-            f"Transport Pro moved the delivery to {shown}; check the pickup still makes it",
+            f"Transport Pro moved the delivery to {shown}; {what}"[:255],
             at=now,
             delivery_ref=case.delivery_ref,
             delivery_at=_iso_utc(case.delivery_at_utc),
+            booked=case.confirmed_local if late else None,
         )
     return ["delivery"]
+
+
+def _booked_misses_delivery(case: BookingCase, settings: Settings | None) -> str | None:
+    """Why a booked pickup no longer makes the delivery slot, or None.
+
+    The booked time plus the drive and loading (``transit_hours``) must land by the delivery.
+    A pickup still being booked is the request's business, not this check's.
+    """
+    if case.status != CaseStatus.SCHEDULED.value or settings is None:
+        return None
+    local = case.confirmed_local or case.requested_local
+    delivery = as_utc(case.delivery_at_utc)
+    if not local or delivery is None:
+        return None
+    day, _, clock = local.partition(" ")
+    start = as_utc(case.confirmed_start_utc) or _local_to_utc(
+        day, clock or None, case.vendor_timezone
+    )
+    arrival = start + timedelta(hours=transit_hours(case, settings))
+    if arrival <= delivery:
+        return None
+    return (
+        f"the booked pickup {slot_text(local, case.vendor_timezone)} would arrive "
+        f"{stamp(arrival)}, after it: ask the vendor for an earlier pickup, then reschedule"
+    )
 
 
 def _refresh_request(
@@ -1680,6 +1719,66 @@ _BOOKED_WORDS = {
 }
 
 
+def _put_on_hold(result: ReplyClassification) -> bool:
+    """A hold with no day to check back: the facility will say when (a day given is a deferral).
+
+    Read as a decline or not, a hold is not one: the facility will release it, so the customer
+    is not asked to move the delivery for it.
+    """
+    if result.topic != ReplyTopic.HOLD:
+        return False
+    if result.status == ReplyStatus.DEFERRED:
+        return not result.pickup_date
+    return result.status in (ReplyStatus.QUESTION, ReplyStatus.UNRELATED, ReplyStatus.REJECTED)
+
+
+def _topic_flag(
+    session: Session,
+    case: BookingCase,
+    result: ReplyClassification,
+    text: str,
+    *,
+    actor: str,
+    reply_sent_at: datetime | None,
+) -> bool:
+    """Raise the to-do of a request a person must chase: the driver's ETA, a late arrival.
+
+    True when one was raised; a plain question is left to the caller.
+    """
+    said = result.question or _first_words(text) or "see reply"
+    if result.topic == ReplyTopic.ETA:
+        why = f"facility asks for the driver's ETA: {said}"[:255]
+        flag(session, case, ExceptionType.ETA_REQUESTED, why, question=result.question)
+        _event(session, case, "eta_requested", actor=actor, reason=why)
+        return True
+    if result.topic == ReplyTopic.WORK_IN:
+        tz = case.vendor_timezone
+        written = as_utc(reply_sent_at)
+        day = result.pickup_date or (
+            written.astimezone(ZoneInfo(tz or "America/New_York")).date().isoformat()
+            if written
+            else None
+        )
+        until = (
+            f" until {slot_text(f'{day} {result.pickup_time}', tz)}"
+            if day and result.pickup_time
+            else ""
+        )
+        why = f"facility will still take the truck{until}: {said}"[:255]
+        flag(
+            session,
+            case,
+            ExceptionType.WORK_IN_OFFERED,
+            why,
+            date=day,
+            time=result.pickup_time,
+            question=result.question,
+        )
+        _event(session, case, "work_in_offered", actor=actor, reason=why)
+        return True
+    return False
+
+
 def _apply_to_booked(
     session: Session,
     case: BookingCase,
@@ -1701,6 +1800,10 @@ def _apply_to_booked(
     old one). A question is raised like any other; anything else is kept on the case.
     """
     tz = case.vendor_timezone
+    held = _put_on_hold(result)
+    if held:  # the booked time will not happen as it stands: one change for a person to settle
+        update = {"status": ReplyStatus.DEFERRED, "pickup_date": None, "topic": ReplyTopic.NONE}
+        result = result.model_copy(update=update)
     booked_day = (case.confirmed_local or case.requested_local or "").partition(" ")[0]
     passed = False
     if result.status == ReplyStatus.CONFIRMED and (result.pickup_date or booked_day):
@@ -1711,6 +1814,8 @@ def _apply_to_booked(
         # A time already past when they wrote is not a new time for a booking still ahead: a
         # work-in or late-arrival note ("latest is 9pm, keep us updated on the ETA") a person
         # answers. The booking stands.
+        if _topic_flag(session, case, result, text, actor=actor, reply_sent_at=reply_sent_at):
+            return "question"
         said = result.question or _first_words(text) or "see reply"
         if passed:
             past = f"{result.pickup_date or booked_day} {result.pickup_time or ''}".strip()
@@ -1772,7 +1877,7 @@ def _apply_to_booked(
         message_id=message_id,
         text=text,
     )
-    what = _BOOKED_WORDS.get(action, "wrote about it").format(new=new)
+    what = "put it on hold" if held else _BOOKED_WORDS.get(action, "wrote about it").format(new=new)
     note = f"booked for {slot_text(was, tz) if was else 'a time'}: the facility {what}" + (
         "; Transport Pro still shows the booked time" if written else ""
     )
@@ -1789,7 +1894,7 @@ def _apply_to_booked(
     return "booked_changed"
 
 
-def apply_reply(
+def apply_reply(  # noqa: PLR0912 - one branch per reply status
     session: Session,
     case: BookingCase,
     result: ReplyClassification,
@@ -1941,8 +2046,18 @@ def apply_reply(
         )
         _event(session, case, "counter_offer", actor=actor, reason=offered)
         return "counter_offer"
+    if _put_on_hold(result):
+        _new_reading(session, case, "on_hold")
+        said = result.question or _first_words(text) or "see reply"
+        why = f"facility put the pickup on hold: {said}"[:255]
+        case.reason = why
+        flag(session, case, ExceptionType.ON_HOLD, why, question=result.question)
+        _event(session, case, "on_hold", actor=actor, reason=why)
+        return "on_hold"
     if result.status == ReplyStatus.QUESTION:
         _new_reading(session, case, "question", about_slot=False)
+        if _topic_flag(session, case, result, text, actor=actor, reply_sent_at=reply_sent_at):
+            return "question"
         asked = f"vendor asked: {result.question or 'see reply'}"[:255]
         flag(session, case, ExceptionType.FACILITY_QUESTION, asked, question=result.question)
         _event(session, case, "question", actor=actor, reason=asked)
@@ -2061,7 +2176,9 @@ def ingest(  # noqa: PLR0912 - one branch per reply outcome
         ]
         if from_desk:
             moved = [
-                _apply_customer_desk_message(session, c, message, responder, known.for_case(c))
+                _apply_customer_desk_message(
+                    session, c, message, responder, known.for_case(c), settings=settings
+                )
                 for c in from_desk
             ]
             if any(moved):
@@ -2303,7 +2420,13 @@ def _ingest_reply(  # noqa: PLR0912 - one branch per reply outcome
             stats.booked_changed += 1
             stats.needs_human += 1
             continue  # a person settles a change to a booked pickup; the agent says nothing
-        elif action in ("counter_offer", "question", "rejected_by_vendor", "stale_confirmation"):
+        elif action in (
+            "counter_offer",
+            "question",
+            "rejected_by_vendor",
+            "stale_confirmation",
+            "on_hold",
+        ):
             stats.needs_human += 1
         elif action == "deferred":
             stats.deferred += 1
@@ -2642,8 +2765,13 @@ def _apply_customer_desk_message(
     message: InboundMessage,
     responder: Responder | None,
     customer: Customer,
+    *,
+    settings: Settings | None = None,
 ) -> bool:
-    """Record a customer-desk message; on a new delivery slot, move the pickup request."""
+    """Record a customer-desk message; on a new delivery slot, move the pickup request.
+
+    A booked pickup is not moved: one the new slot makes it miss is raised for a person.
+    """
     slot = parse_delivery_slot(
         message.full_text,
         year=message.sent_at.year,
@@ -2683,9 +2811,20 @@ def _apply_customer_desk_message(
         delivery_ref=ref,
         delivery_at=start.isoformat(),
     )
+    settings = settings or (responder.settings if responder is not None else None)
     if case.status in DECIDED_STATUSES:
+        late = _booked_misses_delivery(case, settings)
+        if late:
+            flag(
+                session,
+                case,
+                ExceptionType.DELIVERY_MOVED,
+                f"the customer's desk moved the delivery to {ref}; {late}"[:255],
+                delivery_ref=ref,
+                delivery_at=start.isoformat(),
+                booked=case.confirmed_local,
+            )
         return True
-    settings = responder.settings if responder is not None else None
     if settings is None:
         flag(
             session,

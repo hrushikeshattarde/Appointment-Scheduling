@@ -150,6 +150,22 @@ KINDS: dict[str, tuple[str, str]] = {
         "address on the facility's profile (or call the desk), then send the request again, or "
         "book by phone and mark it booked.",
     ),
+    "eta_requested": (
+        "Driver ETA asked",
+        "The facility wants to know when the driver will arrive. Call the driver or the "
+        "carrier's dispatch (on the load's dispatch in Transport Pro) and reply with the ETA.",
+    ),
+    "work_in_offered": (
+        "Late arrival offered",
+        "After a missed or late arrival, the facility will still take the truck until the time "
+        "below. Check the driver can make it and reply, or agree a new appointment and "
+        "reschedule.",
+    ),
+    "on_hold": (
+        "Pickup on hold",
+        "The facility put the pickup or the order on hold. Ask when it will be released, or "
+        "check with the customer; the agent does not chase the facility while this is open.",
+    ),
 }
 # The vendor's silence: raised by the no-reply timers, cleared by any answer from the vendor.
 UNANSWERED: frozenset[ExceptionType] = frozenset(
@@ -173,7 +189,15 @@ SLOT_REPLY_SUPERSEDES: frozenset[ExceptionType] = UNANSWERED | {
     ExceptionType.SEND_UNCONFIRMED,
     ExceptionType.ATTACHMENT_UNREAD,
     ExceptionType.EMAIL_BOUNCED,
+    ExceptionType.ETA_REQUESTED,
+    ExceptionType.WORK_IN_OFFERED,
+    ExceptionType.ON_HOLD,
 }
+# The to-dos a facility's request of its own opens (ETA, late arrival, hold): what else it asked
+# and the agent could not answer is added to it, not raised beside it.
+TOPIC_KINDS: frozenset[ExceptionType] = frozenset(
+    {ExceptionType.ETA_REQUESTED, ExceptionType.WORK_IN_OFFERED, ExceptionType.ON_HOLD}
+)
 # A change to a booked pickup is not superseded by later replies: once a booked pickup is
 # disturbed, a person settles it (approving or marking it booked resolves it).
 # A question replaces an earlier open question only. "Which carrier?" after a confirmation
@@ -183,6 +207,7 @@ QUESTION_SUPERSEDES: frozenset[ExceptionType] = UNANSWERED | {
     ExceptionType.HANDOFF,
     ExceptionType.SEND_UNCONFIRMED,
     ExceptionType.EMAIL_BOUNCED,  # they wrote, so mail reaches them
+    ExceptionType.ETA_REQUESTED,
 }
 # Booking methods a profile can name that the agent cannot use: it only books by email.
 MANUAL_METHODS = {

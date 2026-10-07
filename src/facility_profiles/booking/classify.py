@@ -35,7 +35,7 @@ from facility_profiles.extraction.openrouter import (
     strict_json_schema,
 )
 
-PROMPT_VERSION = "reply-v7"
+PROMPT_VERSION = "reply-v8"
 
 SYSTEM_PROMPT = """You read one email reply from a shipping facility to a freight broker's pickup \
 appointment request and return a JSON object describing it.
@@ -55,6 +55,12 @@ being able to ship it is "rejected".
 - A reply written after the requested time has passed that gives a latest arrival time, offers \
 to work the driver in, or asks for the driver's ETA is a "question" (put their ask in question), \
 not a confirmation.
+- topic: "eta" when they ask when the driver or the truck will arrive, or for news of the \
+driver; "work_in" when, after a missed or late arrival, they will still take the truck later \
+(status "question"; put the latest time they will take it in pickup_time, and its day in \
+pickup_date when they give one); "hold" when they put the pickup, the appointment or the order \
+on hold with no day to check back (status "deferred" with no pickup_date: a hold is not a \
+rejection); "none" otherwise.
 - pickup_date is YYYY-MM-DD and pickup_time is HH:MM in 24-hour time, exactly as the reply \
 states them: never convert between time zones. Resolve relative dates ("tomorrow", "Monday") \
 from the date the reply was written at the facility, given to you. Use null when not stated.
@@ -598,6 +604,7 @@ def for_case(result: ReplyClassification, po_numbers: list[str]) -> ReplyClassif
         pickup_number=chosen.pickup_number,
         time_zone=result.time_zone,
         reject_reason=chosen.reject_reason or result.reject_reason,
+        topic=result.topic,
         conditions=list(chosen.conditions)
         + [c for c in result.conditions if c not in chosen.conditions],
         question=result.question,

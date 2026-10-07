@@ -18,6 +18,19 @@ class ReplyStatus(StrEnum):
     UNRELATED = "unrelated"  # not about this pickup appointment
 
 
+class ReplyTopic(StrEnum):
+    """What a reply is about besides the slot, when it is one of the things a person must chase.
+
+    BiggerPicture reads the same three out of facility mail (ETA asked, holds, late work-ins);
+    each has its own to-do here instead of landing as a plain question.
+    """
+
+    NONE = "none"
+    ETA = "eta"  # they ask when the driver or the truck will arrive, or for news of the driver
+    WORK_IN = "work_in"  # after a missed or late arrival, they still take the truck until a time
+    HOLD = "hold"  # they put the pickup, the appointment or the order on hold, with no day given
+
+
 class RejectReason(StrEnum):
     """Why a facility cannot book, which decides who can fix it.
 
@@ -89,6 +102,14 @@ class ReplyClassification(BaseModel):
     )
     reject_reason: RejectReason | None = Field(
         None, description="Why the facility cannot book, when the status is rejected"
+    )
+    topic: ReplyTopic = Field(
+        ReplyTopic.NONE,
+        description=(
+            "eta when they ask when the driver will arrive; work_in when, after a missed or late "
+            "arrival, they will still take the truck until a time; hold when they put the pickup "
+            "or the order on hold with no day given; none otherwise"
+        ),
     )
     conditions: list[str] = Field(default_factory=list, description="Rules the vendor stated")
     question: str | None = Field(None, description="What the vendor asked, if anything")

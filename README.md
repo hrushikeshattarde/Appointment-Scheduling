@@ -332,7 +332,7 @@ agent when the situation clears or by a person with a note (`booking resolve`):
 | `facility_question` | the vendor asked something | the agent answering it from the case, a person |
 | `facility_declined` | the vendor cannot book as asked | the pickup asked for again (`reschedule`, a new delivery slot from the customer desk) |
 | `stale_confirmation` | a "confirmation" of a slot already past when the vendor wrote | a person |
-| `delivery_moved` | the customer moved the delivery and nothing re-requested the pickup | a person, or the pickup asked for again |
+| `delivery_moved` | the customer moved the delivery and nothing re-requested the pickup, or a booked pickup can no longer make the new delivery | a person, or the pickup asked for again |
 | `handoff` | the agent stopped and nothing more specific was open | a person |
 | `confirmed_outside_window` | the vendor confirmed another day, or a time more than 2 h from the one asked | `approve`, a later reply |
 | `unanswered_24h` | timer: no answer 24 weekday hours after we wrote | any answer from the vendor, a sent follow-up, 48 h replacing it |
@@ -341,6 +341,9 @@ agent when the situation clears or by a person with a note (`booking resolve`):
 | `send_unconfirmed` | Gmail never answered a send, so the email may or may not have gone | the group's copy or a reply to it being read, `booking sent`, any later reply, a person |
 | `attachment_unread` | the facility's email carries a file the agent could not read (a scan, a picture, an old .doc) | a later reply about the slot, a person |
 | `email_bounced` | the facility's mail server sent our email back | any reply from the facility, `reschedule`, a person |
+| `eta_requested` | the facility asks when the driver will arrive, and the agent could not answer from the driver's check call or position | an answer that left nothing open, a later reply, a person |
+| `work_in_offered` | after a missed or late arrival, the facility will still take the truck until a time | a later reply about the slot, a person |
+| `on_hold` | the facility put the pickup or the order on hold with no day given (the agent stops chasing) | a later reply about the slot, a person |
 
 When the agent hands a reply to a person (money, the round cap, no safe answer) the exception
 the reply raised stays open with the agent's reason added to it. A later reply about the slot (a
@@ -387,8 +390,14 @@ send mail and never write to Transport Pro.
   Monday-to-Friday hours in the vendor's time zone count, so a Friday-afternoon request is not
   overdue on Monday morning. The clock starts at the first unanswered message; a follow-up does
   not restart it, an out-of-office or unrelated reply does not stop it, and a case waiting on us
-  (a confirmation to approve, a question) is not the vendor's silence. `booking follow-up` still
-  drafts the nudge at `FP_BOOKING_FOLLOW_UP_HOURS`; a follow-up actually sent settles the 24 h.
+  (a confirmation to approve, a question) is not the vendor's silence. `booking follow-up` counts
+  the same silence the same way: it nudges after `FP_BOOKING_FOLLOW_UP_HOURS` weekday hours, once
+  per silence (the desk's answer starts a new one), and a note to the customer's desk, a
+  person's email or an out-of-office does not end it. A follow-up actually sent settles the 24 h.
+- **Check back.** "Check back on Monday" gets a check-back that day, and "check back later" with
+  no day gets one after `FP_BOOKING_FOLLOW_UP_HOURS` weekday hours, even when the desk was nudged
+  before. One pickup gets at most three nudges; after that the to-dos and a person take over. A
+  pickup the facility put on hold is not chased.
 - **Pickup passed.** `pickup_expired` is raised when the pickup the case is working towards
   (the confirmed slot, else a time the vendor offered that still waits for a person, else the
   slot asked for) has passed and the case is not booked. It replaces the no-reply and
@@ -471,8 +480,8 @@ alternatives inside the workable window; a factual question is answered only fro
 the case (PO numbers, carrier, delivery site and number, load number), by rule first and by
 the model second, and every number in the answer must exist on the case; a vendor that
 cannot ship gets a drafted note to the customer's inbound desk (its customer file's `[customer_desk]`)
-asking for a new delivery slot; `booking follow-up` nudges once after
-`FP_BOOKING_FOLLOW_UP_HOURS` of silence. Replies that mention rates, fees, detention, claims
+asking for a new delivery slot; `booking follow-up` nudges a quiet desk once per silence after
+`FP_BOOKING_FOLLOW_UP_HOURS` weekday hours. Replies that mention rates, fees, detention, claims
 or damage, and threads past `FP_BOOKING_MAX_ROUNDS`, go to a person untouched.
 
 Also from the threads: a desk that serves several shippers (`FP_BOOKING_SHARED_DESKS`, the CCI
@@ -617,7 +626,8 @@ Each pass:
    `send` and `FP_BOOKING_MODE` is send.
 4. **Failures**: a batch that fails leaves nothing behind. It is retried an hour later, and after
    three tries raised as "Automation failed".
-5. **Follow-ups**: a sent request with no reply gets its one follow-up, unless the rule says not
+5. **Follow-ups**: a quiet desk gets a follow-up once per silence, and a check-back on the day it
+   named (or a day after "check back later"), up to three on a pickup, unless the rule says not
    to.
 
 A request drafted, a booking made or a case canceled by a person closes the job: the agent never
@@ -653,6 +663,19 @@ With `FP_BOOKING_INBOX` set, each pass also reads the new replies, the way Bigge
   (`Auto-Submitted`, "Automatic reply:") and a delay notice are kept on the pickup and read by
   nobody: the desk still counts as silent, so the no-reply to-dos and the follow-up go on. A
   scheduling portal's own notices are automatic too but carry the booking, so they are read.
+- **ETA, late arrivals, holds**: a facility asking when the driver will arrive gets the driver's
+  latest word from Transport Pro (a check call about time or place, or the tracking position,
+  under a day old, with its time) when there is one; Circle's own tracking notes ("POD indexed")
+  are never passed on, and the agent never works out an arrival time itself. Without one, "Driver
+  ETA asked" goes to a person, and anything else they asked joins that to-do. A facility that
+  will still take the truck late raises "Late arrival offered" with its latest time; one that put
+  the pickup on hold raises "Pickup on hold" (on a booked pickup, "Booked pickup changed"), and
+  neither is answered by the agent. A hold is never read as a decline, so Lidl is not asked to
+  move the delivery for it.
+- **Delivery moved under a booked pickup**: when Transport Pro or the customer's desk moves the
+  delivery, a booked pickup is checked against it (the booked time plus the drive and loading);
+  one that can no longer make it raises "Delivery moved" for a person to ask the facility for an
+  earlier pickup. The booking itself is never moved by the agent.
 - **No email dropped without a word**: an email that fails to be read (the model unreachable,
   a fault) is tried again every pass; one still failing in the last six hours before it leaves
   the look-back is kept under "Emails we could not match" with the error. From then on it no

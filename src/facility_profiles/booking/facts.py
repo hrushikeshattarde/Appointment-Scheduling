@@ -9,11 +9,16 @@ Money never enters it. No rate, max buy, charge or insurance is read, so no answ
 A fact Transport Pro does not have is None: the writer says it will follow up rather than guess.
 Every date and time is as our emails give them, on the Eastern clock ("10/01 @ 0900", with "ET"
 for a facility outside Eastern time).
+
+For a facility asking when the driver will arrive, the newest check call on the live dispatch
+(what the driver or the carrier last told us) and the newest tracking position are given, with
+their times, when they are less than a day old. The agent never estimates an arrival itself.
 """
 
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
 from facility_profiles.booking.models import BookingCase
@@ -23,7 +28,7 @@ from facility_profiles.config import Settings
 from facility_profiles.customers import customer_of
 from facility_profiles.logging import get_logger
 from facility_profiles.storage.repository import as_utc
-from facility_profiles.tpro.models import Dispatch, Load, Waypoint
+from facility_profiles.tpro.models import Dispatch, Load, TrackingNote, Waypoint
 
 log = get_logger(__name__)
 
@@ -67,7 +72,21 @@ FACT_KEYS = (
     "driver_phone",
     "truck_number",
     "trailer_number",
+    "last_check_call",
+    "last_location",
 )
+# How old a check call or a position may be and still say where the driver is.
+TRACKING_FRESH = timedelta(hours=24)
+# A check call a facility may hear is one about when or where the driver is ("30 minutes out",
+# "ETA 1400", "on the way"); the rest are Circle's own tracking notes ("POD indexed", "Called
+# DISP again for times at REC") and stay inside.
+_ETA_WORDS = re.compile(
+    r"\beta\b|\b(?:\d+|an?|one|half an?)\s*(?:min(?:ute)?s?|hrs?|hours?)\s+(?:out|away)\b|"
+    r"\bon (?:the|his|her|their) way\b|\ben ?route\b|\barriv\w*|\brolling\b|\bclose by\b",
+    re.I,
+)
+# Circle's tracking shorthand: a note written in it is for the team, not the facility.
+_INTERNAL_WORDS = re.compile(r"\b(?:POD|DISP|REC|TM|SHP|CNEE)\b|escalat|index", re.I)
 _CANCELED = frozenset({"canceled", "cancelled", "void", "voided"})
 _BREAK_RE = re.compile(r"<br\s*/?>|\r?\n", re.I)
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -170,10 +189,56 @@ def _dispatch(dispatches: list[Dispatch]) -> Dispatch | None:
     return live[-1] if live else None
 
 
+def _tracking(notes: list[TrackingNote], live: Dispatch, now: datetime) -> dict[str, str | None]:
+    """The live dispatch's newest check call and position, each under a day old, with its time."""
+    fresh = [
+        n
+        for n in notes
+        if n.dispatch_id in (None, live.id)
+        and (at := n.event_at) is not None
+        and now - at <= TRACKING_FRESH
+    ]
+    fresh.sort(key=lambda n: n.event_at or now)
+    calls = [
+        n
+        for n in fresh
+        if n.is_user_entered
+        and n.comments
+        and _ETA_WORDS.search(n.comments)
+        and not _INTERNAL_WORDS.search(n.comments)
+        and not FORBIDDEN_TOPICS.search(n.comments)
+    ]
+    pings = [n for n in fresh if not n.is_user_entered and n.location and n.location.city]
+    out: dict[str, str | None] = {"last_check_call": None, "last_location": None}
+    if calls:
+        call = calls[-1]
+        said = " ".join(_TAG_RE.sub(" ", call.comments or "").split())[:160]
+        out["last_check_call"] = f"{_stamp(call.event_at)}: {said}"
+    if pings:
+        ping = pings[-1]
+        loc = ping.location
+        place = ", ".join(x for x in (loc.city, loc.state) if x) if loc else ""
+        out["last_location"] = f"{place} at {_stamp(ping.event_at)}"
+    return out
+
+
+def _stamp(at: datetime | None) -> str:
+    return f"{to_eastern(at):%m/%d @ %H%M} ET" if at else ""
+
+
 def load_facts(
-    load: Load, dispatches: list[Dispatch], *, waypoint_index: int = 0
+    load: Load,
+    dispatches: list[Dispatch],
+    *,
+    waypoint_index: int = 0,
+    notes: list[TrackingNote] | None = None,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
-    """The freight, its notes, and who hauls it, as a facility would ask about them."""
+    """The freight, its notes, and who hauls it, as a facility would ask about them.
+
+    ``notes`` are the load's tracking notes: they give the driver's latest check call and
+    position (:func:`_tracking`).
+    """
     ref = load.reference or {}
     stops = load.waypoints
     pickup = stops[waypoint_index] if 0 <= waypoint_index < len(stops) else None
@@ -222,6 +287,8 @@ def load_facts(
                 "trailer_number": assigned.get("trailerNumber"),
             }
         )
+        if notes:
+            facts.update(_tracking(notes, live, now or datetime.now(tz=UTC)))
     return {k: v for k, v in facts.items() if k in FACT_KEYS}
 
 
@@ -237,7 +304,14 @@ def read_load_facts(case: BookingCase, source: FactsSource) -> dict[str, Any]:
     except Exception as exc:
         log.warning("booking.facts_unread", case=case.id, load=case.load_id, error=str(exc))
         return {}
-    return load_facts(load, dispatches, waypoint_index=case.waypoint_index)
+    notes: list[TrackingNote] = []
+    tracking = getattr(source, "get_tracking_load_notes", None)  # a source may not track
+    if callable(tracking):
+        try:
+            notes = list(tracking(case.load_id))
+        except Exception as exc:  # no tracking leaves the rest of the facts
+            log.warning("booking.tracking_unread", case=case.id, error=str(exc))
+    return load_facts(load, dispatches, waypoint_index=case.waypoint_index, notes=notes)
 
 
 def with_load(facts: dict[str, Any], loaded: dict[str, Any]) -> dict[str, Any]:

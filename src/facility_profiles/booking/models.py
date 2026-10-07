@@ -73,6 +73,11 @@ class ExceptionType(StrEnum):
     ATTACHMENT_UNREAD = "attachment_unread"
     # The mail server sent our email back (booking/automated.py): the facility never got it.
     EMAIL_BOUNCED = "email_bounced"
+    # What a facility writes about besides the slot (schema.ReplyTopic): the driver's ETA asked,
+    # a late arrival it will still take, the pickup put on hold.
+    ETA_REQUESTED = "eta_requested"
+    WORK_IN_OFFERED = "work_in_offered"
+    ON_HOLD = "on_hold"
 
 
 class BookingCase(Base):

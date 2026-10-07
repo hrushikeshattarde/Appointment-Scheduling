@@ -6,7 +6,8 @@ The policy is deliberately narrow. The agent only ever does five things in a thr
 2. ask for alternatives inside a stated window when it does not,
 3. answer the facility's questions from the facts: the case's, and the load's and its dispatch's
    read from Transport Pro (weight, pallets, equipment, load notes, trucking company, driver),
-4. nudge once when a request goes unanswered,
+4. nudge a quiet desk after a day of weekday hours, once per silence, and check back when the
+   desk said to (on its day, or after a day when it named none),
 5. draft a note to the customer's inbound desk when the vendor cannot ship on the day asked
    (the order is not ready, no slots, closed): moving the delivery fixes that, and nothing else.
 
@@ -14,6 +15,10 @@ The code decides the move; a writer (``booking/writer.py``) writes the words for
 facility actually wrote, answering every question it asked in the same reply, and its draft goes
 out only when every value in it is in the facts. Without a writer, or when a draft fails that
 check, the pod's fixed wording goes. A question nothing answered is raised in Needs you.
+
+A facility asking for the driver's ETA gets the driver's latest check call or position from
+Transport Pro when there is one; a late arrival it will still take, or a pickup it put on hold,
+goes to a person with a to-do of its own.
 
 Everything else, and anything that mentions money, is handed to a person: the exception the
 reply raised stays open with the agent's reason added to it. So is any change to a pickup that
@@ -42,7 +47,6 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from facility_profiles.booking.automated import AUTOMATED_KINDS
 from facility_profiles.booking.facts import (
     FACT_KEYS,
     FORBIDDEN_TOPICS,
@@ -73,6 +77,7 @@ from facility_profiles.booking.schema import (
     RejectReason,
     ReplyClassification,
     ReplyStatus,
+    ReplyTopic,
     questions_of,
 )
 from facility_profiles.booking.templates import (
@@ -82,7 +87,9 @@ from facility_profiles.booking.templates import (
     render,
     vendor_when,
 )
+from facility_profiles.booking.timers import is_vendor_answer, waiting_since, weekday_hours
 from facility_profiles.booking.worklist import (
+    TOPIC_KINDS,
     UNANSWERED,
     annotate,
     flag,
@@ -334,6 +341,22 @@ def answer_is_safe(draft: AnswerDraft, facts: dict[str, Any]) -> tuple[bool, str
     return True, "ok"
 
 
+# Follow-ups and check-backs one pickup may get; then the no-reply to-dos and a person take over.
+MAX_NUDGES = 3
+
+
+def _at(message: BookingMessage) -> datetime | None:
+    """When a message was sent, or written when it was never sent (a draft)."""
+    return as_utc(message.sent_at) or as_utc(message.created_at)
+
+
+def _day(value: object) -> date | None:
+    try:
+        return date.fromisoformat(str(value)) if value else None
+    except ValueError:
+        return None
+
+
 def raise_questions(
     session: Session, case: BookingCase, questions: Iterable[str], *, replied: bool = False
 ) -> None:
@@ -346,6 +369,13 @@ def raise_questions(
     if not asked:
         return
     told = "; the reply said someone will get back to them" if replied else ""
+    topical = open_exceptions(case, *TOPIC_KINDS)
+    if topical:  # the ETA, late-arrival or hold to-do already asks a person to answer them
+        exc = topical[-1]
+        exc.description = f"{exc.description} | also asked: {asked}{told}"[:255]
+        exc.detail = {**exc.detail, "also_asked": asked}
+        session.flush()
+        return
     flag(
         session,
         case,
@@ -406,6 +436,13 @@ class Responder:
                 ResponseIntent.HANDOFF,
                 "the pickup was already booked; a person agrees any change with the facility "
                 "and the carrier",
+            )
+        if result.topic in (ReplyTopic.WORK_IN, ReplyTopic.HOLD):
+            return ResponsePlan(
+                ResponseIntent.HANDOFF,
+                "a late arrival needs the driver's ETA"
+                if result.topic == ReplyTopic.WORK_IN
+                else "the facility put the pickup on hold",
             )
         if result.status == ReplyStatus.COUNTER_OFFER and open_exceptions(
             case, ExceptionType.TIME_ZONE_UNCLEAR
@@ -727,9 +764,11 @@ class Responder:
             )
         elif plan.intent == ResponseIntent.ANSWER_QUESTION:
             # A question never moved the slot, so the status stays; only the question is settled.
-            resolve(
-                session, case, [ExceptionType.FACILITY_QUESTION], resolution=f"agent {plan.reason}"
-            )
+            # An ETA asked for is settled too once nothing in the answer was left open.
+            settled = [ExceptionType.FACILITY_QUESTION]
+            if not plan.unanswered:
+                settled.append(ExceptionType.ETA_REQUESTED)
+            resolve(session, case, settled, resolution=f"agent {plan.reason}")
         elif plan.intent == ResponseIntent.FOLLOW_UP:
             case.status = CaseStatus.PENDING.value
             if sent:  # a draft has not chased anyone yet; a sent follow-up has
@@ -756,7 +795,17 @@ class Responder:
         return plan, self.act(session, case, reply, plan)
 
     def follow_up(self, session: Session, case: BookingCase) -> BookingMessage | None:
-        """Nudge once when a sent request has had no reply for the configured time.
+        """Nudge the desk when it has gone quiet, counting silence the way the to-dos count it.
+
+        - Silence starts at the first email the desk has not answered (``timers.waiting_since``):
+          an out-of-office, a delay notice, a note to the customer or a person's email does not
+          end it. After FP_BOOKING_FOLLOW_UP_HOURS weekday hours of it (weekends and holidays do
+          not count), a follow-up.
+        - "Check back on <day>": a check-back on that day. "Check back later" with no day: a
+          check-back after the same weekday hours. Either goes even after an earlier follow-up,
+          because the desk answered since.
+        - One nudge per silence, and at most :data:`MAX_NUDGES` on a pickup; after that the
+          no-reply to-dos and a person take over.
 
         Only a pending case with nothing open but the vendor's silence itself is nudged: a
         confirmation waiting for approval or a question waiting for a person is not the
@@ -767,32 +816,39 @@ class Responder:
             e.kind not in silence for e in case.open_exceptions
         ):
             return None
-        outbound = [m for m in case.messages if m.direction == "out"]
-        if not outbound or any(m.kind == ResponseIntent.FOLLOW_UP.value for m in outbound):
+        nudges = [
+            m
+            for m in case.messages
+            if m.direction == "out" and m.kind == ResponseIntent.FOLLOW_UP.value
+        ]
+        if len(nudges) >= MAX_NUDGES:
             return None
-        last_out = as_utc(outbound[-1].sent_at) or as_utc(outbound[-1].created_at)
-        if last_out is None:
-            return None
-        check_back = self._check_back_date(session, case, since=last_out)
+        answers = [m for m in case.messages if is_vendor_answer(m) and _at(m) is not None]
+        last = max(answers, key=lambda m: _at(m) or datetime.min.replace(tzinfo=UTC), default=None)
+        last_at = _at(last) if last is not None else None
+        if any(last_at is None or (_at(m) or last_at) > last_at for m in nudges):
+            return None  # this silence, or this check-back, was nudged already
         tz = ZoneInfo(case.vendor_timezone or "America/New_York")
-        if check_back is not None:
-            if self._now().astimezone(tz).date() < check_back:
-                return None  # the vendor said when to ask again; wait for that day
-            reason = f"vendor said to check back on {check_back:%m/%d}"
+        now = self._now()
+        hours = self.settings.booking_follow_up_hours
+        reading = (last.classification or {}) if last is not None else {}
+        if last_at is not None and reading.get("status") == ReplyStatus.DEFERRED.value:
+            day = _day(reading.get("pickup_date"))
+            if day is not None:
+                if now.astimezone(tz).date() < day:
+                    return None  # the vendor said when to ask again; wait for that day
+                reason = f"vendor said to check back on {day:%m/%d}"
+            else:
+                if weekday_hours(last_at, now, tz) < hours:
+                    return None
+                reason = f"vendor said to check back later; {hours} weekday hours since"
             kind = TemplateKind.CHECK_BACK
         else:
-            if self._now() - last_out < timedelta(hours=self.settings.booking_follow_up_hours):
+            waiting = waiting_since(case)
+            since = as_utc(waiting.sent_at) if waiting is not None else None
+            if since is None or weekday_hours(since, now, tz) < hours:
                 return None
-            # An out-of-office or a delay notice is not a reply: the desk is still silent.
-            replied_since = any(
-                m.direction == "in"
-                and m.kind not in AUTOMATED_KINDS
-                and (as_utc(m.sent_at) or last_out) > last_out
-                for m in case.messages
-            )
-            if replied_since:
-                return None
-            reason = f"no reply for {self.settings.booking_follow_up_hours} hours"
+            reason = f"no reply for {hours} weekday hours"
             kind = TemplateKind.FOLLOW_UP
         names = customer_of(case, self.settings).template_matches(case.customer_name)
         template = pick(session, kind, desk=case.contact_email, customer=names)
@@ -808,28 +864,6 @@ class Responder:
             signed=True,
         )
         return self.act(session, case, None, plan)
-
-    @staticmethod
-    def _check_back_date(session: Session, case: BookingCase, *, since: datetime) -> date | None:
-        """The day the vendor asked to be contacted again (latest deferral after ``since``)."""
-        from sqlalchemy import select  # noqa: PLC0415
-
-        events = session.scalars(
-            select(BookingEvent)
-            .where(BookingEvent.case_id == case.id, BookingEvent.action == "deferred")
-            .order_by(BookingEvent.id.desc())
-        )
-        for event in events:
-            created = as_utc(event.created_at)
-            if created is not None and created < since:
-                break
-            raw = (event.detail or {}).get("check_back")
-            if raw:
-                try:
-                    return date.fromisoformat(str(raw))
-                except ValueError:
-                    return None
-        return None
 
     def acknowledge(
         self,

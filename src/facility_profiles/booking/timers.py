@@ -80,6 +80,8 @@ EXPIRY_DEFERS_TO = frozenset(
         ExceptionType.FACILITY_DECLINED.value,
         ExceptionType.DELIVERY_MOVED.value,
         ExceptionType.LOAD_INFEASIBLE.value,
+        ExceptionType.ON_HOLD.value,
+        ExceptionType.WORK_IN_OFFERED.value,
     }
 )
 _SENT_WHAT = {
