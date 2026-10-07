@@ -66,6 +66,11 @@ class ExceptionType(StrEnum):
     TIME_ZONE_UNCLEAR = "time_zone_unclear"
     # The facility said to check back on the pickup day itself, or later.
     CHECK_BACK_TOO_LATE = "check_back_too_late"
+    # Gmail gave no answer when an email was sent (a timeout, a dropped connection, its own
+    # error): it may have gone out. Cleared when the group's copy or a reply to it is read.
+    SEND_UNCONFIRMED = "send_unconfirmed"
+    # The facility's email carries a file the agent could not read (a scanned PDF, a picture).
+    ATTACHMENT_UNREAD = "attachment_unread"
 
 
 class BookingCase(Base):

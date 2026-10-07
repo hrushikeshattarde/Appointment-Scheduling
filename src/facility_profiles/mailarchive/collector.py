@@ -9,6 +9,13 @@ the thread ids that qualified and why, so a bare "Re:" in a kept thread is kept 
 When a message qualifies and its thread is new, the earlier messages of that thread are collected
 as well (Gmail knows the thread), so the request a confirmation answers is never missing from the
 archive even when it arrived before the collector existed.
+
+A message whose subject, people and thread say nothing is kept when it answers a kept email by
+its Message-ID (a reply under a new subject; one listed in the same pass as the email it answers
+is kept on the next), or when its text names one of the customer's PO
+numbers, a pickup number, or a pickup appointment (a new desk writing under a subject of its
+own). Its text is read once: a message found not to be about booking is remembered by its Gmail
+id for a few days, so the passes every quarter of an hour do not fetch it again.
 """
 
 from __future__ import annotations
@@ -21,14 +28,16 @@ import hashlib
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from email import policy
 from typing import Any
 
-from facility_profiles.booking.mail import split_quoted
+from facility_profiles.booking.mail import gmail_body_text, split_quoted
 from facility_profiles.mailarchive import filters
 from facility_profiles.mailarchive.gmail import GmailClient, headers_of, internal_date_iso
 from facility_profiles.mailarchive.store import (
+    BODY_CHECKED_KEY,
+    KEPT_IDS_KEY,
     LAST_RUN_KEY,
     THREADS_KEY,
     Store,
@@ -38,6 +47,8 @@ from facility_profiles.mailarchive.store import (
     message_key,
 )
 
+KEPT_IDS_DAYS = 180  # a reply more than half a year after the email it answers is not looked for
+
 
 @dataclass
 class Stats:
@@ -46,6 +57,7 @@ class Stats:
     listed: int = 0
     already: int = 0  # in S3 before this pass
     not_booking: int = 0  # listed, read, and not about a pickup appointment
+    body_read: int = 0  # messages whose text was fetched to see whether it is about booking
     stored: int = 0
     backfilled: int = 0  # earlier messages of a newly matched thread
     threads_new: int = 0
@@ -61,7 +73,7 @@ class Stats:
         bits = [
             f"{self.listed} listed",
             f"{self.already} already archived",
-            f"{self.not_booking} not about booking",
+            f"{self.not_booking} not about booking ({self.body_read} read through)",
             f"{self.stored} stored ({self.backfilled} backfilled from their threads)",
             f"{self.threads_new} new thread(s)",
             f"attachments {self.attachments_stored} stored, "
@@ -120,8 +132,11 @@ def run(
         msg = "no group address: give one, or set [mail] group in the customer file"
         raise ValueError(msg)
     st = Stats()
-    threads: dict[str, str] = dict(store.get_json(THREADS_KEY) or {})
-    threads_changed = False
+    today = datetime.now(tz=UTC).date()
+    saved = {k: store.get_json(k) or {} for k in (THREADS_KEY, KEPT_IDS_KEY, BODY_CHECKED_KEY)}
+    threads: dict[str, str] = dict(saved[THREADS_KEY])
+    kept = _recent(saved[KEPT_IDS_KEY], today, KEPT_IDS_DAYS)
+    checked = _recent(saved[BODY_CHECKED_KEY], today, days + 1)
     refs = gmail.search(default_query(group, days))
     st.listed = len(refs)
     for i, ref in enumerate(refs):
@@ -137,19 +152,24 @@ def run(
                 st.already += 1
                 continue
             thread_id = str(meta.get("threadId") or ref.get("threadId") or "")
-            reason = filters.match_reason(
-                h.get("subject"),
-                filters.participants(h.get("from"), h.get("to"), h.get("cc")),
+            reason = _why_kept(
+                gmail,
+                ref["id"],
+                h,
+                thread_id,
                 rules,
+                threads=threads,
+                kept=kept,
+                checked=checked,
+                st=st,
             )
-            if reason is None and thread_id in threads:
-                reason = f"thread:{threads[thread_id]}"
+            if reason is None and ref["id"] not in checked:
+                checked[ref["id"]] = today.isoformat()
             if reason is None:
                 st.not_booking += 1
                 continue
             if thread_id and thread_id not in threads:
                 threads[thread_id] = reason
-                threads_changed = True
                 st.threads_new += 1
                 _backfill_thread(
                     gmail,
@@ -160,9 +180,17 @@ def run(
                     mailbox=mailbox,
                     st=st,
                     rules=rules,
+                    kept=kept,
                 )
             stored = collect_message(
-                gmail, store, ref["id"], mailbox=mailbox, reason=reason, st=st, rules=rules
+                gmail,
+                store,
+                ref["id"],
+                mailbox=mailbox,
+                reason=reason,
+                st=st,
+                rules=rules,
+                kept=kept,
             )
             if verbose and stored is not None:
                 print(f"  {ref['id']} -> {stored.key}  ({reason})")  # noqa: T201 - CLI progress
@@ -173,8 +201,10 @@ def run(
             st.stopped_by = "error"
             st.error = f"{ref['id']}: {type(e).__name__} {str(e)[:200]}"
             break
-    if threads_changed:
-        store.put_json(THREADS_KEY, threads)
+    registers = ((THREADS_KEY, threads), (KEPT_IDS_KEY, kept), (BODY_CHECKED_KEY, checked))
+    for key, now_held in registers:
+        if now_held != saved[key]:
+            store.put_json(key, now_held)
     store.put_json(
         LAST_RUN_KEY,
         {
@@ -189,6 +219,49 @@ def run(
     return st
 
 
+def _recent(saved: Any, today: date, days: int) -> dict[str, str]:
+    """A ``{id: "YYYY-MM-DD"}`` register without the entries older than ``days``."""
+    if not isinstance(saved, dict):
+        return {}
+    oldest = (today - timedelta(days=days)).isoformat()
+    return {str(k): str(v) for k, v in saved.items() if str(v) >= oldest}
+
+
+def _why_kept(
+    gmail: GmailClient,
+    gmail_id: str,
+    headers: dict[str, str],
+    thread_id: str,
+    rules: filters.MailRules,
+    *,
+    threads: dict[str, str],
+    kept: dict[str, str],
+    checked: dict[str, str],
+    st: Stats | None = None,
+) -> str | None:
+    """Why a listed message belongs in the archive, or None.
+
+    In order: its subject or people, its thread, the kept email it answers, and last its text,
+    fetched only for a message not already read and found wanting (``checked``).
+    """
+    reason = filters.match_reason(
+        headers.get("subject"),
+        filters.participants(headers.get("from"), headers.get("to"), headers.get("cc")),
+        rules,
+    )
+    if reason is None and thread_id in threads:
+        reason = f"thread:{threads[thread_id]}"
+    if reason is not None or filters.is_dropped(headers.get("subject"), rules):
+        return reason
+    reason = filters.reply_reason(kept, headers.get("in-reply-to"), headers.get("references"))
+    if reason is None and gmail_id not in checked:
+        if st is not None:
+            st.body_read += 1
+        full = gmail.message(gmail_id, fmt="full")
+        reason = filters.body_reason(gmail_body_text(full.get("payload") or {}), rules)
+    return reason
+
+
 def _backfill_thread(
     gmail: GmailClient,
     store: Store,
@@ -199,6 +272,7 @@ def _backfill_thread(
     mailbox: str,
     st: Stats,
     rules: filters.MailRules,
+    kept: dict[str, str] | None = None,
 ) -> None:
     """Collect the other messages of a thread that just qualified, oldest first.
 
@@ -221,7 +295,14 @@ def _backfill_thread(
             rules,
         )
         if collect_message(
-            gmail, store, mid, mailbox=mailbox, reason=own or f"thread:{reason}", st=st, rules=rules
+            gmail,
+            store,
+            mid,
+            mailbox=mailbox,
+            reason=own or f"thread:{reason}",
+            st=st,
+            rules=rules,
+            kept=kept,
         ):
             st.backfilled += 1
 
@@ -235,8 +316,13 @@ def collect_message(
     reason: str,
     st: Stats,
     rules: filters.MailRules = filters.GENERIC,
+    kept: dict[str, str] | None = None,
 ) -> Stored | None:
-    """Fetch one message raw and store its attachments, its ``.eml`` and its ``.json``."""
+    """Fetch one message raw and store its attachments, its ``.eml`` and its ``.json``.
+
+    ``kept`` (the register of kept Message-IDs) learns this message's, so a reply to it under a
+    new subject is kept too.
+    """
     msg = gmail.message(gmail_id, fmt="raw")
     raw = base64.urlsafe_b64decode(msg["raw"] + "=" * (-len(msg["raw"]) % 4))
     parsed = parse_raw(raw)
@@ -268,6 +354,7 @@ def collect_message(
                 "bytes": len(data),
                 "sha256": sha,
                 "key": store.full(attachment_key(sha)),
+                "inline": bool(part.get("inline")),
             }
         )
 
@@ -299,6 +386,9 @@ def collect_message(
     }
     store.put(base + ".eml", raw, content_type="message/rfc822")
     stored = store.put_json(base + ".json", envelope)
+    rfc_id = (h.get("message-id") or "").strip().strip("<>").lower()
+    if kept is not None and rfc_id:
+        kept[rfc_id] = datetime.now(tz=UTC).date().isoformat()  # the day kept
     st.stored += 1
     st.reasons[reason.split(":", 1)[0] if reason.startswith("thread") else reason] += 1
     return stored
@@ -323,7 +413,17 @@ def parse_raw(raw: bytes) -> Parsed:
         payload = part.get_payload(decode=True)
         if not isinstance(payload, bytes) or not payload:
             continue
-        attachments.append({"filename": filename, "mime": part.get_content_type(), "data": payload})
+        disposition = part.get_content_disposition()
+        attachments.append(
+            {
+                "filename": filename,
+                "mime": part.get_content_type(),
+                "data": payload,
+                # Shown in the body (a logo), not attached: said so, or a Content-ID with no say.
+                "inline": disposition == "inline"
+                or (disposition is None and bool(part["Content-ID"])),
+            }
+        )
     text = "\n".join(plain) if plain else _html_to_text("\n".join(html))
     return Parsed(headers=headers, text=text, attachments=attachments)
 

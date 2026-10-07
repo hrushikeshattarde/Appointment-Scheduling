@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -40,6 +40,7 @@ from facility_profiles.booking.links import (
     offer_url,
 )
 from facility_profiles.booking.mail import (
+    UNCONFIRMED,
     InboundMessage,
     Mailer,
     OutboundDraft,
@@ -1053,13 +1054,18 @@ def _offers(
     profile: VendorProfile | None,
     *,
     now: datetime,
+    profiles: Mapping[int, VendorProfile | None] | None = None,
 ) -> dict[int, SlotOffer]:
-    """The one-click times each case's request offers, by case id; none while links are off."""
+    """The one-click times each case's request offers, by case id; none while links are off.
+
+    In a batch, ``profiles`` gives each case its own facility's hours and rules.
+    """
     if not links_enabled(settings):
         return {}
     found: dict[int, SlotOffer] = {}
     for case in cases:
-        offer = create_offer(session, case, settings, profile, now=now)
+        own = profiles.get(case.id, profile) if profiles is not None else profile
+        offer = create_offer(session, case, settings, own, now=now)
         if offer is not None:
             found[case.id] = offer
     return found
@@ -1431,12 +1437,13 @@ def reschedule_case(
     session.flush()
     for offer in offers.values():
         offer.message_id = message.id
+    asked_again = fmt_slot(requested_local, case.vendor_timezone)
+    # Before the send: what the send itself raises (Gmail never answered) stays open.
+    resolve_all(session, case, resolution=f"pickup asked for again: {asked_again}", by=by)
     result = dispatch(session, case, message, mailer, draft, actor=by)
     case.status = CaseStatus.PENDING.value
     case.reason = None
     case.reschedule_count = (case.reschedule_count or 0) + 1
-    asked_again = fmt_slot(requested_local, case.vendor_timezone)
-    resolve_all(session, case, resolution=f"pickup asked for again: {asked_again}", by=by)
     session.flush()
     _event(
         session,
@@ -1479,8 +1486,17 @@ def mark_sent(
         request.thread_id = thread_id or request.thread_id
         request.message_id = message_id or request.message_id
         request.rfc_message_id = rfc_message_id or request.rfc_message_id
+        if request.draft_ref == UNCONFIRMED:
+            request.draft_ref = "gmail:sent"
     case.thread_id = thread_id or case.thread_id
     case.status = CaseStatus.PENDING.value
+    resolve(
+        session,
+        case,
+        [ExceptionType.SEND_UNCONFIRMED],
+        resolution=f"{by} marked it sent",
+        by=by,
+    )
     _event(
         session,
         case,
@@ -2024,6 +2040,7 @@ def ingest(  # noqa: PLR0912 - one branch per reply outcome
             continue
         stats.new_mail += 1
         settle_unmatched(session, message, cases[0])
+        _answered_unconfirmed(session, message)
         from_desk = [
             c
             for c in cases
@@ -2154,6 +2171,17 @@ def _ingest_reply(  # noqa: PLR0912 - one branch per reply outcome
             message_id=inbound.id,
             text=message.body,
         )
+        if message.unread_files and action != "reply_ignored":
+            # Raised before anything is booked on its own: what the file says may change it.
+            flag(
+                session,
+                case,
+                ExceptionType.ATTACHMENT_UNREAD,
+                f"{message.from_email or 'the facility'} sent a file the agent could not read: "
+                f"{'; '.join(message.unread_files)}"[:255],
+                files=list(message.unread_files),
+                message_id=inbound.id,
+            )
         if doubt is not None and action in ("vendor_confirmed", "counter_offer", "booked_changed"):
             flag(
                 session,
@@ -2285,6 +2313,58 @@ def _already_recorded(session: Session, message: InboundMessage) -> bool:
     return False
 
 
+def _answered_unconfirmed(session: Session, message: InboundMessage) -> None:
+    """A reply that names an email Gmail never confirmed shows that email went out."""
+    referenced = message.referenced_ids
+    if not referenced:
+        return
+    for sent in session.scalars(
+        select(BookingMessage).where(
+            BookingMessage.direction == "out",
+            BookingMessage.draft_ref == UNCONFIRMED,
+            func.lower(BookingMessage.rfc_message_id).in_(referenced),
+        )
+    ):
+        confirm_sent(
+            session,
+            sent,
+            sent_at=as_utc(sent.created_at) or message.sent_at,
+            why=f"{message.from_email or 'the facility'} answered it",
+        )
+
+
+def confirm_sent(
+    session: Session, message: BookingMessage, *, sent_at: datetime, why: str, by: str = "agent"
+) -> bool:
+    """An email Gmail never confirmed turns out to have gone: record it as sent.
+
+    ``why`` says what showed it (the group's copy, a reply to it, a person who checked). A
+    request moves the case on to pending, as a confirmed send would have; the
+    ``send_unconfirmed`` to-do is resolved once nothing on the case is left unconfirmed. False
+    when the email was not one Gmail left unconfirmed.
+    """
+    if message.draft_ref != UNCONFIRMED or message.sent_at is not None:
+        return False
+    case = message.case
+    message.sent_at = sent_at
+    message.draft_ref = "gmail:sent"
+    if message.kind == "request" and case.status == CaseStatus.UNSCHEDULED.value:
+        case.status = CaseStatus.PENDING.value
+    session.flush()
+    if not any(m.draft_ref == UNCONFIRMED and m.sent_at is None for m in case.messages):
+        resolve(session, case, [ExceptionType.SEND_UNCONFIRMED], resolution=why, by=by)
+    _event(
+        session,
+        case,
+        "sent",
+        actor=by,
+        to=message.to_addr,
+        rfc_message_id=message.rfc_message_id,
+        confirmed_later=why,
+    )
+    return True
+
+
 def link_outbound(session: Session, message: InboundMessage) -> str:
     """Recognise Circle's own mail in the archive: ``own``, ``linked`` or ``""``.
 
@@ -2301,6 +2381,9 @@ def link_outbound(session: Session, message: InboundMessage) -> str:
             )
         )
         if own is not None:
+            confirm_sent(
+                session, own, sent_at=message.sent_at, why="the group's copy shows it went out"
+            )
             own.message_id = own.message_id or message.message_id
             own.thread_id = own.thread_id or message.thread_id
             if not own.case.thread_id and message.thread_id:
@@ -2603,21 +2686,31 @@ def _draft_group(
     by: str,
     now: datetime,
 ) -> list[BookingMessage]:
-    """One desk's email for one customer: a lone case's request, or the batched one."""
+    """One desk's email for one customer: a lone case's request, or the batched one.
+
+    A desk can book for several facilities (one company's plants): each case is checked against
+    its own facility's profile (the desk it trusts, its cut-off, the numbers it needs) and its
+    PO line written for that facility, not for whichever case came first.
+    """
     known = customers(settings)
     desk = (group[0].contact_email or "").lower()
     if len(group) == 1 or not desk:
         return [draft_case(session, case, mailer, settings, by=by, now=now) for case in group]
     messages: list[BookingMessage] = []
     repo = Repository(session)
-    profile = vendor_profile(repo, group[0].facility_key) if group[0].facility_key else None
+    profiles = {
+        c.id: vendor_profile(repo, c.facility_key) if c.facility_key else None for c in group
+    }
     for case in group:
-        _check_draftable(case, settings, now=now, profile=profile)
+        _check_draftable(case, settings, now=now, profile=profiles[case.id])
     group.sort(key=lambda c: c.requested_local or "")
+    profile = profiles[group[0].id]
     template = pick(
         session, TemplateKind.BATCH_REQUEST, desk=desk, customer=_names(group[0], settings)
     )
-    rendered_subject, body = render(template, request_values(group, settings, profile))
+    rendered_subject, body = render(
+        template, request_values(group, settings, profile, profiles=profiles)
+    )
     subject = rendered_subject or "Pick Up Appointments"
     customer = known.for_case(group[0])
     draft = OutboundDraft(
@@ -2629,13 +2722,16 @@ def _draft_group(
         reply_to=customer.group,
     )
     if is_sender(mailer):
-        trusted = profile.contact_email if profile and profile.can_email else None
         for case in group:
+            own = profiles[case.id]
+            trusted = own.contact_email if own and own.can_email else None
             check_send_gate(session, case, draft, settings, trusted_desk=trusted)
-    offers = _offers(session, group, settings, profile, now=now)
+    offers = _offers(session, group, settings, profile, now=now, profiles=profiles)
     if offers:
         chosen, links, by_url = _with_links(template, group, offers, settings)
-        _, body = render(chosen, request_values(group, settings, profile, links=links))
+        _, body = render(
+            chosen, request_values(group, settings, profile, links=links, profiles=profiles)
+        )
         draft = replace(draft, body=body, html=html_body(body, by_url))
     result = deliver(mailer, draft)
     for case in group:

@@ -17,7 +17,14 @@ from sqlalchemy import String, cast, func, select
 from sqlalchemy.orm import Session
 
 from facility_profiles.booking.mail import Delivery, Mailer, OutboundDraft, Sender, deliver
-from facility_profiles.booking.models import PERSON_MAIL, BookingCase, BookingEvent, BookingMessage
+from facility_profiles.booking.models import (
+    PERSON_MAIL,
+    BookingCase,
+    BookingEvent,
+    BookingMessage,
+    ExceptionType,
+)
+from facility_profiles.booking.worklist import flag
 from facility_profiles.config import Settings
 
 
@@ -115,8 +122,43 @@ def record_delivery(
     Drafts leave a reference a person can find. Sends leave the Gmail id and thread of the
     sending mailbox and the Message-ID that went out; the case learns its thread from the first
     send, and a ``sent`` event names the recipient. The caller sets the case status.
+
+    A send Gmail never answered (``result.unconfirmed``) keeps the Message-ID it would carry, so
+    the group's copy or a reply can show later that it went, and raises ``send_unconfirmed`` for
+    a person: it is neither counted as sent nor sent again.
     """
     message.draft_ref = result.ref
+    if result.unconfirmed is not None:
+        message.rfc_message_id = result.rfc_message_id
+        message.in_reply_to = draft.in_reply_to
+        message.references_header = draft.references
+        session.flush()
+        flag(
+            session,
+            case,
+            ExceptionType.SEND_UNCONFIRMED,
+            f"Gmail did not confirm the email to {draft.to_addr} went out: {result.unconfirmed}"[
+                :255
+            ],
+            actor=actor,
+            message_id=message.id,
+            rfc_message_id=result.rfc_message_id,
+        )
+        session.add(
+            BookingEvent(
+                case_id=case.id,
+                action="send_unconfirmed",
+                actor=actor,
+                detail={
+                    "to": draft.to_addr,
+                    "subject": draft.subject,
+                    "kind": message.kind,
+                    "rfc_message_id": result.rfc_message_id,
+                    "error": result.unconfirmed,
+                },
+            )
+        )
+        return
     if result.sent:
         message.sent_at = datetime.now(tz=UTC)
         message.message_id = result.gmail_id or message.message_id

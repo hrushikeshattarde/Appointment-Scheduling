@@ -39,7 +39,7 @@ from sqlalchemy.orm import Session
 from facility_profiles.booking.classify import ReplyClassifier
 from facility_profiles.booking.facts import FactsSource
 from facility_profiles.booking.inbox import Inbox
-from facility_profiles.booking.mail import Mailer, Sender
+from facility_profiles.booking.mail import UNCONFIRMED, Mailer, Sender
 from facility_profiles.booking.models import (
     AutomationJob,
     BookingCase,
@@ -329,18 +329,25 @@ def _execute(
         written = {m.case_id: m for m in messages}
         for job in group:
             message = written.get(job.case_id)
-            _close(job, JobStatus.DONE, "sent" if send else "drafted for a person to send", now)
+            unconfirmed = message is not None and message.draft_ref == UNCONFIRMED
+            done = "sent" if send else "drafted for a person to send"
+            if unconfirmed:  # recorded, with a to-do to check: never tried again on its own
+                done = "Gmail did not answer; it may have gone out"
+            _close(job, JobStatus.DONE, done, now)
             job.result = {
                 **job.result,
                 "message_id": message.id if message else None,
                 "draft_ref": message.draft_ref if message else None,
-                "sent": send,
+                "sent": send and not unconfirmed,
             }
+            when = fmt_slot(job.case.requested_local, job.case.vendor_timezone)
+            if unconfirmed:
+                report.say(job.case, f"may have gone out to {desk} for {when}: {done}")
+                continue
             if send:
                 report.sent += 1
             else:
                 report.drafted += 1
-            when = fmt_slot(job.case.requested_local, job.case.vendor_timezone)
             report.say(job.case, f"{'sent' if send else 'drafted'} to {desk} for {when}")
 
 
@@ -409,6 +416,10 @@ def _read_inbox(
         report.mail_failed += 1
         report.lines.append(f"inbox: could not read the mail ({exc})")
         return
+    for problem in getattr(inbox, "problems", ()):  # one of several sources failed
+        log.warning("booking.inbox_source_failed", problem=problem)
+        report.mail_failed += 1
+        report.lines.append(f"inbox: could not read {problem}")
     for message in sorted(messages, key=lambda m: m.sent_at):
         try:
             with session.begin_nested():

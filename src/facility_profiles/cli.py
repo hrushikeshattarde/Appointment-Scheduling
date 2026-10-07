@@ -806,9 +806,11 @@ def booking_send(
     The customer's rule is followed as when the agent runs on its own: a rule that only drafts,
     skips, holds or waits for the delivery's appointment holds the request back (``--anyway``
     sends a named case regardless). Each desk's email stands on its own: one the send gate
-    refuses is reported, and the ones already sent stay recorded.
+    refuses, or Gmail fails, is reported, and the ones already sent stay recorded. One Gmail
+    never answered may have gone out: it is recorded with a to-do to check the Sent folder,
+    and not sent again.
     """
-    from facility_profiles.booking.mail import GmailSender
+    from facility_profiles.booking.mail import UNCONFIRMED, GmailSender, MailError
     from facility_profiles.booking.outbox import SendRefusedError
     from facility_profiles.booking.service import (
         draft_batch,
@@ -843,17 +845,28 @@ def booking_send(
                 for case, why in waiting:
                     typer.echo(f"#{case.id} waits: {why}")
                 messages = draft_batch(session, ready, sender, settings, by=by, refused=refused)
-        except (SendRefusedError, ValueError, RuntimeError) as exc:
+        except MailError as exc:  # nothing went out: the login, the network or Gmail said no
+            typer.echo(f"not sent: {exc}")
+            raise typer.Exit(code=1) from exc
+        except (SendRefusedError, ValueError, RuntimeError, OSError) as exc:
             typer.echo(f"refused: {exc}")
             raise typer.Exit(code=1) from exc
+        unconfirmed = [m for m in messages if m.draft_ref == UNCONFIRMED]
         for message in messages:
+            if message.draft_ref == UNCONFIRMED:
+                typer.echo(
+                    f"#{message.case_id} may have gone out -> {message.to_addr}: Gmail did not "
+                    f"answer; look in the Sent folder of {settings.booking_gmail_user} "
+                    "(a to-do is on the pickup)"
+                )
+                continue
             typer.echo(
                 f"#{message.case_id} sent -> {message.to_addr}: {message.subject}  "
                 f"[{message.draft_ref}] {message.rfc_message_id}"
             )
         for group, why in refused:
             typer.echo(f"{' '.join(f'#{c.id}' for c in group)} not sent: {why}")
-    if refused:  # what was sent before the refusal stays recorded
+    if refused or unconfirmed:  # what was sent before stays recorded
         raise typer.Exit(code=1)
 
 

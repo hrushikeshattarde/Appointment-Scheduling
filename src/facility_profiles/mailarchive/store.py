@@ -5,6 +5,10 @@
                                         attachment manifest, why it was kept)
     attachments/<sha256[:2]>/<sha256>   every attachment once, addressed by content
     state/threads.json                  kept thread ids and the reason each qualified
+    state/kept-ids.json                 kept Message-IDs and the day kept (a reply under a new
+                                        subject is kept by the email it answers)
+    state/body-checked.json             Gmail ids whose text was read and found not about
+                                        booking, so a pass does not fetch them again
     state/last-run.json                 what the last collection pass did
 
 ``<key>`` is the first 24 hex characters of the sha256 of the RFC ``Message-ID`` header. Gmail's
@@ -23,6 +27,8 @@ from typing import Any
 MAIL_PREFIX = "mail"
 ATTACHMENT_PREFIX = "attachments"
 THREADS_KEY = "state/threads.json"
+KEPT_IDS_KEY = "state/kept-ids.json"
+BODY_CHECKED_KEY = "state/body-checked.json"
 LAST_RUN_KEY = "state/last-run.json"
 _MISSING = ("404", "NoSuchKey", "NotFound")
 

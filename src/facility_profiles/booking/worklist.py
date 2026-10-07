@@ -132,6 +132,18 @@ KINDS: dict[str, tuple[str, str]] = {
         "The facility said to check back on the pickup day or later, so the pickup is at risk. "
         "Call the desk, or ask the customer to move the delivery.",
     ),
+    "send_unconfirmed": (
+        "Check the email went out",
+        "Gmail did not answer when the agent sent this email, so it may or may not have gone. "
+        "Look in the sending mailbox's Sent folder: if it is there, mark it sent; if not, "
+        "resolve this and send it again. This clears by itself once the group's copy or the "
+        "facility's reply is read.",
+    ),
+    "attachment_unread": (
+        "Open the attachment",
+        "The facility's email carries a file the agent could not read (a scan, a picture, an "
+        "old Word file). Open it and act on what it says.",
+    ),
 }
 # The vendor's silence: raised by the no-reply timers, cleared by any answer from the vendor.
 UNANSWERED: frozenset[ExceptionType] = frozenset(
@@ -152,6 +164,8 @@ SLOT_REPLY_SUPERSEDES: frozenset[ExceptionType] = UNANSWERED | {
     ExceptionType.HANDOFF,
     ExceptionType.TIME_ZONE_UNCLEAR,
     ExceptionType.CHECK_BACK_TOO_LATE,
+    ExceptionType.SEND_UNCONFIRMED,
+    ExceptionType.ATTACHMENT_UNREAD,
 }
 # A change to a booked pickup is not superseded by later replies: once a booked pickup is
 # disturbed, a person settles it (approving or marking it booked resolves it).
@@ -160,6 +174,7 @@ SLOT_REPLY_SUPERSEDES: frozenset[ExceptionType] = UNANSWERED | {
 QUESTION_SUPERSEDES: frozenset[ExceptionType] = UNANSWERED | {
     ExceptionType.FACILITY_QUESTION,
     ExceptionType.HANDOFF,
+    ExceptionType.SEND_UNCONFIRMED,
 }
 # Booking methods a profile can name that the agent cannot use: it only books by email.
 MANUAL_METHODS = {

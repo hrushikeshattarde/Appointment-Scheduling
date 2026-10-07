@@ -11,6 +11,10 @@ and rate requests are not booking mail and are not kept.
 A person links an item to its pickup (the agent then reads it as that pickup's reply) or
 dismisses it. When a later pass finds the pickup itself (a case opened since), the item is
 linked by the agent.
+
+The text counts as well as the subject (``filters.body_reason``): a new desk writing under a
+subject of its own is kept when its email, quoted history or attached files name a PO, a pickup
+number or a pickup appointment.
 """
 
 from __future__ import annotations
@@ -31,7 +35,13 @@ from facility_profiles.booking.models import (
 )
 from facility_profiles.booking.worklist import flag
 from facility_profiles.logging import get_logger
-from facility_profiles.mailarchive.filters import is_dropped, match_reason, participants, rules_for
+from facility_profiles.mailarchive.filters import (
+    body_reason,
+    is_dropped,
+    match_reason,
+    participants,
+    rules_for,
+)
 
 if TYPE_CHECKING:
     from facility_profiles.booking.classify import ReplyClassifier
@@ -96,13 +106,9 @@ def booking_reason(
     for customer in mine or files or [known.fallback]:
         rules = rules_for(customer)
         reason = match_reason(message.subject, addresses, rules)
-        if (
-            reason is None
-            and customer.po is not None
-            and not is_dropped(message.subject, rules)
-            and customer.po.search(f"{message.subject} {message.body}")
-        ):
-            reason = "po-number"
+        if reason is None and not is_dropped(message.subject, rules):
+            # What the archive keeps for its text: a PO, a pickup number, a pickup appointment.
+            reason = body_reason(f"{message.subject}\n{message.full_text}", rules)
         if reason is not None:
             # Whose it is only when it went to that customer's group: anything else is the
             # admins' to sort, never filed under whichever customer's rules happened to match.

@@ -22,7 +22,7 @@ time, so its desk does not read it as its own.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
@@ -207,10 +207,27 @@ def is_shared_desk(case: BookingCase, settings: Settings) -> bool:
 # ------------------------------------------------------------------ fill-in values
 
 
+def _own(
+    case: BookingCase,
+    profile: VendorProfile | None,
+    profiles: Mapping[int, VendorProfile | None] | None,
+) -> VendorProfile | None:
+    """The case's own facility profile in a batch, else the one given for all."""
+    return profiles.get(case.id, profile) if profiles is not None else profile
+
+
 def case_values(
-    cases: Sequence[BookingCase], settings: Settings, profile: VendorProfile | None
+    cases: Sequence[BookingCase],
+    settings: Settings,
+    profile: VendorProfile | None,
+    *,
+    profiles: Mapping[int, VendorProfile | None] | None = None,
 ) -> dict[str, str]:
-    """The fields every template can use, for one case or a batch for one desk."""
+    """The fields every template can use, for one case or a batch for one desk.
+
+    ``profile`` is the first case's facility; in a batch, ``profiles`` gives each case its own,
+    so the numbers each facility needs are listed for its own PO.
+    """
     first = cases[0]
     pos = [str(p) for c in cases for p in c.po_numbers]
     mmdd, clock = vendor_when(first.requested_local, first.vendor_timezone)
@@ -226,7 +243,9 @@ def case_values(
         "desk_name": first.contact_name or (profile.contact_name if profile else None) or "",
         "delivery_ref": first.delivery_ref or "",
         "delivery_date": to_eastern(delivery).strftime("%m/%d") if delivery else "",
-        "refs": ", ".join(ref for c in cases for ref in extra_references(c, profile)),
+        "refs": ", ".join(
+            ref for c in cases for ref in extra_references(c, _own(c, profile, profiles))
+        ),
         "carrier": settings.booking_carrier_name,
         "signature": customer_of(first, settings).signature or settings.booking_signature,
     }
@@ -238,23 +257,28 @@ def request_values(
     profile: VendorProfile | None,
     *,
     links: str = "",
+    profiles: Mapping[int, VendorProfile | None] | None = None,
 ) -> dict[str, str]:
-    """The fields of a request: the PO lines, the ask and any links, on top of the common ones."""
+    """The fields of a request: the PO lines, the ask and any links, on top of the common ones.
+
+    In a batch for one desk, each PO line follows its own facility (``profiles``): the numbers
+    that facility needs, and a date only where that facility books by the day.
+    """
     first = cases[0]
-    date_only = bool(profile and profile.date_only)
     ask = (
         f"Can I please schedule the following for {short_vendor(first.vendor_name)} going to "
         f"{customer_of(first, settings).label(first.customer_name)}?"
         if is_shared_desk(first, settings)
         else "Can I please schedule the following?"
     )
-    lines = [
-        line
-        for c in cases
-        for line in request_lines(c, date_only=date_only, extra=extra_references(c, profile))
-    ]
+    lines: list[str] = []
+    for c in cases:
+        own = _own(c, profile, profiles)
+        lines += request_lines(
+            c, date_only=bool(own and own.date_only), extra=extra_references(c, own)
+        )
     return {
-        **case_values(cases, settings, profile),
+        **case_values(cases, settings, profile, profiles=profiles),
         "lines": "\n".join(lines),
         "ask": ask,
         "links": links,

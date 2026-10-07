@@ -115,6 +115,7 @@ EVENTS: dict[str, str] = {
     "thanks_held": "No thank-you sent",
     "mail_linked": "Email linked to this pickup",
     "sent_by_person": "Email sent by a person",
+    "send_unconfirmed": "Gmail did not confirm the email went out",
 }
 # Transport Pro changes the board's "Latest updates" lists beside the emails.
 LOAD_UPDATES = frozenset(

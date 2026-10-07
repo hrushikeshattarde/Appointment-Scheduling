@@ -338,6 +338,8 @@ agent when the situation clears or by a person with a note (`booking resolve`):
 | `unanswered_24h` | timer: no answer 24 weekday hours after we wrote | any answer from the vendor, a sent follow-up, 48 h replacing it |
 | `unanswered_48h` | timer: still no answer after 48 weekday hours | any answer from the vendor, a person |
 | `pickup_expired` | timer: the pickup passed and the case is not booked | `booked`, `approve`, `reschedule`, a later pickup (an offer, a moved delivery), `close` |
+| `send_unconfirmed` | Gmail never answered a send, so the email may or may not have gone | the group's copy or a reply to it being read, `booking sent`, any later reply, a person |
+| `attachment_unread` | the facility's email carries a file the agent could not read (a scan, a picture, an old .doc) | a later reply about the slot, a person |
 
 When the agent hands a reply to a person (money, the round cap, no safe answer) the exception
 the reply raised stays open with the agent's reason added to it. A later reply about the slot (a
@@ -626,10 +628,19 @@ days are left for the pod to set.
 With `FP_BOOKING_INBOX` set, each pass also reads the new replies, the way Bigger Picture does:
 
 - **Where it reads**: `FP_BOOKING_INBOX=gmail` reads the sending mailbox (`FP_BOOKING_GMAIL_KEY`
-  for `FP_BOOKING_GMAIL_USER`) for mail to or copying the customers' groups;
-  `FP_BOOKING_INBOX=s3://bucket/prefix` reads the group-mail archive. Each pass looks
-  `FP_BOOKING_INBOX_DAYS` back (2). Mail already on a case is skipped by its email ID, so a reply
-  is never answered twice, however often the inbox is read.
+  for `FP_BOOKING_GMAIL_USER`) for mail to or copying the customers' groups, and mail sent to
+  the mailbox itself; `FP_BOOKING_INBOX=s3://bucket/prefix` reads the group-mail archive and,
+  when the sending mailbox is set up too, the mail sent straight to it without the group (a
+  facility that answered the address the request came from). An email found in both is read
+  once, and one source that cannot be read is reported without stopping the other. Each pass
+  looks `FP_BOOKING_INBOX_DAYS` back (2). Mail already on a case is skipped by its email ID, so a
+  reply is never answered twice, however often the inbox is read.
+- **Attached files are read**: the text of a PDF (with the `pdf` extra), Word (.docx), Excel
+  (.xlsx), text, CSV, HTML or calendar file goes under the email's own words, marked with the
+  file's name, so a confirmation sent only as a PDF is matched by its PO and read like the
+  email. A file that cannot be read (a scanned PDF, a picture sent as a file, an old .doc) is
+  named in the email and raises "Open the attachment", which also stops the agent booking on
+  that reply by itself. Logos in signatures are left alone.
 - **Finding the pickup**: by the email IDs the reply answers, its thread, a PO in its words (of a
   pickup being booked or one booked), the desk that wrote, or another address at that desk's
   company when only one pickup is open with it (too weak to book on). Every email the agent
@@ -747,6 +758,17 @@ nothing.
 - **Each desk's email stands on its own:** one the send gate refuses is reported and the rest
   go on; what was already sent stays recorded. The daily cap counts emails, so a batched
   request for four POs is one.
+- **A batched email follows each pickup's own facility:** a desk that books for several plants
+  gets one email, but each pickup is checked against its own plant's profile (the desk it
+  trusts, its cut-off, the numbers it needs) and its PO line carries that plant's numbers, with
+  a date only where that plant books by the day.
+- **Gmail failures are reported, not crashed on:** a login refused, no connection, or Gmail
+  saying no ends `booking send` with "not sent: ..." and nothing recorded. When Gmail took the
+  email and never answered (a timeout, a dropped connection, its own error), the email may have
+  gone: it is recorded with the Message-ID it carries and the to-do "Check the email went out", and
+  never sent again on its own. It clears when the group's copy or the facility's reply to it is
+  read, or when a person marks it sent (`booking sent`); if it is not in the Sent folder,
+  resolve the to-do and send it again with `--again`.
 
 ### Desk rules
 
@@ -920,6 +942,15 @@ pickup numbers, DCT references, why it was kept) with every attachment once unde
 two members' mailboxes is one object and a backfill from a long-standing member merges cleanly. A
 thread is kept as a whole once any message in it qualifies, and the earlier messages of a newly
 matched thread are collected with it.
+
+Mail whose subject and people say nothing is still kept when it answers a kept email by its
+Message-ID (a reply under a subject of its own, remembered in `state/kept-ids.json` for 180
+days), or when its text names one of the customer's PO numbers, a pickup or confirmation number,
+or a pickup appointment (a new desk writing "Order ready"). Its text is fetched once; a message
+found not to be about booking is remembered in `state/body-checked.json` for the days the pass
+looks back. The agent applies the same text rules to mail no pickup matched, so such mail lands
+in "Emails no pickup matched" for a person instead of being dropped. Each attachment's manifest
+entry says whether it sat in the body (`inline`, a logo) or was attached.
 
 ```powershell
 facility-profiles mail-archive collect --key <service-account.json> --subject <member> --bucket <bucket> --days 10

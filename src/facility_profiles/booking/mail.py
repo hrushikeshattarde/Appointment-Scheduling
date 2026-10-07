@@ -13,12 +13,22 @@ import base64
 import importlib
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.message import EmailMessage
 from email.utils import make_msgid, parseaddr
 from pathlib import Path
 from typing import Any, Protocol
+
+from facility_profiles.booking.attachments import (
+    READ,
+    Attachment,
+    Reading,
+    triage,
+    with_attachments,
+)
+from facility_profiles.booking.attachments import read as read_attachment
 
 GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me"
 SCOPE_READ = "https://www.googleapis.com/auth/gmail.readonly"
@@ -43,6 +53,9 @@ class InboundMessage:
     quoted: str = ""  # the quoted history under the reply (vendors edit times in it)
     rfc_message_id: str | None = None  # the RFC Message-ID header, when the source keeps it
     references: str | None = None  # the References header, when the source keeps it
+    # Attached files that should have been read and were not ("scan.pdf: a scan"); the text of
+    # those that were read is in ``body``, under the email's own words (booking/attachments.py).
+    unread_files: tuple[str, ...] = ()
 
     @property
     def full_text(self) -> str:
@@ -155,11 +168,33 @@ class OutboundDraft:
 class Delivery:
     """What an outbox did with a draft."""
 
-    ref: str  # a file path, a Gmail draft id, or "gmail:<message id>"
+    ref: str  # a file path, a Gmail draft id, "gmail:<message id>", or UNCONFIRMED
     sent: bool = False
     gmail_id: str | None = None
     thread_id: str | None = None
     rfc_message_id: str | None = None
+    # Gmail gave no answer to a send it may have carried out: why, for the person who checks.
+    unconfirmed: str | None = None
+
+
+# The ``ref`` of a send Gmail never answered: it may or may not have gone out.
+UNCONFIRMED = "gmail:unconfirmed"
+
+
+class MailError(RuntimeError):
+    """Gmail could not be reached, refused the login, or refused the message.
+
+    ``maybe_sent`` is True when the message may have gone out all the same (the connection
+    dropped or timed out after the message was handed over, or Gmail failed on its side), so it
+    must not simply be sent again. ``rfc_message_id`` is the Message-ID it would carry.
+    """
+
+    def __init__(
+        self, message: str, *, maybe_sent: bool = False, rfc_message_id: str | None = None
+    ) -> None:
+        super().__init__(message)
+        self.maybe_sent = maybe_sent
+        self.rfc_message_id = rfc_message_id
 
 
 class Mailer(Protocol):
@@ -179,10 +214,22 @@ class Sender(Protocol):
 
 
 def deliver(outbox: Mailer | Sender, draft: OutboundDraft) -> Delivery:
-    """Hand a draft to whichever kind of outbox this is."""
+    """Hand a draft to whichever kind of outbox this is.
+
+    A send Gmail may have carried out without saying so comes back as an unconfirmed
+    :class:`Delivery` (``ref`` :data:`UNCONFIRMED`), so it is recorded and not sent twice; any
+    other :class:`MailError` is raised: nothing went out.
+    """
     send = getattr(outbox, "deliver", None)
     if callable(send):
-        result: Delivery = send(draft)
+        try:
+            result: Delivery = send(draft)
+        except MailError as exc:
+            if not exc.maybe_sent:
+                raise
+            return Delivery(
+                ref=UNCONFIRMED, rfc_message_id=exc.rfc_message_id, unconfirmed=str(exc)[:300]
+            )
         return result
     return Delivery(ref=outbox.create_draft(draft))  # type: ignore[union-attr]
 
@@ -289,11 +336,65 @@ def _gmail_session(key_path: Path, subject: str, scope: str) -> Any:
         service_account = importlib.import_module("google.oauth2.service_account")
     except ImportError as exc:  # pragma: no cover - environment guard
         msg = "install the gmail extra (google-auth, requests) to use Gmail"
-        raise RuntimeError(msg) from exc
-    creds = service_account.Credentials.from_service_account_file(
-        str(key_path), scopes=[scope]
-    ).with_subject(subject)
+        raise MailError(msg) from exc
+    try:
+        creds = service_account.Credentials.from_service_account_file(
+            str(key_path), scopes=[scope]
+        ).with_subject(subject)
+    except (OSError, ValueError, KeyError) as exc:
+        msg = f"the Gmail key {key_path} could not be loaded ({type(exc).__name__}: {exc})"
+        raise MailError(msg[:400]) from exc
     return transport.AuthorizedSession(creds)
+
+
+# Errors raised before anything reached Gmail: the login (minted on the first call), or no
+# connection at all. Anything else raised during a send may come after Gmail took the message.
+_BEFORE_SENDING = ("RefreshError", "DefaultCredentialsError", "TransportError", "ConnectTimeout")
+_NO_CONNECTION = (
+    "NewConnectionError",
+    "NameResolutionError",
+    "Failed to establish a new connection",
+)
+
+
+def _may_have_gone(exc: Exception) -> bool:
+    """Whether a send that raised ``exc`` may still have reached Gmail."""
+    names = {type(e).__name__ for e in (exc, exc.__cause__, exc.__context__) if e is not None}
+    if names & set(_BEFORE_SENDING):
+        return False
+    return not any(marker in str(exc) for marker in _NO_CONNECTION)
+
+
+def _post(
+    session: Any,
+    url: str,
+    payload: dict[str, Any],
+    *,
+    what: str,
+    sending: bool,
+    rfc_message_id: str | None = None,
+) -> dict[str, Any]:
+    """POST to Gmail; every failure becomes a :class:`MailError` that says what went wrong.
+
+    ``sending`` marks a call that delivers mail: a timeout, a dropped connection or a 5xx from
+    Gmail may then have sent it, and the error says so.
+    """
+    try:
+        resp = session.post(url, json=payload, timeout=60)
+    except Exception as exc:  # the login's and the transport's errors, whichever library raised
+        maybe = sending and _may_have_gone(exc)
+        reason = f"Gmail {what} failed: {type(exc).__name__}: {str(exc)[:240]}"
+        raise MailError(reason, maybe_sent=maybe, rfc_message_id=rfc_message_id) from exc
+    if resp.status_code not in (200, 201):
+        maybe = sending and resp.status_code >= 500
+        reason = f"Gmail {what} failed {resp.status_code}: {resp.text[:300]}"
+        raise MailError(reason, maybe_sent=maybe, rfc_message_id=rfc_message_id)
+    try:
+        data = resp.json()
+    except ValueError as exc:  # it answered 200: the message went, the answer is unreadable
+        reason = f"Gmail {what} answered {resp.status_code} with no readable body"
+        raise MailError(reason, maybe_sent=sending, rfc_message_id=rfc_message_id) from exc
+    return dict(data) if isinstance(data, dict) else {}
 
 
 def _raw(msg: EmailMessage) -> str:
@@ -308,18 +409,15 @@ class GmailDraftMailer:
     subject_user: str
     sender: str
 
-    def create_draft(self, draft: OutboundDraft) -> str:  # pragma: no cover - live API
-        """POST users/me/drafts; returns the draft ID."""
+    def create_draft(self, draft: OutboundDraft) -> str:
+        """POST users/me/drafts; returns the draft ID. Raises :class:`MailError` on failure."""
         raw = _raw(build_mime(draft, draft.from_addr or self.sender))
         payload: dict[str, Any] = {"message": {"raw": raw}}
         if draft.thread_id:
             payload["message"]["threadId"] = draft.thread_id
         session = _gmail_session(self.key_path, self.subject_user, SCOPE_COMPOSE)
-        resp = session.post(f"{GMAIL_API}/drafts", json=payload, timeout=60)
-        if resp.status_code not in (200, 201):
-            msg_text = f"Gmail draft failed {resp.status_code}: {resp.text[:300]}"
-            raise RuntimeError(msg_text)
-        return str(resp.json().get("id"))
+        data = _post(session, f"{GMAIL_API}/drafts", payload, what="draft", sending=False)
+        return str(data.get("id"))
 
 
 @dataclass
@@ -335,19 +433,26 @@ class GmailSender:
     subject_user: str
     sender: str | None = None
 
-    def deliver(self, draft: OutboundDraft) -> Delivery:  # pragma: no cover - live API
-        """POST users/me/messages/send; returns the Gmail ids and the Message-ID that went out."""
+    def deliver(self, draft: OutboundDraft) -> Delivery:
+        """POST users/me/messages/send; returns the Gmail ids and the Message-ID that went out.
+
+        Raises :class:`MailError` when it fails, with ``maybe_sent`` when Gmail may have sent
+        the message all the same.
+        """
         sender = self.sender or self.subject_user
         message_id = new_message_id(sender)
         payload: dict[str, Any] = {"raw": _raw(build_mime(draft, sender, message_id=message_id))}
         if draft.thread_id:
             payload["threadId"] = draft.thread_id
         session = _gmail_session(self.key_path, self.subject_user, SCOPE_SEND)
-        resp = session.post(f"{GMAIL_API}/messages/send", json=payload, timeout=60)
-        if resp.status_code not in (200, 201):
-            msg_text = f"Gmail send failed {resp.status_code}: {resp.text[:300]}"
-            raise RuntimeError(msg_text)
-        data = resp.json()
+        data = _post(
+            session,
+            f"{GMAIL_API}/messages/send",
+            payload,
+            what="send",
+            sending=True,
+            rfc_message_id=message_id,
+        )
         return Delivery(
             ref=f"gmail:{data.get('id')}",
             sent=True,
@@ -378,7 +483,7 @@ class GmailReader:
             resp = session.get(f"{GMAIL_API}/messages", params=params, timeout=60)
             if resp.status_code != 200:
                 msg = f"Gmail list failed {resp.status_code}: {resp.text[:300]}"
-                raise RuntimeError(msg)
+                raise MailError(msg)
             data = resp.json()
             ids.extend(m["id"] for m in data.get("messages", []))
             token = data.get("nextPageToken")
@@ -389,22 +494,42 @@ class GmailReader:
             resp = session.get(f"{GMAIL_API}/messages/{mid}", params={"format": "full"}, timeout=60)
             if resp.status_code != 200:
                 continue
-            out.append(_from_gmail(resp.json()))
+
+            def attachment(attachment_id: str, mid: str = mid) -> bytes:
+                got = session.get(
+                    f"{GMAIL_API}/messages/{mid}/attachments/{attachment_id}", timeout=60
+                )
+                if got.status_code != 200:
+                    msg = f"Gmail attachment failed {got.status_code}: {got.text[:200]}"
+                    raise MailError(msg)
+                return _decode_bytes(str(got.json().get("data") or ""))
+
+            out.append(_from_gmail(resp.json(), attachment=attachment))
         return sorted(out, key=lambda m: m.sent_at)
 
 
+def _decode_bytes(data: str) -> bytes:
+    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+
+
 def _decode(data: str) -> str:
-    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4)).decode("utf-8", "replace")
+    return _decode_bytes(data).decode("utf-8", "replace")
 
 
-def _body_text(payload: dict[str, Any]) -> str:
+def _part_headers(part: dict[str, Any]) -> dict[str, str]:
+    headers = part.get("headers") or []
+    return {str(h.get("name", "")).lower(): str(h.get("value", "")) for h in headers}
+
+
+def gmail_body_text(payload: dict[str, Any]) -> str:
+    """The text of a Gmail ``full`` message: its plain part, else its HTML part as text."""
     plain: list[str] = []
     html: list[str] = []
 
     def walk(part: dict[str, Any]) -> None:
         mime = part.get("mimeType", "")
         body = part.get("body") or {}
-        if body.get("data"):
+        if body.get("data") and not part.get("filename"):
             if mime == "text/plain":
                 plain.append(_decode(body["data"]))
             elif mime == "text/html":
@@ -419,10 +544,62 @@ def _body_text(payload: dict[str, Any]) -> str:
     return re.sub(r"<[^>]+>", " ", text)
 
 
-def _from_gmail(msg: dict[str, Any]) -> InboundMessage:
+def _file_parts(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every part of a Gmail ``full`` message that is a file (it has a file name)."""
+    found: list[dict[str, Any]] = []
+
+    def walk(part: dict[str, Any]) -> None:
+        if part.get("filename"):
+            found.append(part)
+        for child in part.get("parts") or []:
+            walk(child)
+
+    walk(payload)
+    return found
+
+
+def _gmail_readings(
+    payload: dict[str, Any], attachment: Callable[[str], bytes] | None
+) -> list[Reading]:
+    """What each attached file says, fetching only the ones worth reading."""
+    readings: list[Reading] = []
+    for part in _file_parts(payload):
+        body = part.get("body") or {}
+        headers = _part_headers(part)
+        inline = headers.get("content-disposition", "").lower().startswith("inline") or bool(
+            headers.get("content-id")
+        )
+        name, mime = str(part["filename"]), str(part.get("mimeType") or "")
+        verdict = triage(name, mime, int(body.get("size") or 0), inline=inline)
+        if verdict is None:
+            continue
+        if verdict != READ:
+            readings.append(Reading(name, why=verdict))
+            continue
+        if body.get("data"):
+            data = _decode_bytes(str(body["data"]))
+        elif body.get("attachmentId") and attachment is not None:
+            data = attachment(str(body["attachmentId"]))
+        else:
+            continue
+        reading = read_attachment(Attachment(name, mime, data, inline=inline))
+        if reading is not None:
+            readings.append(reading)
+    return readings
+
+
+def _from_gmail(
+    msg: dict[str, Any], *, attachment: Callable[[str], bytes] | None = None
+) -> InboundMessage:
+    """A Gmail ``full`` message as the agent sees it, with the text of its attached files.
+
+    ``attachment`` fetches a file's bytes by its attachment id (a large file is not in the
+    message itself); without it only the files carried inline are read.
+    """
     headers = {h["name"].lower(): h["value"] for h in msg["payload"].get("headers", [])}
     sent_at = datetime.fromtimestamp(int(msg["internalDate"]) / 1000, tz=UTC)
-    body = _body_text(msg["payload"])
+    own, quoted = split_quoted(gmail_body_text(msg["payload"]))
+    body, unread = with_attachments(own, _gmail_readings(msg["payload"], attachment))
     return InboundMessage(
         message_id=str(msg["id"]),
         thread_id=msg.get("threadId"),
@@ -431,9 +608,10 @@ def _from_gmail(msg: dict[str, Any]) -> InboundMessage:
         to_addr=headers.get("to", ""),
         cc_addr=headers.get("cc", ""),
         subject=headers.get("subject", ""),
-        body=split_quoted(body)[0],
+        body=body,
         in_reply_to=headers.get("in-reply-to"),
-        quoted=split_quoted(body)[1],
+        quoted=quoted,
         rfc_message_id=headers.get("message-id"),
         references=headers.get("references"),
+        unread_files=unread,
     )

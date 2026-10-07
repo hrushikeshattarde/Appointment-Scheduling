@@ -1,12 +1,31 @@
-"""Read the archive back as the booking agent's :class:`InboundMessage` objects."""
+"""Read the archive back as the booking agent's :class:`InboundMessage` objects.
+
+Attached files are read too (``booking/attachments.py``): the collector stores each one once by
+its content, and the text of those worth reading goes under the email's own words. A file's text
+is kept in memory by its content hash, so a board that reads the last days' mail every few
+minutes fetches each file once.
+"""
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from facility_profiles.booking.attachments import (
+    READ,
+    Attachment,
+    Reading,
+    read,
+    triage,
+    with_attachments,
+)
 from facility_profiles.booking.mail import InboundMessage
-from facility_profiles.mailarchive.store import MAIL_PREFIX, Store
+from facility_profiles.mailarchive.store import MAIL_PREFIX, Store, attachment_key
+
+_CACHE_SIZE = 512
+# What each attached file said, by its sha256; None for a file not worth reading.
+_READINGS: OrderedDict[str, Reading | None] = OrderedDict()
 
 
 def day_prefixes(*, days: int, now: datetime | None = None) -> list[str]:
@@ -18,8 +37,10 @@ def day_prefixes(*, days: int, now: datetime | None = None) -> list[str]:
     ]
 
 
-def to_inbound(envelope: dict[str, Any], key: str) -> InboundMessage:
-    """One archived envelope as the agent sees it."""
+def to_inbound(
+    envelope: dict[str, Any], key: str, readings: list[Reading] | None = None
+) -> InboundMessage:
+    """One archived envelope as the agent sees it, with the text of its attached files."""
     sent = envelope.get("internal_date") or envelope.get("date") or ""
     try:
         sent_at = datetime.fromisoformat(str(sent))
@@ -27,6 +48,7 @@ def to_inbound(envelope: dict[str, Any], key: str) -> InboundMessage:
         sent_at = datetime.now(tz=UTC)
     if sent_at.tzinfo is None:
         sent_at = sent_at.replace(tzinfo=UTC)
+    body, unread = with_attachments(str(envelope.get("own_text") or ""), readings or [])
     return InboundMessage(
         message_id=str(envelope.get("key") or key),
         thread_id=str(envelope.get("thread_id") or "") or None,
@@ -35,12 +57,49 @@ def to_inbound(envelope: dict[str, Any], key: str) -> InboundMessage:
         to_addr=str(envelope.get("to") or ""),
         cc_addr=str(envelope.get("cc") or ""),
         subject=str(envelope.get("subject") or ""),
-        body=str(envelope.get("own_text") or ""),
+        body=body,
         in_reply_to=envelope.get("in_reply_to") or None,
         quoted=str(envelope.get("quoted") or ""),
         rfc_message_id=envelope.get("message_id") or None,
         references=envelope.get("references") or None,
+        unread_files=unread,
     )
+
+
+def attachment_readings(store: Store, envelope: dict[str, Any]) -> list[Reading]:
+    """What each file in the envelope's manifest says; only files worth reading are fetched.
+
+    An envelope written before the collector noted which parts were inline treats a picture as
+    inline: a logo in a signature, not a confirmation.
+    """
+    out: list[Reading] = []
+    for item in envelope.get("attachments") or []:
+        if not isinstance(item, dict):
+            continue
+        sha = str(item.get("sha256") or "")
+        name = str(item.get("filename") or "") or "attachment"
+        mime = str(item.get("mime") or "")
+        inline = bool(item.get("inline", str(mime).startswith("image/")))
+        if sha in _READINGS:
+            _READINGS.move_to_end(sha)
+            cached = _READINGS[sha]
+            if cached is not None:
+                out.append(Reading(name, text=cached.text, why=cached.why))
+            continue
+        verdict = triage(name, mime, int(item.get("bytes") or 0), inline=inline)
+        if verdict is None or not sha:
+            reading: Reading | None = None
+        elif verdict != READ:
+            reading = Reading(name, why=verdict)
+        else:
+            reading = read(Attachment(name, mime, store.get(attachment_key(sha)), inline=inline))
+        if sha:
+            _READINGS[sha] = reading
+            while len(_READINGS) > _CACHE_SIZE:
+                _READINGS.popitem(last=False)
+        if reading is not None:
+            out.append(reading)
+    return out
 
 
 class S3MailReader:
@@ -58,5 +117,6 @@ class S3MailReader:
                     continue
                 envelope = self.store.get_json(key)
                 if isinstance(envelope, dict):
-                    out.append(to_inbound(envelope, key))
+                    readings = attachment_readings(self.store, envelope)
+                    out.append(to_inbound(envelope, key, readings))
         return sorted(out, key=lambda m: m.sent_at)

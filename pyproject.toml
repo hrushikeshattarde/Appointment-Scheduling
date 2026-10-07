@@ -25,6 +25,9 @@ api = ["fastapi>=0.115,<1", "uvicorn[standard]>=0.32,<1"]
 postgres = ["psycopg[binary]>=3.2,<4"]
 gmail = ["google-auth>=2.30,<3", "requests>=2.32,<3"]
 aws = ["boto3>=1.35,<2"]
+# Reads the text of PDF attachments (a confirmation sent only as a PDF); without it a PDF is
+# listed as unread and a person is asked to open it.
+pdf = ["pypdf>=6,<7"]
 
 [project.scripts]
 facility-profiles = "facility_profiles.cli:app"

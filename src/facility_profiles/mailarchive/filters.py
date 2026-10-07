@@ -11,6 +11,11 @@ A thread is kept as a whole once any message in it qualifies, so a "Thank you!" 
 orders?" with a bare "Re:" subject rides along with the request it answers. Dropped subjects are
 never kept, whatever else they match; marketplace notices (new tenders, tracking requests, RFQs)
 are dropped for every customer.
+
+Mail whose subject and people say nothing is still kept when its text does
+(:func:`body_reason`): a new desk writing "Order ready" about one of the customer's PO numbers,
+or giving a pickup number. So is a reply to a kept email under a new subject (the collector
+remembers what it kept by Message-ID).
 """
 
 from __future__ import annotations
@@ -161,6 +166,45 @@ def match_reason(
     if is_dropped(subject, rules):
         return None
     return subject_reason(subject, rules) or desk_reason(addresses, rules)
+
+
+# What makes an email's text about booking a pickup, when its subject does not say so.
+BODY_KEEP: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("pickup-appointment", KEEP_FIRST[0][1]),
+    ("pickup-number", PICKUP_NUMBER_RE),
+)
+
+
+def body_reason(text: str | None, rules: MailRules = GENERIC) -> str | None:
+    """``body:<rule>`` when the email's text is about a pickup appointment, else None.
+
+    For mail whose subject and people say nothing: one of the customer's PO numbers, a pickup or
+    confirmation number ("PU# 4471"), or a pickup appointment in so many words. The caller drops
+    the never-booking subjects first.
+    """
+    if not text:
+        return None
+    if rules.po is not None and re.search(rf"\b(?:{rules.po.pattern})\b", text):
+        return "body:po-number"
+    for name, pattern in BODY_KEEP:
+        if pattern.search(text):
+            return f"body:{name}"
+    return None
+
+
+def reply_reason(kept: Iterable[str], *headers: str | None) -> str | None:
+    """``reply:kept`` when In-Reply-To or References names a kept email's Message-ID.
+
+    A facility that answers under a subject of its own ("Confirmed") starts a new Gmail thread,
+    but still names the email it answers. ``kept`` holds kept Message-IDs, lower case, no angle
+    brackets.
+    """
+    wanted = set(kept)
+    for value in headers:
+        for token in re.findall(r"<([^<>\s]+)>", value or ""):
+            if token.lower() in wanted:
+                return "reply:kept"
+    return None
 
 
 def identifiers(*texts: str | None, rules: MailRules = GENERIC) -> dict[str, list[str]]:

@@ -34,7 +34,7 @@ from facility_profiles.extraction.openrouter import (
     strict_json_schema,
 )
 
-PROMPT_VERSION = "reply-v5"
+PROMPT_VERSION = "reply-v6"
 
 SYSTEM_PROMPT = """You read one email reply from a shipping facility to a freight broker's pickup \
 appointment request and return a JSON object describing it.
@@ -81,6 +81,9 @@ PO numbers as written, its status, date, time, pickup number and reject_reason, 
 that line. \
 Set the top-level fields to the line about the POs marked as ours, or to the overall reading. \
 Leave items empty when the reply has one reading for everything.
+- Text from files attached to the reply follows its own words, each file under a line \
+"--- Attached file: <name> ---". It counts as the reply's own words (a facility may send its \
+confirmation only as a PDF): read it, and quote from it as from the reply.
 - Only use the reply text. Do not invent values that are not written there."""
 
 # Outlook wraps numbers and addresses in link cruft ("115802102660<tel:(580)%20210-2660>",
