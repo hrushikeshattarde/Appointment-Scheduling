@@ -182,7 +182,7 @@ def _temperature(ref: dict[str, Any]) -> str | None:
     return None
 
 
-def _dispatch(dispatches: list[Dispatch]) -> Dispatch | None:
+def live_dispatch(dispatches: list[Dispatch]) -> Dispatch | None:
     """The load's live dispatch: the newest one that was not canceled."""
     live = [d for d in dispatches if (d.status or "").lower() not in _CANCELED]
     live.sort(key=lambda d: (d.date_created or "", d.id))
@@ -266,7 +266,7 @@ def load_facts(
         "seal_number": ref.get("sealNumber") or None,
         "carrier_assigned": "not yet",
     }
-    live = _dispatch(dispatches)
+    live = live_dispatch(dispatches)
     assigned = (live.assigned_to if live else None) or {}
     carrier = assigned.get("carrier") or {}
     if live is not None:

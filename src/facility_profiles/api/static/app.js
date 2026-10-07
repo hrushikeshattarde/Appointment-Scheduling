@@ -1205,6 +1205,7 @@ function keyFacts(d) {
       fact("Vendor's pickup number", d.pickup_number || "Not given yet"),
       fact("Delivery", d.delivery_site || "-", delivery || null),
       fact("Booking desk", desk),
+      d.carrier_checked ? fact("Carrier", d.carrier || "None on the load yet") : null,
       fact("PO", pos(d)),
       fact("Customer", d.customer || "-"),
     ),

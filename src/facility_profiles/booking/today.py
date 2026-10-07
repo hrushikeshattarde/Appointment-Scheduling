@@ -34,9 +34,12 @@ SILENCE = frozenset(k.value for k in UNANSWERED)
 URGENCY: tuple[str, ...] = (
     ExceptionType.LOAD_CANCELED.value,
     ExceptionType.BOOKED_SLOT_CHANGED.value,
+    ExceptionType.PICKUP_NO_SHOW.value,
+    ExceptionType.CARRIER_DROPPED.value,
     ExceptionType.SEND_UNCONFIRMED.value,
     ExceptionType.EMAIL_BOUNCED.value,
     ExceptionType.WORK_IN_OFFERED.value,
+    ExceptionType.CARRIER_MISSING.value,
     ExceptionType.ETA_REQUESTED.value,
     ExceptionType.PICKUP_EXPIRED.value,
     ExceptionType.LOAD_INFEASIBLE.value,

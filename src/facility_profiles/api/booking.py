@@ -29,6 +29,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from facility_profiles.access import Viewer
 from facility_profiles.api.auth import ViewerDep, decided_by
+from facility_profiles.booking.coverage import CARRIER_KEY
 from facility_profiles.booking.inbox import reader_tools
 from facility_profiles.booking.links import offer_state
 from facility_profiles.booking.memory import desk_history
@@ -122,11 +123,17 @@ EVENTS: dict[str, str] = {
     "eta_requested": "Facility asked for the driver's ETA",
     "work_in_offered": "Facility offered a late arrival",
     "on_hold": "Facility put the pickup on hold",
+    "carrier_assigned": "Carrier on the load",
+    "carrier_changed": "Carrier changed",
+    "carrier_dropped": "Carrier's dispatch canceled",
 }
 # Transport Pro changes the board's "Latest updates" lists beside the emails.
 LOAD_UPDATES = frozenset(
     {
         "scanned",
+        "carrier_assigned",
+        "carrier_changed",
+        "carrier_dropped",
         "delivery_from_tpro",
         "tender_changed",
         "booked_in_tpro",
@@ -219,6 +226,9 @@ def case_summary(case: BookingCase, *, now: datetime) -> dict[str, Any]:
         "load_status": (case.tpro_seen or {}).get("load_status"),
         "picked_up": picked_up((case.tpro_seen or {}).get("load_status")),
         "pickup_number": case.pickup_number,
+        # The carrier on the load, once the scan has read the dispatch of a booked pickup.
+        "carrier_checked": CARRIER_KEY in (case.tpro_seen or {}),
+        "carrier": ((case.tpro_seen or {}).get(CARRIER_KEY) or {}).get("name"),
         # Every number the case has carried, so any of them finds it.
         "numbers": sorted({r.value for r in case.references}),
         "desk": case.contact_email,

@@ -78,6 +78,11 @@ class ExceptionType(StrEnum):
     ETA_REQUESTED = "eta_requested"
     WORK_IN_OFFERED = "work_in_offered"
     ON_HOLD = "on_hold"
+    # The truck for a booked pickup (booking/coverage.py): its dispatch canceled, none on the load
+    # in time, or no arrival at the shipper after the booked time.
+    CARRIER_DROPPED = "carrier_dropped"
+    CARRIER_MISSING = "carrier_missing"
+    PICKUP_NO_SHOW = "pickup_no_show"
 
 
 class BookingCase(Base):

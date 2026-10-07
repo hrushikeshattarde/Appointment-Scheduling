@@ -37,6 +37,7 @@ from facility_profiles.booking.classify import (
     validate_classification,
     zone_doubt,
 )
+from facility_profiles.booking.coverage import CARRIER_KEY, watch_coverage
 from facility_profiles.booking.facts import FORBIDDEN_TOPICS
 from facility_profiles.booking.links import (
     create_offer,
@@ -214,6 +215,9 @@ class ScanStats:
     booked_in_tpro: int = 0  # a pickup number or a confirmed stop appeared in Transport Pro
     picked_up: int = 0  # Transport Pro shows the load delivered: the pickup happened
     rechecked: int = 0  # earlier pickups still on the board, read again by load number
+    carriers_watched: int = 0  # booked pickups whose dispatch was read (booking/coverage.py)
+    carrier_alerts: int = 0  # carrier dropped, or none yet in time, raised
+    no_shows: int = 0  # booked pickups with no arrival at the shipper after the grace
     case_ids: list[int] = field(default_factory=list)
 
 
@@ -583,6 +587,12 @@ def scan(  # noqa: PLR0912 - one branch per kind of load
         for load in earlier:
             if _refresh_stop(session, settings, load, now=now, stats=stats):
                 stats.rechecked += 1
+    # The truck for each booked pickup: read after the store is let go, like the loads above.
+    if callable(getattr(client, "search_dispatches", None)):
+        watch = watch_coverage(client, sessions, settings, now=now)
+        stats.carriers_watched = watch.watched
+        stats.carrier_alerts = watch.carrier_alerts
+        stats.no_shows = watch.no_shows
     return stats
 
 
@@ -735,7 +745,9 @@ def refresh_case(
             session, case, seen, customer, settings, now=now, replan=bool(delivery)
         )
         done = [*booked, *delivery, *request]
-    case.tpro_seen = seen.view
+    # The carrier the coverage watch last saw is its own, not the load's: it is kept.
+    carrier = (case.tpro_seen or {}).get(CARRIER_KEY)
+    case.tpro_seen = {**seen.view, CARRIER_KEY: carrier} if carrier is not None else seen.view
     if done:
         stats.refreshed += 1
     return done

@@ -344,6 +344,9 @@ agent when the situation clears or by a person with a note (`booking resolve`):
 | `eta_requested` | the facility asks when the driver will arrive, and the agent could not answer from the driver's check call or position | an answer that left nothing open, a later reply, a person |
 | `work_in_offered` | after a missed or late arrival, the facility will still take the truck until a time | a later reply about the slot, a person |
 | `on_hold` | the facility put the pickup or the order on hold with no day given (the agent stops chasing) | a later reply about the slot, a person |
+| `carrier_dropped` | the carrier's dispatch for a booked pickup was canceled and no other carrier is on the load | a carrier on the load, a person |
+| `carrier_missing` | a booked pickup has no carrier on the load by `FP_BOOKING_CARRIER_BY` (12:00 ET) the business day before | a carrier on the load, a person |
+| `pickup_no_show` | `FP_BOOKING_NO_SHOW_HOURS` (2) after a booked time, Transport Pro shows no arrival at the shipper | an arrival recorded at the shipper, the load picked up, a person |
 
 When the agent hands a reply to a person (money, the round cap, no safe answer) the exception
 the reply raised stays open with the agent's reason added to it. A later reply about the slot (a
@@ -672,6 +675,15 @@ With `FP_BOOKING_INBOX` set, each pass also reads the new replies, the way Bigge
   the pickup on hold raises "Pickup on hold" (on a booked pickup, "Booked pickup changed"), and
   neither is answered by the agent. A hold is never read as a decline, so Lidl is not asked to
   move the delivery for it.
+- **The truck for a booked pickup**: each scan also reads the dispatch of every booked pickup due
+  in the next four days, or past in the last two (one Transport Pro read per load, none while
+  the store is held). A carrier's dispatch canceled with nothing in its place raises "Carrier
+  dropped" at once; no carrier on the load by `FP_BOOKING_CARRIER_BY` (Eastern, default 12:00) on
+  the business day before raises "No carrier yet"; and `FP_BOOKING_NO_SHOW_HOURS` (default 2)
+  after the booked time with no arrival recorded at the shipper raises "Truck not seen at pickup".
+  Each clears itself when a carrier is on the load, or the arrival is recorded. The pickup's page
+  shows the carrier, and Latest updates shows a carrier put on, changed or dropped. Real trucks
+  often arrive hours late, so the no-show to-do is a prompt to check, not a verdict.
 - **Delivery moved under a booked pickup**: when Transport Pro or the customer's desk moves the
   delivery, a booked pickup is checked against it (the booked time plus the drive and loading);
   one that can no longer make it raises "Delivery moved" for a person to ask the facility for an

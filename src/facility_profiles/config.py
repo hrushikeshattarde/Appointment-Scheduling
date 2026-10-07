@@ -124,6 +124,11 @@ class Settings(BaseSettings):
     booking_customer_desk: str | None = None
     booking_max_rounds: int = Field(3, gt=0)
     booking_follow_up_hours: int = Field(24, gt=0)
+    # A booked pickup with no carrier on the load by this time (Eastern) on the business day
+    # before it raises "No carrier yet" (booking/coverage.py).
+    booking_carrier_by: str = Field("12:00", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    # Hours after a booked pickup time with no arrival at the shipper before "Truck not seen".
+    booking_no_show_hours: float = Field(2.0, gt=0)
     booking_min_notice_hours: int = Field(4, ge=0)
     booking_avg_mph: float = Field(50.0, gt=0)
     booking_load_hours: float = Field(2.0, ge=0)

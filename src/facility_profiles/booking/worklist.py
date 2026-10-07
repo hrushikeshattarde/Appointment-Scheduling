@@ -161,6 +161,25 @@ KINDS: dict[str, tuple[str, str]] = {
         "below. Check the driver can make it and reply, or agree a new appointment and "
         "reschedule.",
     ),
+    "carrier_dropped": (
+        "Carrier dropped",
+        "The carrier's dispatch for this booked pickup was canceled and no other carrier is on "
+        "the load. Get it covered again in time for the booked pickup, or move the pickup with "
+        "the facility. This clears when a carrier is on the load.",
+    ),
+    "carrier_missing": (
+        "No carrier yet",
+        "The pickup is booked but no carrier is on the load yet, and it is due tomorrow or "
+        "sooner. Check with whoever covers the load; move the pickup with the facility if no "
+        "truck can make it. This clears when a carrier is on the load.",
+    ),
+    "pickup_no_show": (
+        "Truck not seen at pickup",
+        "The booked pickup time has passed and Transport Pro shows no arrival at the shipper. "
+        "Call the driver or the carrier: if the truck is late, tell the facility; if it missed, "
+        "agree a new pickup and move the delivery if it no longer works. This clears when "
+        "Transport Pro shows the truck arrived.",
+    ),
     "on_hold": (
         "Pickup on hold",
         "The facility put the pickup or the order on hold. Ask when it will be released, or "
