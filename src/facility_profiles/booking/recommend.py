@@ -40,6 +40,7 @@ from facility_profiles.booking.respond import local_dt, transit_hours
 from facility_profiles.booking.rules import VendorProfile
 from facility_profiles.booking.templates import short_vendor
 from facility_profiles.booking.timers import fmt_slot
+from facility_profiles.business_days import holiday, is_business_day, why_closed
 from facility_profiles.clock import local_to_eastern, stamp
 from facility_profiles.config import Settings
 from facility_profiles.customers import customer_of
@@ -171,6 +172,41 @@ def hours_on(profile: VendorProfile | None, day: date) -> list[tuple[str, str]] 
     return sorted(found)
 
 
+def open_on(profile: VendorProfile | None, day: date) -> bool:
+    """Whether the facility ships on ``day``.
+
+    Never on a freight holiday; on a Saturday or Sunday only when its hours say so; on a weekday
+    unless its hours list no opening that day.
+    """
+    if holiday(day) is not None:
+        return False
+    spans = hours_on(profile, day)
+    return bool(spans) if spans is not None else is_business_day(day)
+
+
+def _closed_why(day: date) -> str:
+    return why_closed(day) or f"a {day:%A}, which the facility's hours list closed"
+
+
+def _open_day(profile: VendorProfile | None, day: date, *, earliest: date) -> date | None:
+    """The nearest day the facility ships before ``day``, else after it.
+
+    Not before ``earliest`` (a driver could not make it); None when none is open within two
+    weeks.
+    """
+    before = day - timedelta(days=1)
+    while before >= earliest and day - before <= timedelta(days=7):
+        if open_on(profile, before):
+            return before
+        before -= timedelta(days=1)
+    after = day + timedelta(days=1)
+    while after - day <= timedelta(days=14):
+        if open_on(profile, after):
+            return after
+        after += timedelta(days=1)
+    return None
+
+
 def _fmt_hours(spans: Sequence[tuple[str, str]]) -> str:
     return ", ".join(f"{a.replace(':', '')}-{b.replace(':', '')}" for a, b in spans)
 
@@ -233,7 +269,7 @@ def _start(
         return None
     days = max(1, math.ceil((case.miles or 0) / settings.booking_transit_miles_per_day))
     day = delivery.astimezone(tz).date() - timedelta(days=days)
-    while day.weekday() >= 5:  # vendors ship Monday to Friday
+    while not is_business_day(day):  # vendors ship on business days
         day -= timedelta(days=1)
     plural = "" if days == 1 else "s"
     note = f"{days} day{plural} before the delivery on {stamp(delivery, '%m/%d', label=False)}"
@@ -241,7 +277,7 @@ def _start(
 
 
 def earliest_pickup(now: datetime, settings: Settings, tz: ZoneInfo) -> datetime:
-    """The earliest pickup a driver can still make: past the notice window, on a weekday.
+    """The earliest pickup a driver can still make: past the notice window, on a business day.
 
     Never before the pod's start of day (FP_BOOKING_EARLIEST_PICKUP_TIME).
     """
@@ -252,22 +288,28 @@ def earliest_pickup(now: datetime, settings: Settings, tz: ZoneInfo) -> datetime
     starts = time.fromisoformat(settings.booking_earliest_pickup_time)
     if soonest.time() < starts:
         soonest = datetime.combine(soonest.date(), starts, tzinfo=tz)
-    if soonest.weekday() >= 5:
-        monday = soonest.date() + timedelta(days=7 - soonest.weekday())
+    if not is_business_day(soonest.date()):
+        day = soonest.date()
+        while not is_business_day(day):
+            day += timedelta(days=1)
         clock = time.fromisoformat(settings.booking_default_pickup_time)
-        soonest = datetime.combine(monday, clock, tzinfo=tz)
+        soonest = datetime.combine(day, clock, tzinfo=tz)
     return soonest
 
 
 def _floor(
-    case: BookingCase, settings: Settings, day: date, clock: str
+    case: BookingCase,
+    settings: Settings,
+    day: date,
+    clock: str,
+    profile: VendorProfile | None = None,
 ) -> tuple[date, Step] | None:
-    """The PO date the desk loads from, when it is later than ``day`` (a weekend: Monday)."""
+    """The PO date the desk loads from, when it is later than ``day`` (closed: the next open)."""
     floor = pickup_floor(case, settings)
     if floor is None or day >= floor:
         return None
     target = floor
-    while target.weekday() >= 5:
+    while not open_on(profile, target) and target - floor <= timedelta(days=14):
         target += timedelta(days=1)
     tz = case.vendor_timezone
     note = (
@@ -327,8 +369,24 @@ def recommend_time(
     steps = [first]
     tz = ZoneInfo(case.vendor_timezone or "America/New_York")
     default = settings.booking_default_pickup_time
-
-    floored = _floor(case, settings, day, clock or default)
+    earliest = earliest_pickup(now, settings, tz)
+    if not open_on(profile, day):
+        # A tendered Saturday, a holiday, a day the facility's hours have it closed: the
+        # business day before, when a driver can still make it, else the next open day.
+        moved_to = _open_day(profile, day, earliest=earliest.date())
+        if moved_to is not None:
+            shown = clock or default
+            steps.append(
+                Step(
+                    "closed",
+                    f"{fmt_slot(f'{day:%Y-%m-%d} {shown}', case.vendor_timezone)} is "
+                    f"{_closed_why(day)}; asking for "
+                    f"{fmt_slot(f'{moved_to:%Y-%m-%d} {shown}', case.vendor_timezone)}",
+                    moved=True,
+                )
+            )
+            day = moved_to
+    floored = _floor(case, settings, day, clock or default, profile)
     floor_day = pickup_floor(case, settings) if floored is not None else None
     if floored is not None:
         target, step = floored
@@ -338,7 +396,6 @@ def recommend_time(
         clock, step = _clock(history, default)
         steps.append(step)
 
-    earliest = earliest_pickup(now, settings, tz)
     if (
         first.rule == "delivery"
         and local_dt(f"{day:%Y-%m-%d}", clock, case.vendor_timezone) < earliest

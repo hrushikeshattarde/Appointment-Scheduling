@@ -21,7 +21,7 @@ from collections.abc import Callable
 from contextlib import ExitStack
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import typer
 from sqlalchemy.orm import Session
@@ -39,6 +39,9 @@ from facility_profiles.pipeline.run import Pipeline
 from facility_profiles.storage.db import init_db, make_engine, session_factory, session_scope
 from facility_profiles.storage.models import FacilityRecord
 from facility_profiles.storage.repository import Repository, unwrap
+
+if TYPE_CHECKING:
+    from facility_profiles.booking.models import BookingCase
 
 app = typer.Typer(help="Facility scheduling profiles (Idea 1).", no_args_is_help=True)
 review_app = typer.Typer(help="Work the review queue.", no_args_is_help=True)
@@ -520,6 +523,9 @@ def profile_set(
     if typed is None:
         raise typer.BadParameter(f"'{value}' is not a valid value for {field}")
     settings = _settings()
+    internal = {d.lower() for d in settings.internal_email_domains}
+    if field == "contact_email" and str(typed).rpartition("@")[2].lower() in internal:
+        raise typer.BadParameter(f"{typed} is a Circle address, not the facility's desk")
     with session_scope(_sessions(settings)) as session:
         repo = Repository(session)
         record = resolve_facility(repo, facility)
@@ -725,24 +731,43 @@ def booking_draft(
     case_id: Annotated[
         int | None, typer.Argument(help="Case to draft; omit for all new cases")
     ] = None,
+    again: Annotated[
+        bool, typer.Option(help="Write the request once more for a case that already has one")
+    ] = False,
+    anyway: Annotated[
+        bool,
+        typer.Option(help="Draft the named case though its customer's rule holds it back"),
+    ] = False,
 ) -> None:
     """Compose the request emails as drafts, one per vendor desk (.eml in the drafts folder).
 
     Each desk's rules are checked first: a request past its cut-off or missing a number the
-    desk needs becomes a to-do, and one the desk would not book yet waits.
+    desk needs becomes a to-do, and one the desk would not book yet waits. So does one its
+    customer's rule holds back (a pickup the rule skips or holds, or one waiting for the
+    delivery's appointment); ``--anyway`` drafts a named case regardless.
     """
     from facility_profiles.booking.mail import LocalDraftMailer
-    from facility_profiles.booking.service import draft_batch, draft_case, prepare_drafts
+    from facility_profiles.booking.service import (
+        draft_batch,
+        draft_case,
+        prepare_drafts,
+        rule_stops,
+    )
 
     settings = _settings()
     mailer = LocalDraftMailer(
         Path(settings.booking_drafts_dir), sender=settings.booking_sender or ""
     )
     now = datetime.now(tz=UTC)
+    refused: list[tuple[list[BookingCase], str]] = []
     with session_scope(_sessions(settings)) as session:
         if case_id is not None:
+            case = _booking_case(session, case_id)
             try:
-                messages = [draft_case(session, _booking_case(session, case_id), mailer, settings)]
+                stopped = None if anyway else rule_stops(case, settings)
+                if stopped:
+                    raise ValueError(f"{stopped}; --anyway drafts it regardless")
+                messages = [draft_case(session, case, mailer, settings, again=again)]
             except ValueError as exc:
                 typer.echo(f"#{case_id}: {exc}")
                 raise typer.Exit(code=1) from exc
@@ -750,12 +775,16 @@ def booking_draft(
             ready, waiting = prepare_drafts(session, settings, now=now)
             for case, why in waiting:
                 typer.echo(f"#{case.id} waits: {why}")
-            messages = draft_batch(session, ready, mailer, settings, now=now)
+            messages = draft_batch(session, ready, mailer, settings, now=now, refused=refused)
         for message in messages:
             typer.echo(
                 f"#{message.case_id} drafted -> {message.to_addr}: {message.subject}  "
                 f"[{message.draft_ref}]"
             )
+        for group, why in refused:
+            typer.echo(f"{' '.join(f'#{c.id}' for c in group)} not drafted: {why}")
+    if refused:  # the drafts that were written are kept
+        raise typer.Exit(code=1)
 
 
 @booking_app.command("send")
@@ -764,11 +793,29 @@ def booking_send(
         int | None, typer.Argument(help="Case to send; omit for all new cases, one email per desk")
     ] = None,
     by: Annotated[str, typer.Option(help="Who is sending (recorded on the case)")] = "agent",
+    again: Annotated[
+        bool, typer.Option(help="Send the request once more for a case that already has one")
+    ] = False,
+    anyway: Annotated[
+        bool,
+        typer.Option(help="Send the named case though its customer's rule holds it back"),
+    ] = False,
 ) -> None:
-    """Send the request through Gmail as the agent's mailbox (FP_BOOKING_MODE=send)."""
+    """Send the request through Gmail as the agent's mailbox (FP_BOOKING_MODE=send).
+
+    The customer's rule is followed as when the agent runs on its own: a rule that only drafts,
+    skips, holds or waits for the delivery's appointment holds the request back (``--anyway``
+    sends a named case regardless). Each desk's email stands on its own: one the send gate
+    refuses is reported, and the ones already sent stay recorded.
+    """
     from facility_profiles.booking.mail import GmailSender
     from facility_profiles.booking.outbox import SendRefusedError
-    from facility_profiles.booking.service import draft_batch, draft_case, prepare_drafts
+    from facility_profiles.booking.service import (
+        draft_batch,
+        draft_case,
+        prepare_drafts,
+        rule_stops,
+    )
 
     settings = _settings()
     if settings.booking_mode != "send":
@@ -780,18 +827,23 @@ def booking_send(
     sender = GmailSender(
         Path(settings.booking_gmail_key), settings.booking_gmail_user, settings.booking_gmail_user
     )
+    refused: list[tuple[list[BookingCase], str]] = []
     with session_scope(_sessions(settings)) as session:
         try:
             if case_id is not None:
-                messages = [
-                    draft_case(session, _booking_case(session, case_id), sender, settings, by=by)
-                ]
+                case = _booking_case(session, case_id)
+                stopped = None if anyway else rule_stops(case, settings, sending=True)
+                if stopped:
+                    raise ValueError(f"{stopped}; --anyway sends it regardless")
+                messages = [draft_case(session, case, sender, settings, by=by, again=again)]
             else:
-                ready, waiting = prepare_drafts(session, settings, now=datetime.now(tz=UTC))
+                ready, waiting = prepare_drafts(
+                    session, settings, now=datetime.now(tz=UTC), sending=True
+                )
                 for case, why in waiting:
                     typer.echo(f"#{case.id} waits: {why}")
-                messages = draft_batch(session, ready, sender, settings, by=by)
-        except (SendRefusedError, ValueError) as exc:
+                messages = draft_batch(session, ready, sender, settings, by=by, refused=refused)
+        except (SendRefusedError, ValueError, RuntimeError) as exc:
             typer.echo(f"refused: {exc}")
             raise typer.Exit(code=1) from exc
         for message in messages:
@@ -799,6 +851,10 @@ def booking_send(
                 f"#{message.case_id} sent -> {message.to_addr}: {message.subject}  "
                 f"[{message.draft_ref}] {message.rfc_message_id}"
             )
+        for group, why in refused:
+            typer.echo(f"{' '.join(f'#{c.id}' for c in group)} not sent: {why}")
+    if refused:  # what was sent before the refusal stays recorded
+        raise typer.Exit(code=1)
 
 
 @booking_app.command("delivery-updated")

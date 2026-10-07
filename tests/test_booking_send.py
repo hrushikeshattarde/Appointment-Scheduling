@@ -119,7 +119,8 @@ def test_send_gate_refuses_draft_mode_untrusted_desks_and_the_daily_cap(settings
     with sessions() as session:
         first, second, third = sorted(list_cases(session), key=lambda c: c.id)
         second.contact_email = "someone-else@example.com"
-        with pytest.raises(SendRefusedError, match="not the trusted desk"):
+        # A desk the profile does not trust is refused before anything is written or sent.
+        with pytest.raises(ValueError, match=r"profile now has cci@udfinc.com"):
             draft_case(session, second, sender, send, now=NOW)
         draft_case(session, first, sender, send, now=NOW)
         session.commit()

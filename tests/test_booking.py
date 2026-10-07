@@ -681,7 +681,7 @@ def test_draft_batch_writes_one_email_per_desk(settings, sessions):
         assert len(messages) == 2 and len(mailer.drafts) == 1
         draft = mailer.drafts[0]
         assert draft.subject == "Pick Up Appointments: 104419082630 & 104421082660"
-        assert "PO# 104419082630 on 10/01 @ 0900\nPO# 104421082660 on 10/03 @ 1100" in draft.body
+        assert "PO# 104419082630 on 10/01 @ 0900\nPO# 104421082660 on 10/02 @ 1100" in draft.body
         assert "ALL IN ONE TRUCK" not in draft.body
         assert all(c.status == CaseStatus.UNSCHEDULED.value for c in cases)
         assert messages[0].draft_ref == messages[1].draft_ref

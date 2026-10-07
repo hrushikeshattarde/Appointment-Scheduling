@@ -13,7 +13,7 @@ from datetime import UTC, datetime, timedelta
 from email.utils import parseaddr
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import String, cast, func, select
 from sqlalchemy.orm import Session
 
 from facility_profiles.booking.mail import Delivery, Mailer, OutboundDraft, Sender, deliver
@@ -49,13 +49,17 @@ def check_send_gate(
     The recipient must be the desk the facility profile trusts (a human-set or verified email),
     or one of ``also`` (for an answer: the person at that desk's company who wrote; for a note to
     the customer: the desk in the customer's file). The mode must allow sending, and the day's
-    cap must not be reached. The wording is the caller's responsibility: only template text and
-    checked answers reach this point.
+    cap must not be reached: it counts emails, so a batched request for four POs is one. A Circle
+    address is never a recipient. The wording is the caller's responsibility: only template text
+    and checked answers reach this point.
     """
     if settings.booking_mode != "send":
         msg = "FP_BOOKING_MODE is not 'send'; the agent may only draft"
         raise SendRefusedError(msg)
     to = address(draft.to_addr)
+    if to.rpartition("@")[2] in {d.lower() for d in settings.internal_email_domains}:
+        msg = f"case {case.id}: {to} is a Circle address, not a facility's desk"
+        raise SendRefusedError(msg)
     allowed = {a for a in (address(trusted_desk), *(address(x) for x in also)) if a}
     if not to or to not in allowed:
         msg = (
@@ -64,8 +68,12 @@ def check_send_gate(
         )
         raise SendRefusedError(msg)
     since = datetime.now(tz=UTC) - timedelta(hours=24)
+    # One email may sit on several cases (a batch): count each email once, by its Message-ID.
+    one_email = func.coalesce(
+        BookingMessage.rfc_message_id, BookingMessage.message_id, cast(BookingMessage.id, String)
+    )
     sent_today = session.scalar(
-        select(func.count())
+        select(func.count(func.distinct(one_email)))
         .select_from(BookingMessage)
         .where(
             BookingMessage.direction == "out",

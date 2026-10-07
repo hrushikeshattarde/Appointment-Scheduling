@@ -89,6 +89,7 @@ from facility_profiles.booking.worklist import (
     resolve,
 )
 from facility_profiles.booking.writer import ReplySituation, ReplyWriter, check_reply
+from facility_profiles.business_days import is_business_day, why_closed
 from facility_profiles.clock import slot_text, stamp, to_eastern
 from facility_profiles.config import Settings
 from facility_profiles.customers import customer_of
@@ -159,8 +160,9 @@ def offer_is_feasible(
     case: BookingCase, pickup_local: datetime, settings: Settings, *, now: datetime
 ) -> tuple[bool, str]:
     """Can a pickup at ``pickup_local`` still make the customer's delivery slot?"""
-    if pickup_local.weekday() >= 5:
-        return False, "falls on a weekend"
+    closed = why_closed(pickup_local.date())
+    if closed is not None:  # "falls on a weekend", "falls on a holiday (Thanksgiving)"
+        return False, f"falls on {closed}" if "holiday" in closed else "falls on a weekend"
     if pickup_local <= now + timedelta(hours=settings.booking_min_notice_hours):
         return False, "too soon to dispatch a driver"
     delivery = as_utc(case.delivery_at_utc)
@@ -173,7 +175,7 @@ def offer_is_feasible(
 
 
 def alternative_days(case: BookingCase, settings: Settings, *, now: datetime) -> list[str]:
-    """Up to three weekdays that still make the delivery, latest first, as MM/DD."""
+    """Up to three business days that still make the delivery, latest first, as MM/DD."""
     tz = ZoneInfo(case.vendor_timezone or "America/New_York")
     delivery = as_utc(case.delivery_at_utc)
     if delivery is None:
@@ -183,7 +185,7 @@ def alternative_days(case: BookingCase, settings: Settings, *, now: datetime) ->
     days: list[str] = []
     day = latest
     while day >= earliest and len(days) < 3:
-        if day.weekday() < 5:
+        if is_business_day(day):
             days.append(day.strftime("%m/%d"))
         day -= timedelta(days=1)
     return days

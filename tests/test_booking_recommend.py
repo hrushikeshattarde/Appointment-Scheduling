@@ -121,8 +121,12 @@ def test_a_time_outside_the_facilitys_hours_moves_into_them(settings: Settings) 
     closed = recommend_time(
         a_case(), settings, now=NOW, profile=hours("08:00", "12:00", days=["sat"])
     )
-    assert closed.local == "2026-10-01 09:00" and closed.moved == []
-    assert closed.steps[-1].note == "the facility's hours list no opening on Thu"
+    # Closed on the day asked (its hours list only Saturdays): moved to the day it ships.
+    assert closed.local == "2026-10-03 09:00" and closed.moved[0].rule == "closed"
+    assert closed.moved[0].note == (
+        "Thu 10/01 09:00 ET is a Thursday, which the facility's hours list closed; asking for "
+        "Sat 10/03 09:00 ET"
+    )
 
 
 def test_a_time_too_late_for_the_delivery_moves_earlier_the_same_day(settings: Settings) -> None:
@@ -150,11 +154,11 @@ def test_a_time_too_late_for_the_delivery_moves_earlier_the_same_day(settings: S
 
 
 def test_a_pickup_after_its_delivery_cannot_make_it(settings: Settings) -> None:
-    late = a_case(tendered_pickup_utc=datetime(2026, 10, 3, 15, 0, tzinfo=UTC))  # Sat 11:00
+    late = a_case(tendered_pickup_utc=datetime(2026, 10, 2, 15, 0, tzinfo=UTC))  # Fri 11:00
     rec = recommend_time(late, settings, None, now=NOW)
-    assert not rec.feasible and rec.local == "2026-10-03 11:00"
+    assert not rec.feasible and rec.local == "2026-10-02 11:00"
     assert rec.verdict == (
-        "a pickup Sat 10/03 11:00 ET arrives Sun 10/04 00:10 ET, after the delivery slot Fri 10/02 09:30 ET"
+        "a pickup Fri 10/02 11:00 ET arrives Sat 10/03 00:10 ET, after the delivery slot Fri 10/02 09:30 ET"
     )
     assert rec.latest == "2026-10-01 20:00"
 
@@ -253,14 +257,14 @@ def test_a_load_that_cannot_make_its_delivery_goes_to_a_person(
     settings = settings.model_copy(update={"pilot_terminal_ids": [1089]})
     seed_vendor(sessions)
     load = lidl_load(2001, po="226321092660")
-    load["waypoints"][0]["appointmentTime"]["open"] = "2026-10-03T15:00:00Z"  # after the delivery
+    load["waypoints"][0]["appointmentTime"]["open"] = "2026-10-02T15:00:00Z"  # after the delivery
     scan(FakeTPro([load], {}), sessions, settings, days_ahead=7, now=NOW)  # type: ignore[arg-type]
     with session_scope(sessions) as session:
         case = list_cases(session)[0]
         assert open_kinds(case) == ["load_infeasible"]
         todo = case.open_exceptions[0]
         assert todo.description == (
-            "cannot make the delivery: a pickup Sat 10/03 11:00 ET arrives Sun 10/04 00:10 ET, after "
+            "cannot make the delivery: a pickup Fri 10/02 11:00 ET arrives Sat 10/03 00:10 ET, after "
             "the delivery slot Fri 10/02 09:30 ET; the latest pickup that makes it is Thu 10/01 20:00 ET"
         )
         assert todo.detail["latest"] == "2026-10-01 20:00"
@@ -334,14 +338,14 @@ def test_booking_recommend_explains_without_changing_anything(tmp_path, monkeypa
         with session_scope(session_factory(engine)) as session:
             session.add(
                 a_case(
-                    tendered_pickup_utc=datetime(2026, 10, 3, 15, 0, tzinfo=UTC),
-                    requested_local="2026-10-03 11:00",
+                    tendered_pickup_utc=datetime(2026, 10, 2, 15, 0, tzinfo=UTC),
+                    requested_local="2026-10-02 11:00",
                 )
             )
         engine.dispose()
         result = CliRunner().invoke(app, ["booking", "recommend", "1"])
         assert result.exit_code == 0, result.output
-        assert "#1 asks for Sat 10/03 11:00 ET now" in result.output
+        assert "#1 asks for Fri 10/02 11:00 ET now" in result.output
         assert "after the delivery slot Fri 10/02 09:30 ET" in result.output
         assert "latest pickup that makes the delivery: Thu 10/01 20:00 ET" in result.output
         assert "facility history: 0 confirmed time(s); usual none yet" in result.output

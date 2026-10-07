@@ -23,6 +23,7 @@ from facility_profiles.booking.models import BookingCase, CaseStatus, ExceptionT
 from facility_profiles.booking.service import has_request
 from facility_profiles.booking.timers import fmt_slot, pickup_passed
 from facility_profiles.booking.worklist import KINDS, UNANSWERED
+from facility_profiles.business_days import next_business_day
 from facility_profiles.clock import LABEL, local_to_eastern, stamp
 from facility_profiles.storage.repository import as_utc
 
@@ -110,10 +111,7 @@ def _rank(kind: str) -> int:
 
 
 def _next_business_day(day: date) -> date:
-    day += timedelta(days=1)
-    while day.weekday() >= 5:
-        day += timedelta(days=1)
-    return day
+    return next_business_day(day)
 
 
 def _age(raised: datetime | None, now: datetime) -> str:

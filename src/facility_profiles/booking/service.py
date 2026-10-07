@@ -58,6 +58,8 @@ from facility_profiles.booking.models import (
     SlotOffer,
 )
 from facility_profiles.booking.outbox import (
+    SendRefusedError,
+    address,
     check_send_gate,
     dispatch,
     is_sender,
@@ -123,6 +125,7 @@ from facility_profiles.booking.worklist import (
     resolve_all,
 )
 from facility_profiles.booking.writeback import appointment_payload, queue_write
+from facility_profiles.business_days import is_business_day
 from facility_profiles.clock import EASTERN_ZONE, local_to_eastern, slot_text, stamp
 from facility_profiles.config import Settings
 from facility_profiles.customers import (
@@ -316,7 +319,7 @@ def requested_local(
         return None
     days = max(1, math.ceil((miles or 0) / settings.booking_transit_miles_per_day))
     day = delivery_at_utc.astimezone(tz).date() - timedelta(days=days)
-    while day.weekday() >= 5:  # vendors ship Monday to Friday
+    while not is_business_day(day):  # vendors ship on business days
         day -= timedelta(days=1)
     return f"{day:%Y-%m-%d} {settings.booking_default_pickup_time}"
 
@@ -1112,8 +1115,12 @@ def draft_case(
     *,
     by: str = "agent",
     now: datetime | None = None,
+    again: bool = False,
 ) -> BookingMessage:
     """Compose the request and hand it to the outbox: a draft for a person, or a send.
+
+    A case that already has a request is refused unless ``again`` says to write it once more
+    (a person lost the draft); asking the vendor for a new time is ``reschedule``.
 
     With a :class:`Sender` the request goes out only when the send gate passes (send mode on,
     the recipient is the profile's trusted desk, the daily cap not reached) and the case moves
@@ -1123,7 +1130,7 @@ def draft_case(
     """
     profile = vendor_profile(Repository(session), case.facility_key) if case.facility_key else None
     now = now or datetime.now(tz=UTC)
-    _check_draftable(case, settings, now=now, profile=profile)
+    _check_draftable(case, settings, now=now, profile=profile, again=again)
     template = pick(
         session, TemplateKind.REQUEST, desk=case.contact_email, customer=_names(case, settings)
     )
@@ -1171,12 +1178,14 @@ def _check_draftable(
     *,
     now: datetime,
     profile: VendorProfile | None = None,
+    again: bool = False,
 ) -> None:
     """Refuse a request the agent must not write.
 
-    That is: a case that is not unscheduled, has open exceptions or no desk, whose slot has
-    passed or is inside the notice window or the desk's cut-off, that lacks a number the desk
-    needs, or that the desk would not book yet.
+    That is: a case that is not unscheduled, has open exceptions or no desk; whose desk is a
+    Circle address, or is no longer the one the profile trusts; with no pickup date; already
+    asked for (unless ``again``); whose slot has passed or is inside the notice window or the
+    desk's cut-off; that lacks a number the desk needs; or that the desk would not book yet.
     """
     if case.status != CaseStatus.UNSCHEDULED.value:
         msg = f"case {case.id} is {case.status}; only unscheduled cases can be drafted"
@@ -1187,6 +1196,32 @@ def _check_draftable(
         raise ValueError(msg)
     if not case.contact_email:
         msg = f"case {case.id} has no booking email"
+        raise ValueError(msg)
+    desk = address(case.contact_email)
+    internal = {d.lower() for d in settings.internal_email_domains}
+    if desk.rpartition("@")[2] in internal:
+        msg = f"case {case.id}: {desk} is a Circle address, not a facility's desk"
+        raise ValueError(msg)
+    if profile is not None and (profile.contact_email or profile.booking_method):
+        trusted = address(profile.contact_email) if profile.can_email else ""
+        if trusted != desk:
+            on_file = trusted or "no desk it can email"
+            msg = (
+                f"case {case.id}: the facility's profile now has {on_file}, not {desk}; "
+                "check the desk on the profile before asking"
+            )
+            raise ValueError(msg)
+    if not case.requested_local:
+        msg = (
+            f"case {case.id} has no pickup date: the load has no tendered pickup and no "
+            "delivery slot to work back from"
+        )
+        raise ValueError(msg)
+    if not again and has_request(case):
+        msg = (
+            f"case {case.id} already has a request; ask for a new time with booking "
+            "reschedule, or write it once more with --again"
+        )
         raise ValueError(msg)
     stale = slot_is_stale(
         case.requested_local, case.vendor_timezone, settings, now=now, profile=profile
@@ -1222,18 +1257,46 @@ def ready_to_draft(session: Session) -> list[BookingCase]:
     ]
 
 
-def prepare_drafts(
-    session: Session, settings: Settings, *, now: datetime
-) -> tuple[list[BookingCase], list[tuple[BookingCase, str]]]:
-    """The cases to draft now, and those that wait, after checking each desk's rules.
+def rule_stops(case: BookingCase, settings: Settings, *, sending: bool = False) -> str | None:
+    """Why the customer's rule stops a person's ``booking draft`` or ``booking send``, or None.
 
-    A case the rules stop (past the cut-off, a number missing) gets its exception and drops out;
-    a case whose desk does not book that far ahead yet waits, with the day it can be asked.
+    The same rule the agent follows on its own: a pickup the rule skips or holds for a person,
+    one that waits for the delivery's slot (Lidl asks once the DCT appointment is known), and,
+    for a send, a rule that only drafts.
+    """
+    rule = customer_of(case, settings).rule_for(case)
+    name = f"the customer's rule '{rule.name}'"
+    if rule.do == "skip":
+        return f"{name} skips this pickup: it is not the agent's to book"
+    if rule.do == "hold":
+        return f"{name} holds this pickup for a person" + (f" ({rule.why})" if rule.why else "")
+    if rule.wait_for == "delivery_slot" and not (case.delivery_ref and case.delivery_at_utc):
+        return f"{name} waits for the delivery's appointment (its number and time) before asking"
+    if sending and rule.do != "send":
+        return (
+            f'{name} only drafts (do = "{rule.do}"): send the draft from your mailbox, or set '
+            'do = "send"'
+        )
+    return None
+
+
+def prepare_drafts(
+    session: Session, settings: Settings, *, now: datetime, sending: bool = False
+) -> tuple[list[BookingCase], list[tuple[BookingCase, str]]]:
+    """The cases to draft (or send) now, and those that wait.
+
+    A case the desk's rules stop (past the cut-off, a number missing) gets its exception and
+    drops out; a case whose desk does not book that far ahead yet waits, with the day it can be
+    asked; so does one its customer's rule holds back (:func:`rule_stops`).
     """
     repo = Repository(session)
     ready: list[BookingCase] = []
     waiting: list[tuple[BookingCase, str]] = []
     for case in ready_to_draft(session):
+        stopped = rule_stops(case, settings, sending=sending)
+        if stopped:
+            waiting.append((case, stopped))
+            continue
         profile = vendor_profile(repo, case.facility_key) if case.facility_key else None
         wait = check_desk_rules(session, case, settings, now=now, profile=profile)
         if case.open_exceptions:
@@ -2501,11 +2564,16 @@ def draft_batch(
     *,
     by: str = "agent",
     now: datetime | None = None,
+    refused: list[tuple[list[BookingCase], str]] | None = None,
 ) -> list[BookingMessage]:
     """Draft (or send) new cases, one email per vendor desk, the way the pod batches requests.
 
     A desk that ships for two customers gets one email per customer: each is copied to and
     signed for its own customer's group.
+
+    Given ``refused``, each desk's email stands on its own: one the checks or the send gate
+    refuse (or that fails to go) is listed there with why, the rest go on, and what went before
+    is kept. Without it, the first refusal stops the batch.
     """
     now = now or datetime.now(tz=UTC)
     known = customers(settings)
@@ -2514,70 +2582,92 @@ def draft_batch(
         key = (known.for_case(case).key, (case.contact_email or "").lower())
         groups.setdefault(key, []).append(case)
     messages: list[BookingMessage] = []
-    repo = Repository(session)
-    for (_, desk), group in groups.items():
-        if len(group) == 1 or not desk:
-            for case in group:
-                messages.append(draft_case(session, case, mailer, settings, by=by, now=now))
+    for group in groups.values():
+        if refused is None:
+            messages += _draft_group(session, group, mailer, settings, by=by, now=now)
             continue
-        profile = vendor_profile(repo, group[0].facility_key) if group[0].facility_key else None
+        try:
+            with session.begin_nested():
+                messages += _draft_group(session, group, mailer, settings, by=by, now=now)
+        except (SendRefusedError, ValueError, RuntimeError, OSError) as exc:
+            refused.append((group, str(exc)))
+    return messages
+
+
+def _draft_group(
+    session: Session,
+    group: list[BookingCase],
+    mailer: Mailer | Sender,
+    settings: Settings,
+    *,
+    by: str,
+    now: datetime,
+) -> list[BookingMessage]:
+    """One desk's email for one customer: a lone case's request, or the batched one."""
+    known = customers(settings)
+    desk = (group[0].contact_email or "").lower()
+    if len(group) == 1 or not desk:
+        return [draft_case(session, case, mailer, settings, by=by, now=now) for case in group]
+    messages: list[BookingMessage] = []
+    repo = Repository(session)
+    profile = vendor_profile(repo, group[0].facility_key) if group[0].facility_key else None
+    for case in group:
+        _check_draftable(case, settings, now=now, profile=profile)
+    group.sort(key=lambda c: c.requested_local or "")
+    template = pick(
+        session, TemplateKind.BATCH_REQUEST, desk=desk, customer=_names(group[0], settings)
+    )
+    rendered_subject, body = render(template, request_values(group, settings, profile))
+    subject = rendered_subject or "Pick Up Appointments"
+    customer = known.for_case(group[0])
+    draft = OutboundDraft(
+        to_addr=desk,
+        cc_addr=customer.cc_header,
+        subject=subject,
+        body=body,
+        from_addr=customer.sender,
+        reply_to=customer.group,
+    )
+    if is_sender(mailer):
+        trusted = profile.contact_email if profile and profile.can_email else None
         for case in group:
-            _check_draftable(case, settings, now=now, profile=profile)
-        group.sort(key=lambda c: c.requested_local or "")
-        template = pick(
-            session, TemplateKind.BATCH_REQUEST, desk=desk, customer=_names(group[0], settings)
-        )
-        rendered_subject, body = render(template, request_values(group, settings, profile))
-        subject = rendered_subject or "Pick Up Appointments"
-        customer = known.for_case(group[0])
-        draft = OutboundDraft(
-            to_addr=desk,
-            cc_addr=customer.cc_header,
+            check_send_gate(session, case, draft, settings, trusted_desk=trusted)
+    offers = _offers(session, group, settings, profile, now=now)
+    if offers:
+        chosen, links, by_url = _with_links(template, group, offers, settings)
+        _, body = render(chosen, request_values(group, settings, profile, links=links))
+        draft = replace(draft, body=body, html=html_body(body, by_url))
+    result = deliver(mailer, draft)
+    for case in group:
+        message = BookingMessage(
+            case_id=case.id,
+            direction="out",
+            kind="request",
+            to_addr=draft.to_addr,
+            cc_addr=draft.cc_addr,
             subject=subject,
-            body=body,
-            from_addr=customer.sender,
-            reply_to=customer.group,
+            body=draft.body,
         )
-        if is_sender(mailer):
-            trusted = profile.contact_email if profile and profile.can_email else None
-            for case in group:
-                check_send_gate(session, case, draft, settings, trusted_desk=trusted)
-        offers = _offers(session, group, settings, profile, now=now)
-        if offers:
-            chosen, links, by_url = _with_links(template, group, offers, settings)
-            _, body = render(chosen, request_values(group, settings, profile, links=links))
-            draft = replace(draft, body=body, html=html_body(body, by_url))
-        result = deliver(mailer, draft)
-        for case in group:
-            message = BookingMessage(
-                case_id=case.id,
-                direction="out",
-                kind="request",
-                to_addr=draft.to_addr,
-                cc_addr=draft.cc_addr,
-                subject=subject,
-                body=draft.body,
-            )
-            case.messages.append(message)
-            session.flush()
-            if case.id in offers:
-                offers[case.id].message_id = message.id
-            record_delivery(session, case, message, draft, result, actor=by)
-            case.status = CaseStatus.PENDING.value if result.sent else CaseStatus.UNSCHEDULED.value
-            case.reason = None
-            session.flush()
-            _event(
-                session,
-                case,
-                "drafted",
-                actor=by,
-                draft_ref=result.ref,
-                to=desk,
-                subject=subject,
-                batched_with=[c.id for c in group if c.id != case.id],
-                template=template.source,
-            )
-            messages.append(message)
+        case.messages.append(message)
+        session.flush()
+        if case.id in offers:
+            offers[case.id].message_id = message.id
+        record_delivery(session, case, message, draft, result, actor=by)
+        case.status = CaseStatus.PENDING.value if result.sent else CaseStatus.UNSCHEDULED.value
+        case.reason = None
+        session.flush()
+        _event(
+            session,
+            case,
+            "drafted",
+            actor=by,
+            draft_ref=result.ref,
+            to=desk,
+            subject=subject,
+            batched_with=[c.id for c in group if c.id != case.id],
+            template=template.source,
+        )
+        messages.append(message)
     return messages
 
 

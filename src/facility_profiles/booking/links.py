@@ -45,6 +45,7 @@ from facility_profiles.booking.respond import local_dt, offer_is_feasible
 from facility_profiles.booking.rules import VendorProfile, slot_is_stale, too_early
 from facility_profiles.booking.schema import ReplyClassification, ReplyStatus
 from facility_profiles.booking.timers import after_weekday_hours, fmt_slot, slot_at
+from facility_profiles.business_days import is_business_day
 from facility_profiles.clock import EASTERN, eastern_to_local
 from facility_profiles.config import Settings
 from facility_profiles.storage.repository import as_utc
@@ -95,7 +96,7 @@ def offered_slots(
         cursor = date.fromisoformat(day)
         while len(candidates) < DATE_ONLY_DAYS:
             cursor += timedelta(days=1)
-            if cursor.weekday() < 5:
+            if is_business_day(cursor):
                 candidates.append(cursor.isoformat())
     else:
         start = datetime.strptime(requested, "%Y-%m-%d %H:%M")

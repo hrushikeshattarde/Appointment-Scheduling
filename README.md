@@ -725,6 +725,29 @@ board shows "Automation" in each case. On a copy of the 2026-10-02 Lidl store a 
 five drafted cases' jobs (already requested) and holds the PYE store pickup (no desk). It writes
 nothing.
 
+### Business days, closed days and the checks before a request
+
+- **Business days** are Monday to Friday, less the six freight holidays (New Year's Day,
+  Memorial Day, Independence Day, Labor Day, Thanksgiving, Christmas Day; one on a Saturday is
+  observed the Friday before, one on a Sunday the Monday after). They count everywhere a day is
+  counted: the pickup worked back from a delivery, a desk's cut-off on "the business day
+  before", the no-reply clock, link expiry, the days offered to a vendor, `lead_days`.
+- **A pickup on a day the facility is closed** (a tendered Saturday or Sunday, a holiday, a
+  weekday its hours list no opening) is asked for on the open day before, when a driver can
+  still make it, else on the next open day. The recommendation says why ("Sat 10/03 09:00 ET is
+  a Saturday; asking for Fri 10/02 09:00 ET"). A facility whose hours say it ships Saturdays
+  keeps the Saturday.
+- **A request is refused** for a pickup that already has one (`--again` writes it once more;
+  a new time is `booking reschedule`), a desk on a Circle address, a desk the profile no longer
+  trusts, and a pickup with no date (no tender and no delivery slot). `profile set` refuses a
+  Circle address as a facility's desk, and the send gate never sends to one.
+- **`booking draft` and `booking send` follow the customer's rule** as the agent does: a pickup
+  the rule skips, holds, or keeps waiting for the delivery's appointment waits, and `booking
+  send` holds back what the rule only drafts. `--anyway` acts on a named case regardless.
+- **Each desk's email stands on its own:** one the send gate refuses is reported and the rest
+  go on; what was already sent stays recorded. The daily cap counts emails, so a batched
+  request for four POs is one.
+
 ### Desk rules
 
 A vendor profile also carries the rules its booking desk stated, filed by a person (`profile

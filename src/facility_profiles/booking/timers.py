@@ -53,6 +53,7 @@ from facility_profiles.booking.worklist import (
     open_exceptions,
     resolve,
 )
+from facility_profiles.business_days import is_business_day
 from facility_profiles.clock import slot_text, stamp
 from facility_profiles.config import Settings
 from facility_profiles.logging import get_logger
@@ -144,14 +145,14 @@ def pickup_passed(case: BookingCase, now: datetime) -> bool:
 
 
 def weekday_hours(start: datetime, end: datetime, tz: ZoneInfo) -> float:
-    """Hours between two instants that fall on a Monday to Friday in ``tz``."""
+    """Hours between two instants that fall on a business day in ``tz`` (no weekends, holidays)."""
     total = 0.0
     cursor, stop = start.astimezone(UTC), end.astimezone(UTC)
     while cursor < stop:
         local = cursor.astimezone(tz)
         midnight = datetime.combine(local.date() + timedelta(days=1), time(0), tzinfo=tz)
         chunk_end = min(midnight.astimezone(UTC), stop)
-        if local.weekday() < 5:
+        if is_business_day(local.date()):
             total += (chunk_end - cursor).total_seconds() / 3600
         cursor = chunk_end
     return total
@@ -168,7 +169,7 @@ def after_weekday_hours(start: datetime, hours: float, tz: ZoneInfo) -> datetime
         local = cursor.astimezone(tz)
         midnight = datetime.combine(local.date() + timedelta(days=1), time(0), tzinfo=tz)
         next_day = midnight.astimezone(UTC)
-        if local.weekday() < 5:
+        if is_business_day(local.date()):
             if next_day - cursor >= left:
                 return cursor + left
             left -= next_day - cursor

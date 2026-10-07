@@ -63,6 +63,7 @@ from facility_profiles.booking.timers import fmt_slot, slot_at, sweep
 from facility_profiles.booking.worklist import flag, open_kinds
 from facility_profiles.booking.writeback import LoadWriter, write_appointments
 from facility_profiles.booking.writer import ReplyWriter
+from facility_profiles.business_days import is_business_day
 from facility_profiles.clock import stamp
 from facility_profiles.config import Settings
 from facility_profiles.customers import customers
@@ -114,22 +115,22 @@ class RunReport:
 
 
 def business_days_before(day: date, count: int) -> date:
-    """``count`` weekdays before ``day``."""
+    """``count`` business days before ``day`` (weekends and freight holidays do not count)."""
     while count > 0:
         day -= timedelta(days=1)
-        if day.weekday() < 5:
+        if is_business_day(day):
             count -= 1
     return day
 
 
 def next_batch(clock: str, tz: ZoneInfo, after: datetime) -> datetime:
-    """The first ``clock`` on a weekday, in ``tz``, at or after ``after``."""
+    """The first ``clock`` on a business day, in ``tz``, at or after ``after``."""
     at = time.fromisoformat(clock)
     local = after.astimezone(tz)
     day = local.date()
     while True:
         moment = datetime.combine(day, at, tzinfo=tz)
-        if moment >= local and day.weekday() < 5:
+        if moment >= local and is_business_day(day):
             return moment
         day += timedelta(days=1)
 

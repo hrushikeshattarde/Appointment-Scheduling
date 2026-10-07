@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 
 from facility_profiles.booking.models import BookingCase, BookingEvent, CaseStatus, ExceptionType
 from facility_profiles.booking.worklist import flag, resolve
+from facility_profiles.business_days import is_business_day
 from facility_profiles.clock import slot_text, stamp
 from facility_profiles.config import Settings
 from facility_profiles.domain.schema import ReferenceType, Role
@@ -178,9 +179,9 @@ def _pickup(requested: str | None, timezone: str | None) -> datetime | None:
 
 
 def business_day_before(day: datetime) -> datetime:
-    """The weekday before ``day`` (a Monday's is the Friday)."""
+    """The business day before ``day`` (a Monday's is the Friday; holidays are skipped too)."""
     before = day - timedelta(days=1)
-    while before.weekday() >= 5:
+    while not is_business_day(before.date()):
         before -= timedelta(days=1)
     return before
 
