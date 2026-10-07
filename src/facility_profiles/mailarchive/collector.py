@@ -32,7 +32,12 @@ from datetime import UTC, date, datetime, timedelta
 from email import policy
 from typing import Any
 
-from facility_profiles.booking.mail import gmail_body_text, split_quoted
+from facility_profiles.booking.mail import (
+    auto_submitted_of,
+    gmail_body_text,
+    split_quoted,
+    tidy_text,
+)
 from facility_profiles.mailarchive import filters
 from facility_profiles.mailarchive.gmail import GmailClient, headers_of, internal_date_iso
 from facility_profiles.mailarchive.store import (
@@ -375,6 +380,7 @@ def collect_message(
         "to": h.get("to", ""),
         "cc": h.get("cc", ""),
         "date": h.get("date"),
+        "auto_submitted": auto_submitted_of(h),
         "internal_date": internal,
         "labels": msg.get("labelIds") or [],
         "own_text": own,
@@ -408,7 +414,10 @@ def parse_raw(raw: bytes) -> Parsed:
         maintype = part.get_content_maintype()
         if not filename and maintype == "text":
             text = _part_text(part)
-            (plain if part.get_content_subtype() == "plain" else html).append(text)
+            # A bounce's copy of the returned email's headers is read as text: its Message-ID
+            # ties the bounce to the email sent back.
+            as_plain = part.get_content_subtype() in ("plain", "rfc822-headers")
+            (plain if as_plain else html).append(text)
             continue
         payload = part.get_payload(decode=True)
         if not isinstance(payload, bytes) or not payload:
@@ -424,7 +433,7 @@ def parse_raw(raw: bytes) -> Parsed:
                 or (disposition is None and bool(part["Content-ID"])),
             }
         )
-    text = "\n".join(plain) if plain else _html_to_text("\n".join(html))
+    text = tidy_text("\n".join(plain)) if plain else _html_to_text("\n".join(html))
     return Parsed(headers=headers, text=text, attachments=attachments)
 
 
@@ -442,5 +451,5 @@ def _part_text(part: email.message.Message) -> str:
 def _html_to_text(html: str) -> str:
     text = re.sub(r"<(?:script|style).*?</(?:script|style)>", " ", html, flags=re.S | re.I)
     text = re.sub(r"<br\s*/?>|</p>|</div>|</tr>", "\n", text, flags=re.I)
-    text = re.sub(r"<[^>]+>", " ", text)
+    text = tidy_text(re.sub(r"<[^>]+>", " ", text))
     return re.sub(r"[ \t]+", " ", text).strip()

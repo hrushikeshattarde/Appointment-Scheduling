@@ -20,7 +20,7 @@ from facility_profiles.booking.attachments import (
     triage,
     with_attachments,
 )
-from facility_profiles.booking.mail import InboundMessage
+from facility_profiles.booking.mail import InboundMessage, tidy_text
 from facility_profiles.mailarchive.store import MAIL_PREFIX, Store, attachment_key
 
 _CACHE_SIZE = 512
@@ -48,7 +48,9 @@ def to_inbound(
         sent_at = datetime.now(tz=UTC)
     if sent_at.tzinfo is None:
         sent_at = sent_at.replace(tzinfo=UTC)
-    body, unread = with_attachments(str(envelope.get("own_text") or ""), readings or [])
+    # Envelopes written before the collector decoded HTML codes are tidied here too.
+    own = tidy_text(str(envelope.get("own_text") or ""))
+    body, unread = with_attachments(own, readings or [])
     return InboundMessage(
         message_id=str(envelope.get("key") or key),
         thread_id=str(envelope.get("thread_id") or "") or None,
@@ -59,10 +61,11 @@ def to_inbound(
         subject=str(envelope.get("subject") or ""),
         body=body,
         in_reply_to=envelope.get("in_reply_to") or None,
-        quoted=str(envelope.get("quoted") or ""),
+        quoted=tidy_text(str(envelope.get("quoted") or "")),
         rfc_message_id=envelope.get("message_id") or None,
         references=envelope.get("references") or None,
         unread_files=unread,
+        auto_submitted=envelope.get("auto_submitted") or None,
     )
 
 

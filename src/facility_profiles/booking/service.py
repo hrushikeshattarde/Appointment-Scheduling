@@ -22,6 +22,12 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from facility_profiles.booking.automated import (
+    BOUNCE,
+    automated_kind,
+    bounce_details,
+    bounced_ids,
+)
 from facility_profiles.booking.classify import (
     ClassificationIssue,
     ReplyClassifier,
@@ -233,6 +239,8 @@ class IngestStats:
     unmatched_kept: int = 0  # booking mail no pickup matched, kept for a person (booking/unmatched)
     new_mail: int = 0  # messages recorded for the first time (on a pickup, or kept unmatched)
     booked_changed: int = 0  # replies that moved, dropped or put off a pickup already booked
+    automated: int = 0  # bounces, out-of-office replies, delays: kept, never read as an answer
+    bounced: int = 0  # emails a mail server sent back: "Email did not arrive" raised
 
 
 # ------------------------------------------------------------------ profile and load helpers
@@ -2030,6 +2038,10 @@ def ingest(  # noqa: PLR0912 - one branch per reply outcome
         if _already_recorded(session, message):
             stats.duplicates += 1
             continue
+        automated = automated_kind(message)
+        if automated is not None:  # no person wrote it: kept, never read as the vendor's answer
+            _ingest_automated(session, message, automated, known=known, stats=stats)
+            continue
         cases, how = match_with_how(session, message)
         if not cases:
             stats.unmatched += 1
@@ -2082,6 +2094,81 @@ def ingest(  # noqa: PLR0912 - one branch per reply outcome
         )
         session.flush()
     return stats
+
+
+def _ingest_automated(
+    session: Session,
+    message: InboundMessage,
+    kind: str,
+    *,
+    known: Customers,
+    stats: IngestStats,
+) -> None:
+    """Keep a bounce, an out-of-office or a delay notice on its pickups (``booking/automated``).
+
+    None is classified or answered, and none ends the vendor's silence. A bounce raises "Email
+    did not arrive" on each live pickup the returned email was about, with the address and the
+    server's reason; one tied to no pickup is kept for a person like other booking mail.
+    """
+    stats.automated += 1
+    if kind == BOUNCE:
+        cases = _bounced_cases(session, message)
+    else:
+        cases = match_with_how(session, message)[0]
+    if not cases:
+        stats.unmatched += 1
+        if kind == BOUNCE and keep_unmatched(session, message, known) == "new":
+            stats.unmatched_kept += 1
+            stats.new_mail += 1
+        return
+    stats.new_mail += 1
+    settle_unmatched(session, message, cases[0])
+    for case in cases:
+        detail: dict[str, Any] = {"automated": kind}
+        if kind == BOUNCE:
+            recipient, reason = bounce_details(message, [case.contact_email])
+            detail |= {"recipient": recipient, "reason": reason}
+        record = _inbound_record(case, message, kind=kind, classification=detail)
+        case.messages.append(record)
+        session.flush()
+        live = case.status != CaseStatus.CANCELED.value and not picked_up(
+            (case.tpro_seen or {}).get("load_status")
+        )
+        if kind == BOUNCE and live:
+            stats.bounced += 1
+            flag(
+                session,
+                case,
+                ExceptionType.EMAIL_BOUNCED,
+                f"the email to {detail['recipient'] or case.contact_email or 'the desk'} did not "
+                f"arrive: {detail['reason']}"[:255],
+                message_id=record.id,
+                recipient=detail["recipient"],
+                reason=detail["reason"],
+            )
+        action = "email_bounced" if kind == BOUNCE else kind
+        _event(session, case, action, subject=message.subject, said=_first_words(message.body))
+
+
+def _bounced_cases(session: Session, message: InboundMessage) -> list[BookingCase]:
+    """The pickups whose email a bounce sent back.
+
+    By the returned email's Message-ID (what the bounce answers, or the headers it quotes),
+    else its thread or a PO it names; never by who wrote, which is the mail server.
+    """
+    ids = bounced_ids(message)
+    if ids:
+        sent = session.scalars(
+            select(BookingMessage).where(
+                BookingMessage.direction == "out",
+                func.lower(BookingMessage.rfc_message_id).in_(ids),
+            )
+        )
+        cases = _distinct(m.case for m in sent)
+        if cases:
+            return cases
+    cases, how = match_with_how(session, message)
+    return cases if how not in WEAK_MATCHES else []
 
 
 def _ingest_reply(  # noqa: PLR0912 - one branch per reply outcome
@@ -2295,7 +2382,11 @@ def _inbound_record(
 
 
 def _already_recorded(session: Session, message: InboundMessage) -> bool:
-    """Seen before, by the source's id or by the RFC Message-ID (two sources, one email)."""
+    """Seen before, by the source's id or by the RFC Message-ID (two sources, one email).
+
+    An email with no Message-ID, read from a second mailbox, is known by its sender, subject,
+    text and time instead.
+    """
     if session.scalar(
         select(BookingMessage.id).where(BookingMessage.message_id == message.message_id)
     ):
@@ -2310,7 +2401,16 @@ def _already_recorded(session: Session, message: InboundMessage) -> bool:
             )
             is not None
         )
-    return False
+    same_subject = session.scalars(
+        select(BookingMessage).where(
+            BookingMessage.direction == "in",
+            BookingMessage.rfc_message_id.is_(None),
+            BookingMessage.subject == message.subject,
+        )
+    )
+    return any(
+        message.looks_like(m.from_addr, m.subject, m.body, as_utc(m.sent_at)) for m in same_subject
+    )
 
 
 def _answered_unconfirmed(session: Session, message: InboundMessage) -> None:

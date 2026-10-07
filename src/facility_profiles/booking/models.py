@@ -71,6 +71,8 @@ class ExceptionType(StrEnum):
     SEND_UNCONFIRMED = "send_unconfirmed"
     # The facility's email carries a file the agent could not read (a scanned PDF, a picture).
     ATTACHMENT_UNREAD = "attachment_unread"
+    # The mail server sent our email back (booking/automated.py): the facility never got it.
+    EMAIL_BOUNCED = "email_bounced"
 
 
 class BookingCase(Base):

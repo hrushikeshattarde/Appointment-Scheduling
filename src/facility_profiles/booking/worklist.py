@@ -144,6 +144,12 @@ KINDS: dict[str, tuple[str, str]] = {
         "The facility's email carries a file the agent could not read (a scan, a picture, an "
         "old Word file). Open it and act on what it says.",
     ),
+    "email_bounced": (
+        "Email did not arrive",
+        "The facility's mail server sent our email back, so they never got it. Check the desk's "
+        "address on the facility's profile (or call the desk), then send the request again, or "
+        "book by phone and mark it booked.",
+    ),
 }
 # The vendor's silence: raised by the no-reply timers, cleared by any answer from the vendor.
 UNANSWERED: frozenset[ExceptionType] = frozenset(
@@ -166,6 +172,7 @@ SLOT_REPLY_SUPERSEDES: frozenset[ExceptionType] = UNANSWERED | {
     ExceptionType.CHECK_BACK_TOO_LATE,
     ExceptionType.SEND_UNCONFIRMED,
     ExceptionType.ATTACHMENT_UNREAD,
+    ExceptionType.EMAIL_BOUNCED,
 }
 # A change to a booked pickup is not superseded by later replies: once a booked pickup is
 # disturbed, a person settles it (approving or marking it booked resolves it).
@@ -175,6 +182,7 @@ QUESTION_SUPERSEDES: frozenset[ExceptionType] = UNANSWERED | {
     ExceptionType.FACILITY_QUESTION,
     ExceptionType.HANDOFF,
     ExceptionType.SEND_UNCONFIRMED,
+    ExceptionType.EMAIL_BOUNCED,  # they wrote, so mail reaches them
 }
 # Booking methods a profile can name that the agent cannot use: it only books by email.
 MANUAL_METHODS = {

@@ -57,6 +57,9 @@ const MESSAGE_KINDS = {
   reply: "Vendor's reply",
   customer_desk: "From the customer",
   by_person: "Sent by a person",
+  bounce: "Email sent back",
+  auto_reply: "Automatic reply",
+  delivery_delayed: "Delivery delayed",
 };
 const READING = {
   confirmed: "Vendor confirmed",
@@ -607,6 +610,7 @@ function mailBox(items, pickups) {
 
 function mailItem(m, pickups) {
   const first = (m.body || "").split("\n").map((line) => line.trim()).find(Boolean) || "";
+  const unreadable = (m.reason || "").startsWith("unreadable: ") ? m.reason.slice(12) : "";
   const choose = h(
     "select",
     { "aria-label": "The pickup this email is about" },
@@ -647,6 +651,7 @@ function mailItem(m, pickups) {
     { class: "mail-item" },
     h("div", { class: "title" }, m.subject || "(no subject)"),
     h("div", { class: "meta" }, `${m.from || "Unknown sender"} · ${fmtInstant(m.sent_at)}`),
+    unreadable ? h("div", { class: "meta" }, `The agent could not read this email: ${unreadable}`) : null,
     first ? h("div", { class: "snippet" }, first.slice(0, 220)) : null,
     h(
       "div",

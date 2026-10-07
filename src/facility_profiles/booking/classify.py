@@ -13,6 +13,7 @@ import httpx
 from pydantic import ValidationError
 
 from facility_profiles import __version__
+from facility_profiles.booking.mail import tidy_text
 from facility_profiles.booking.schema import ReplyClassification, ReplyStatus
 from facility_profiles.clock import (
     EASTERN_ZONE,
@@ -34,7 +35,7 @@ from facility_profiles.extraction.openrouter import (
     strict_json_schema,
 )
 
-PROMPT_VERSION = "reply-v6"
+PROMPT_VERSION = "reply-v7"
 
 SYSTEM_PROMPT = """You read one email reply from a shipping facility to a freight broker's pickup \
 appointment request and return a JSON object describing it.
@@ -60,7 +61,8 @@ from the date the reply was written at the facility, given to you. Use null when
 - time_zone is the time zone the reply names for its times, as written ("ET", "EST", "CT", \
 "Central", "PT" ...), or "local" when it says the time is the facility's own; null when it \
 names none.
-- pickup_number is the vendor's pickup, confirmation or appointment number, if given.
+- pickup_number is the vendor's pickup, confirmation or appointment number, if given. A phone, \
+fax or extension number, or anything in the sender's signature, is never a pickup number.
 - quotes are short verbatim snippets copied from the reply's own words (the text above any \
 quoted earlier messages) that contain each date, time and number you report. Never paraphrase \
 inside quotes. Only for a counter_offer where the vendor edited dates or times inside the \
@@ -93,6 +95,44 @@ _CID_RE = re.compile(r"\[cid:[^\]]*\]", re.I)
 _RELATIVE_DAY_RE = re.compile(
     r"\b(?:today|tonight|tomorrow|mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|"
     r"fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b",
+    re.I,
+)
+# Dates written out: 10/01, 10/01/26, 10-01-2026, 2026-10-01, Oct 1st, 1 October.
+_MONTH_NAMES = r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?"
+_SLASH_DATE_RE = re.compile(r"(?<![\d/])(\d{1,2})/(\d{1,2})(?:/(?:\d{4}|\d{2}))?(?![\d/])")
+_DASH_DATE_RE = re.compile(r"(?<![\d-])(\d{1,2})-(\d{1,2})-(?:\d{4}|\d{2})(?![\d-])")
+_ISO_DATE_RE = re.compile(r"(?<!\d)\d{4}-(\d{2})-(\d{2})(?!\d)")
+_NAMED_DATE_RE = re.compile(rf"\b{_MONTH_NAMES}\s+(\d{{1,2}})(?:st|nd|rd|th)?\b", re.I)
+_DAY_MONTH_RE = re.compile(rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+(?:of\s+)?{_MONTH_NAMES}", re.I)
+_MONTHS = {
+    m: i
+    for i, m in enumerate(
+        ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), 1
+    )
+}
+# A sign-off line: where a signature starts ("Thanks,", "Regards", "-- ", "Sent from my iPhone").
+_SIGN_OFF_RE = re.compile(
+    r"^\s*(?:--|thanks?(?: you)?(?: so much)?|thx|many thanks|regards|best regards|kind regards|"
+    r"warm regards|best|sincerely|respectfully|cheers|have a (?:great|good|nice) "
+    r"(?:day|one|weekend)|sent from my \w+.*)\s*[,.!]*\s*$",
+    re.I,
+)
+SIGNATURE_LINES = 10
+# Words that make a line booking content rather than a signature.
+_BOOKING_WORDS_RE = re.compile(
+    r"\b(?:pu|pick\s*-?\s*up|appointment|appt|confirm\w*|po|load|dock|door)\b|\d{1,2}/\d{1,2}",
+    re.I,
+)
+# Phone numbers: formatted (260-208-4500, (260) 208-4500, +1 260.208.4500 x12), or after a
+# label (Phone:, Cell, Fax, Office, Direct; P:, C:, F:).
+_PHONE_RE = re.compile(
+    r"(?<!\d)(?:\+?1[\s.-]?)?(?:\(\d{3}\)\s*|\d{3}[\s.-])\d{3}[\s.-]\d{4}(?!\d)"
+    r"(?:\s*(?:x|ext\.?|extension)\s*\d{1,6})?",
+    re.I,
+)
+_LABELLED_PHONE_RE = re.compile(
+    r"(?:\b(?:phone|ph|tel|telephone|cell|mobile|mob|fax|office|direct|main)\b\s*[:.#]?|"
+    r"\b[PCFOMT]\s*:)\s*(\+?[\d(][\d\s().-]{5,}\d)",
     re.I,
 )
 
@@ -207,8 +247,45 @@ def render_user_message(context: ReplyContext) -> str:
 
 
 def clean_mail_text(text: str | None) -> str:
-    """Drop the link cruft mail clients wrap around numbers and addresses, and inline image tags."""
-    return _CID_RE.sub("", _LINK_CRUFT_RE.sub("", text or ""))
+    """Drop the link cruft mail clients wrap around numbers and addresses, and inline image tags.
+
+    HTML codes and odd spaces are made plain too (:func:`tidy_text`), on both sides of a check.
+    """
+    return tidy_text(_CID_RE.sub("", _LINK_CRUFT_RE.sub("", text or "")))
+
+
+def without_signature(text: str) -> str:
+    """The reply's own words without the sign-off and what follows it (a name, a title, phones).
+
+    Only a sign-off followed by a short block that says nothing about the booking counts:
+    "Thanks!" over a long reply, or "Thanks" over "PU# 4471 for 10/01", is not a signature.
+    """
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if not _SIGN_OFF_RE.match(line):
+            continue
+        rest = [ln for ln in lines[i + 1 :] if ln.strip()]
+        short = len(rest) <= SIGNATURE_LINES and all(len(ln) <= 80 for ln in rest)
+        if short and not any(_BOOKING_WORDS_RE.search(ln) for ln in rest):
+            return "\n".join(lines[:i]).rstrip()
+    return text
+
+
+def without_phone_numbers(text: str) -> str:
+    """The text with every phone, fax or extension number blanked out."""
+    return _LABELLED_PHONE_RE.sub(" ", _PHONE_RE.sub(" ", text))
+
+
+def written_dates(text: str) -> set[tuple[int, int]]:
+    """Every (month, day) written out in the text: 10/01, 10-01-26, 2026-10-01, Oct 1st, 1 Oct."""
+    found: list[tuple[int, int]] = []
+    for pattern in (_SLASH_DATE_RE, _DASH_DATE_RE, _ISO_DATE_RE):
+        found += [(int(m.group(1)), int(m.group(2))) for m in pattern.finditer(text)]
+    for m in _NAMED_DATE_RE.finditer(text):
+        found.append((_MONTHS[m.group(1)[:3].lower()], int(m.group(2))))
+    for m in _DAY_MONTH_RE.finditer(text):
+        found.append((_MONTHS[m.group(2)[:3].lower()], int(m.group(1))))
+    return {(month, day) for month, day in found if 1 <= month <= 12 and 1 <= day <= 31}
 
 
 def _number_in_text(number: str, text: str) -> bool:
@@ -224,11 +301,20 @@ def _digit_runs(text: str) -> set[str]:
 
 
 def date_is_backed(value: str, quotes: str) -> bool:
-    """The day of the month, or a relative day word, appears in the backing quotes."""
+    """The backing quotes give this date.
+
+    A date written out (10/01, Oct 1st) must match by month and day: "11/01" never backs
+    10/01. With no date written out, the day of the month or a relative day word will do
+    ("the 1st", "tomorrow").
+    """
     try:
-        day = datetime.strptime(value, "%Y-%m-%d").day
+        parsed = datetime.strptime(value, "%Y-%m-%d")
     except ValueError:
         return False
+    written = written_dates(quotes)
+    if written:
+        return (parsed.month, parsed.day) in written
+    day = parsed.day
     runs = _digit_runs(quotes)
     if str(day) in runs or f"{day:02d}" in runs:
         return True
@@ -284,10 +370,22 @@ def _sort_quotes(
 
 
 def _validate_slot(
-    data: dict[str, Any], own: str, history: str, *, label: str = ""
+    data: dict[str, Any],
+    own: str,
+    history: str,
+    *,
+    label: str = "",
+    numbers: str | None = None,
+    whole: str | None = None,
 ) -> list[ClassificationIssue]:
-    """Check one reading (the whole reply, or one PO line) against the text, in place."""
+    """Check one reading (the whole reply, or one PO line) against the text, in place.
+
+    ``own`` is the reply's own words without its signature; ``numbers`` the same without phone
+    numbers, where a pickup number must be found; ``whole`` the own words as written.
+    """
     prefix = f"{label}." if label else ""
+    numbers = own if numbers is None else numbers
+    whole = own if whole is None else whole
     own_quotes, kept_quotes, issues = _sort_quotes(
         list(data.get("quotes") or []),
         own,
@@ -300,12 +398,13 @@ def _validate_slot(
     data["quotes"] = kept_quotes
 
     number = data.get("pickup_number")
-    if number and not _number_in_text(str(number), own):
-        issues.append(
-            ClassificationIssue(
-                prefix + "pickup_number", "number not in the reply's own words", number
-            )
+    if number and not _number_in_text(str(number), numbers):
+        why = (
+            "number is only in a phone number or the signature"
+            if _number_in_text(str(number), whole)
+            else "number not in the reply's own words"
         )
+        issues.append(ClassificationIssue(prefix + "pickup_number", why, number))
         data["pickup_number"] = None
     day = data.get("pickup_date")
     if day and not date_is_backed(str(day), backing):
@@ -344,12 +443,18 @@ def validate_classification(
     else: a chaser that carries the old confirmation underneath must not re-confirm the slot.
     Each PO line in ``items`` is checked the same way, and a line whose PO numbers are nowhere
     in the message is dropped: it cannot be about anything the message says.
+
+    The sender's signature backs nothing (a name, a title, office hours), and a pickup number
+    found only inside a phone, fax or extension number is not one.
     """
-    own = clean_mail_text(text)
+    whole = clean_mail_text(text)
+    words, mark, files = whole.partition("\n--- Attached file")  # read files carry no signature
+    own = without_signature(words) + mark + files
+    numbers = without_phone_numbers(own)
     history = clean_mail_text(quoted)
     data = result.model_dump()
-    issues = _validate_slot(data, own, history)
-    everything = f"{own}\n{history}"
+    issues = _validate_slot(data, own, history, numbers=numbers, whole=whole)
+    everything = f"{whole}\n{history}"
     kept_items: list[dict[str, Any]] = []
     for index, item in enumerate(data.get("items") or []):
         label = f"items[{index}]"
@@ -362,7 +467,7 @@ def validate_classification(
             continue
         item["question"] = None  # lines carry verdicts and values, the reply carries the question
         item["questions"] = []
-        issues.extend(_validate_slot(item, own, history, label=label))
+        issues.extend(_validate_slot(item, own, history, label=label, numbers=numbers, whole=whole))
         item.pop("question", None)
         item.pop("questions", None)
         kept_items.append(item)

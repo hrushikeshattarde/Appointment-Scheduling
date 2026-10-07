@@ -5,17 +5,22 @@ person sends); a :class:`Sender` delivers the message itself. Both build the sam
 :func:`build_mime`, which stamps every outbound message with its own RFC ``Message-ID`` so a
 vendor's reply can be tied back to the request through ``In-Reply-To`` and ``References``
 whatever mailbox it is read from.
+
+Every inbound text is tidied the same way whatever its source (:func:`tidy_text`): HTML codes
+such as ``&nbsp;`` and ``&amp;`` are decoded, and odd spaces and invisible characters go, so the
+model and the checks read the words the vendor wrote.
 """
 
 from __future__ import annotations
 
 import base64
+import html
 import importlib
 import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage
 from email.utils import make_msgid, parseaddr
 from pathlib import Path
@@ -56,6 +61,9 @@ class InboundMessage:
     # Attached files that should have been read and were not ("scan.pdf: a scan"); the text of
     # those that were read is in ``body``, under the email's own words (booking/attachments.py).
     unread_files: tuple[str, ...] = ()
+    # Auto-Submitted, or what stands in for it (X-Autoreply, Precedence: auto_reply): set on an
+    # out-of-office or another message no person wrote.
+    auto_submitted: str | None = None
 
     @property
     def full_text(self) -> str:
@@ -65,11 +73,7 @@ class InboundMessage:
     @property
     def from_email(self) -> str:
         """Bare lower-cased sender address (display names may themselves contain an @)."""
-        angle = re.search(r"<([^>]+)>", self.from_addr)
-        if angle:
-            return angle.group(1).strip().lower()
-        found = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", self.from_addr)
-        return (found.group(0) if found else parseaddr(self.from_addr)[1]).lower()
+        return bare_address(self.from_addr)
 
     @property
     def from_domain(self) -> str:
@@ -81,6 +85,41 @@ class InboundMessage:
         """Every Message-ID this reply points at, In-Reply-To first, lower-cased."""
         return message_ids(self.in_reply_to, self.references)
 
+    def looks_like(
+        self, from_addr: str | None, subject: str | None, body: str | None, sent_at: datetime | None
+    ) -> bool:
+        """Whether an email with no Message-ID is this one, read from another mailbox.
+
+        The same sender, subject and text (letters and digits, so line breaks and spacing a
+        source adds do not count), received within :data:`SAME_EMAIL_WITHIN` of each other.
+        """
+        if sent_at is None or bare_address(from_addr) != self.from_email:
+            return False
+        if " ".join((subject or "").split()).lower() != " ".join(self.subject.split()).lower():
+            return False
+        mine = self.sent_at if self.sent_at.tzinfo else self.sent_at.replace(tzinfo=UTC)
+        theirs = sent_at if sent_at.tzinfo else sent_at.replace(tzinfo=UTC)
+        return abs(mine - theirs) <= SAME_EMAIL_WITHIN and text_key(body) == text_key(self.body)
+
+
+# Two copies of one email read from two mailboxes arrive this close together.
+SAME_EMAIL_WITHIN = timedelta(minutes=15)
+
+
+def bare_address(value: str | None) -> str:
+    """The bare lower-cased address in a From header (display names may themselves hold an @)."""
+    value = value or ""
+    angle = re.search(r"<([^>]+)>", value)
+    if angle:
+        return angle.group(1).strip().lower()
+    found = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", value)
+    return (found.group(0) if found else parseaddr(value)[1]).lower()
+
+
+def text_key(text: str | None) -> str:
+    """An email's text as letters and digits only, lower case, the first 300 of them."""
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())[:300]
+
 
 def message_ids(*headers: str | None) -> list[str]:
     """Distinct ``<id>`` tokens from In-Reply-To or References header values, lower-cased."""
@@ -91,6 +130,43 @@ def message_ids(*headers: str | None) -> list[str]:
             if lowered not in out:
                 out.append(lowered)
     return out
+
+
+# Spaces that are not plain spaces, and characters that show as nothing.
+_ODD_SPACES = re.compile(
+    "[" + "".join(map(chr, (0x00A0, *range(0x2000, 0x200B), 0x202F, 0x205F, 0x3000))) + "]"
+)
+_INVISIBLE = re.compile(
+    "[" + "".join(map(chr, (0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF, 0x00AD))) + "]"
+)
+
+
+def tidy_text(text: str | None) -> str:
+    """Mail text as people read it: HTML codes decoded, odd spaces made plain, invisible gone.
+
+    "Set for 9/16&nbsp;@ 1700" reads "Set for 9/16 @ 1700"; "Smith &amp; Sons" reads "Smith &
+    Sons". Line breaks are kept.
+    """
+    if not text:
+        return ""
+    decoded = html.unescape(text) if "&" in text else text
+    return _INVISIBLE.sub("", _ODD_SPACES.sub(" ", decoded.replace("\r\n", "\n")))
+
+
+def auto_submitted_of(headers: dict[str, str]) -> str | None:
+    """Whether a message's headers say no person wrote it: their word for it, or None.
+
+    ``Auto-Submitted: auto-replied`` (RFC 3834), ``X-Autoreply`` or ``X-Autorespond``, or
+    ``Precedence: auto_reply``. ``Auto-Submitted: no`` means a person wrote it.
+    """
+    auto = (headers.get("auto-submitted") or "").strip().lower()
+    if auto and auto != "no":
+        return auto
+    for name in ("x-autoreply", "x-autorespond"):
+        if (headers.get(name) or "").strip():
+            return name
+    precedence = (headers.get("precedence") or "").strip().lower()
+    return "auto_reply" if precedence == "auto_reply" else None
 
 
 _QUOTE_SPLIT = re.compile(
@@ -120,7 +196,7 @@ def load_messages_jsonl(path: Path) -> list[InboundMessage]:
             if not line.strip():
                 continue
             m = json.loads(line)
-            own, quoted = split_quoted(m.get("body", ""))
+            own, quoted = split_quoted(tidy_text(m.get("body", "")))
             out.append(
                 InboundMessage(
                     message_id=str(m["id"]),
@@ -130,7 +206,7 @@ def load_messages_jsonl(path: Path) -> list[InboundMessage]:
                     to_addr=m.get("to", ""),
                     cc_addr=m.get("cc", ""),
                     subject=m.get("subject", ""),
-                    body=m.get("own_text") or own,
+                    body=tidy_text(m.get("own_text")) or own,
                     in_reply_to=m.get("in_reply_to") or None,
                     quoted=quoted,
                     rfc_message_id=m.get("message_id") or None,
@@ -522,26 +598,30 @@ def _part_headers(part: dict[str, Any]) -> dict[str, str]:
 
 
 def gmail_body_text(payload: dict[str, Any]) -> str:
-    """The text of a Gmail ``full`` message: its plain part, else its HTML part as text."""
+    """The text of a Gmail ``full`` message: its plain part, else its HTML part as text.
+
+    A bounce's copy of the returned email's headers counts as plain text: its Message-ID ties
+    the bounce to the email sent back.
+    """
     plain: list[str] = []
-    html: list[str] = []
+    markup: list[str] = []
 
     def walk(part: dict[str, Any]) -> None:
         mime = part.get("mimeType", "")
         body = part.get("body") or {}
         if body.get("data") and not part.get("filename"):
-            if mime == "text/plain":
+            if mime in ("text/plain", "text/rfc822-headers"):
                 plain.append(_decode(body["data"]))
             elif mime == "text/html":
-                html.append(_decode(body["data"]))
+                markup.append(_decode(body["data"]))
         for child in part.get("parts") or []:
             walk(child)
 
     walk(payload)
     if plain:
-        return "\n".join(plain)
-    text = re.sub(r"<br\s*/?>|</p>|</div>", "\n", "\n".join(html), flags=re.I)
-    return re.sub(r"<[^>]+>", " ", text)
+        return tidy_text("\n".join(plain))
+    text = re.sub(r"<br\s*/?>|</p>|</div>", "\n", "\n".join(markup), flags=re.I)
+    return tidy_text(re.sub(r"<[^>]+>", " ", text))
 
 
 def _file_parts(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -614,4 +694,5 @@ def _from_gmail(
         rfc_message_id=headers.get("message-id"),
         references=headers.get("references"),
         unread_files=unread,
+        auto_submitted=auto_submitted_of(headers),
     )

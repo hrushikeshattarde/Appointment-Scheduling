@@ -86,9 +86,14 @@ class MergedInbox:
     problems: list[str] = field(default_factory=list)
 
     def fetch(self) -> list[InboundMessage]:
-        """Every source's messages, oldest first, each email once (the first source's copy)."""
+        """Every source's messages, oldest first, each email once (the first source's copy).
+
+        An email with no Message-ID is known by its sender, subject, text and time
+        (:meth:`InboundMessage.looks_like`).
+        """
         self.problems = []
         seen: set[str] = set()
+        nameless: list[InboundMessage] = []
         out: list[InboundMessage] = []
         failed: list[Exception] = []
         for source in self.sources:
@@ -99,6 +104,13 @@ class MergedInbox:
                 self.problems.append(f"{source}: {exc}")
                 continue
             for message in found:
+                if not message.rfc_message_id:
+                    if any(
+                        message.looks_like(m.from_addr, m.subject, m.body, m.sent_at)
+                        for m in nameless
+                    ):
+                        continue
+                    nameless.append(message)
                 key = identity(message)
                 if key not in seen:
                     seen.add(key)

@@ -116,6 +116,9 @@ EVENTS: dict[str, str] = {
     "mail_linked": "Email linked to this pickup",
     "sent_by_person": "Email sent by a person",
     "send_unconfirmed": "Gmail did not confirm the email went out",
+    "email_bounced": "Email sent back by the mail server",
+    "auto_reply": "Automatic reply",
+    "delivery_delayed": "Delivery delayed",
 }
 # Transport Pro changes the board's "Latest updates" lists beside the emails.
 LOAD_UPDATES = frozenset(
@@ -262,6 +265,13 @@ def _email_update(
     if message.kind == "link":
         return at, "The vendor answered with the link", subject
     reading = message.classification or {}
+    if message.kind == "bounce":
+        to = reading.get("recipient") or "the desk"
+        return at, f"The mail server sent back the email to {to}", subject
+    if message.kind == "auto_reply":
+        return at, f"{_who(message.from_addr)} sent an automatic reply", subject
+    if message.kind == "delivery_delayed":
+        return at, "The mail server is still trying to deliver an email", subject
     said = READ_AS.get(str(reading.get("status") or ""))
     read = f", read as {said}" if said and not reading.get("skipped") else ""
     return at, f"{_who(message.from_addr)} wrote{read}", subject

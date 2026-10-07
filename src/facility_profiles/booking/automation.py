@@ -39,7 +39,7 @@ from sqlalchemy.orm import Session
 from facility_profiles.booking.classify import ReplyClassifier
 from facility_profiles.booking.facts import FactsSource
 from facility_profiles.booking.inbox import Inbox
-from facility_profiles.booking.mail import UNCONFIRMED, Mailer, Sender
+from facility_profiles.booking.mail import UNCONFIRMED, InboundMessage, Mailer, Sender
 from facility_profiles.booking.models import (
     AutomationJob,
     BookingCase,
@@ -60,6 +60,7 @@ from facility_profiles.booking.service import (
     plan_request,
 )
 from facility_profiles.booking.timers import fmt_slot, slot_at, sweep
+from facility_profiles.booking.unmatched import is_kept, keep_unreadable, leaving_soon
 from facility_profiles.booking.worklist import flag, open_kinds
 from facility_profiles.booking.writeback import LoadWriter, write_appointments
 from facility_profiles.booking.writer import ReplyWriter
@@ -431,10 +432,9 @@ def _read_inbox(
                     responder=responder,
                     settings=settings,
                 )
-        except Exception:  # this reply is tried again on the next pass
+        except Exception as exc:  # this reply is tried again on the next pass
             log.exception("booking.reply_failed", subject=message.subject)
-            report.mail_failed += 1
-            report.lines.append(f"inbox: could not handle {message.subject!r}; trying next pass")
+            _failed_mail(session, message, exc, settings=settings, report=report)
             continue
         report.mail_read += stats.new_mail
         report.mail_by_person += stats.by_person
@@ -452,6 +452,40 @@ def _read_inbox(
             report.lines.append(
                 f"inbox: {message.subject!r} changes a booked pickup; left for a person"
             )
+
+
+def _failed_mail(
+    session: Session,
+    message: InboundMessage,
+    exc: Exception,
+    *,
+    settings: Settings,
+    report: RunReport,
+) -> None:
+    """An email that could not be read: tried again next pass, or kept before it is lost.
+
+    While the inbox still looks back far enough to see it, it is tried again every pass. Once it
+    is about to fall out of that window it is kept for a person with the error, under "Emails
+    we could not match". An email a person already has is not counted as a failure again, so
+    one bad email does not keep the board's mail notice red.
+    """
+    subject = message.subject or "(no subject)"
+    if is_kept(session, message):
+        report.lines.append(f"inbox: still cannot read {subject!r}; a person has it")
+        return
+    report.mail_failed += 1
+    now = datetime.now(tz=UTC)
+    if not leaving_soon(message, days=settings.booking_inbox_days, now=now):
+        report.lines.append(f"inbox: could not handle {subject!r}; trying next pass")
+        return
+    error = f"{type(exc).__name__}: {exc}"
+    with session.begin_nested():
+        keep_unreadable(session, message, error, customers(settings))
+    report.mail_unmatched += 1
+    report.lines.append(
+        f"inbox: {subject!r} still could not be read as it leaves the "
+        f"{settings.booking_inbox_days}-day look-back; kept for a person ({error[:120]})"
+    )
 
 
 def read_mail(

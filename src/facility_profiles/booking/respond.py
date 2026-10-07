@@ -42,6 +42,7 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from facility_profiles.booking.automated import AUTOMATED_KINDS
 from facility_profiles.booking.facts import (
     FACT_KEYS,
     FORBIDDEN_TOPICS,
@@ -782,8 +783,11 @@ class Responder:
         else:
             if self._now() - last_out < timedelta(hours=self.settings.booking_follow_up_hours):
                 return None
+            # An out-of-office or a delay notice is not a reply: the desk is still silent.
             replied_since = any(
-                m.direction == "in" and (as_utc(m.sent_at) or last_out) > last_out
+                m.direction == "in"
+                and m.kind not in AUTOMATED_KINDS
+                and (as_utc(m.sent_at) or last_out) > last_out
                 for m in case.messages
             )
             if replied_since:

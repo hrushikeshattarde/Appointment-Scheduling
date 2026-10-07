@@ -340,6 +340,7 @@ agent when the situation clears or by a person with a note (`booking resolve`):
 | `pickup_expired` | timer: the pickup passed and the case is not booked | `booked`, `approve`, `reschedule`, a later pickup (an offer, a moved delivery), `close` |
 | `send_unconfirmed` | Gmail never answered a send, so the email may or may not have gone | the group's copy or a reply to it being read, `booking sent`, any later reply, a person |
 | `attachment_unread` | the facility's email carries a file the agent could not read (a scan, a picture, an old .doc) | a later reply about the slot, a person |
+| `email_bounced` | the facility's mail server sent our email back | any reply from the facility, `reschedule`, a person |
 
 When the agent hands a reply to a person (money, the round cap, no safe answer) the exception
 the reply raised stays open with the agent's reason added to it. A later reply about the slot (a
@@ -641,6 +642,23 @@ With `FP_BOOKING_INBOX` set, each pass also reads the new replies, the way Bigge
   email. A file that cannot be read (a scanned PDF, a picture sent as a file, an old .doc) is
   named in the email and raises "Open the attachment", which also stops the agent booking on
   that reply by itself. Logos in signatures are left alone.
+- **Clean text, careful checks**: HTML codes (`&nbsp;`, `&amp;`) are decoded and odd spaces made
+  plain, whatever the source. When the reply's words are checked against what the model read,
+  the sender's signature backs nothing, a pickup number found only inside a phone, fax or
+  extension number is dropped, and a date written out ("11/01", "Oct 1st") must match by month
+  as well as day; with no date written out, the day of the month or "tomorrow" still does.
+- **Mail no person wrote**: a bounce (the mail server sent our email back) is tied to the email
+  it returned by its Message-ID, never read by the model, and raises "Email did not arrive" at
+  once with the address and the server's reason. An out-of-office or other automatic reply
+  (`Auto-Submitted`, "Automatic reply:") and a delay notice are kept on the pickup and read by
+  nobody: the desk still counts as silent, so the no-reply to-dos and the follow-up go on. A
+  scheduling portal's own notices are automatic too but carry the booking, so they are read.
+- **No email dropped without a word**: an email that fails to be read (the model unreachable,
+  a fault) is tried again every pass; one still failing in the last six hours before it leaves
+  the look-back is kept under "Emails we could not match" with the error. From then on it no
+  longer turns the mail notice red, and once it can be read it links itself to its pickup.
+- **No Message-ID**: the same email read from two mailboxes is known by its sender, subject,
+  text and time (within 15 minutes) and read once.
 - **Finding the pickup**: by the email IDs the reply answers, its thread, a PO in its words (of a
   pickup being booked or one booked), the desk that wrote, or another address at that desk's
   company when only one pickup is open with it (too weak to book on). Every email the agent

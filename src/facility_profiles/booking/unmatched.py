@@ -15,11 +15,16 @@ linked by the agent.
 The text counts as well as the subject (``filters.body_reason``): a new desk writing under a
 subject of its own is kept when its email, quoted history or attached files name a PO, a pickup
 number or a pickup appointment.
+
+An email the agent keeps failing to read (the model unreachable, a fault in the agent) is tried
+again every pass while the inbox still looks back far enough to see it; one still failing when
+it is about to fall out of that window is kept here too, with the error (:func:`keep_unreadable`),
+so no email is ever dropped without a word.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from sqlalchemy import func, select
@@ -42,6 +47,7 @@ from facility_profiles.mailarchive.filters import (
     participants,
     rules_for,
 )
+from facility_profiles.storage.repository import as_utc
 
 if TYPE_CHECKING:
     from facility_profiles.booking.classify import ReplyClassifier
@@ -55,6 +61,10 @@ log = get_logger(__name__)
 OPEN = "open"
 LINKED = "linked"
 DISMISSED = "dismissed"
+# The reason an email the agent kept failing to read is kept with (``unreadable: <error>``).
+UNREADABLE = "unreadable"
+# How long before an email leaves the inbox's look-back a failing one is kept for a person.
+LAST_CHANCE = timedelta(hours=6)
 # Mail services anyone can use: a shared domain there says nothing about who wrote.
 FREE_MAIL = frozenset(
     {
@@ -78,7 +88,10 @@ FREE_MAIL = frozenset(
 
 
 def _find(session: Session, message: InboundMessage) -> UnmatchedMail | None:
-    """The kept item for this email: by the source's id, else by its RFC Message-ID."""
+    """The kept item for this email: by the source's id, else by its RFC Message-ID.
+
+    One with no Message-ID is known by its sender, subject, text and time.
+    """
     item = session.scalar(
         select(UnmatchedMail).where(UnmatchedMail.message_id == message.message_id)
     )
@@ -87,6 +100,20 @@ def _find(session: Session, message: InboundMessage) -> UnmatchedMail | None:
             select(UnmatchedMail).where(
                 func.lower(UnmatchedMail.rfc_message_id) == message.rfc_message_id.lower()
             )
+        )
+    if item is None and not message.rfc_message_id:
+        same_subject = session.scalars(
+            select(UnmatchedMail).where(
+                UnmatchedMail.rfc_message_id.is_(None), UnmatchedMail.subject == message.subject
+            )
+        )
+        item = next(
+            (
+                i
+                for i in same_subject
+                if message.looks_like(i.from_addr, i.subject, i.body, as_utc(i.sent_at))
+            ),
+            None,
         )
     return item
 
@@ -138,6 +165,47 @@ def keep_unmatched(session: Session, message: InboundMessage, known: Customers) 
     reason, key = booking_reason(session, message, known)
     if reason is None:
         return None
+    _keep(session, message, reason=reason, key=key)
+    log.info("booking.unmatched_kept", subject=message.subject, reason=reason)
+    return "new"
+
+
+def leaving_soon(message: InboundMessage, *, days: int, now: datetime) -> bool:
+    """Whether the email is about to fall out of the inbox's look-back of ``days`` days.
+
+    The last :data:`LAST_CHANCE` of the window (at most half of it) counts as about to go.
+    """
+    window = timedelta(days=max(1, days))
+    sent = message.sent_at if message.sent_at.tzinfo else message.sent_at.replace(tzinfo=UTC)
+    return now - sent >= window - min(LAST_CHANCE, window / 2)
+
+
+def keep_unreadable(
+    session: Session, message: InboundMessage, error: str, known: Customers
+) -> str | None:
+    """Keep an email the agent keeps failing to read, before the look-back leaves it behind.
+
+    Every pass tries a failed email again while it is inside the look-back; one still failing
+    when it is about to fall out is kept here for a person, with the error, whatever it is
+    about, so it is never dropped without a word. ``new`` when kept now, ``known`` when kept
+    before (for any reason), None never.
+    """
+    if _find(session, message) is not None:
+        return "known"
+    addresses = participants(message.from_addr, message.to_addr, message.cc_addr)
+    mine = [c for c in known.files if c.group and c.group.lower() in addresses]
+    reason = f"{UNREADABLE}: {error}"
+    _keep(session, message, reason=reason, key=mine[0].key if mine else None)
+    log.warning("booking.unreadable_kept", subject=message.subject, error=error)
+    return "new"
+
+
+def is_kept(session: Session, message: InboundMessage) -> bool:
+    """Whether the email is already with a person (kept, linked or dismissed)."""
+    return _find(session, message) is not None
+
+
+def _keep(session: Session, message: InboundMessage, *, reason: str, key: str | None) -> None:
     session.add(
         UnmatchedMail(
             message_id=message.message_id,
@@ -158,8 +226,6 @@ def keep_unmatched(session: Session, message: InboundMessage, known: Customers) 
         )
     )
     session.flush()
-    log.info("booking.unmatched_kept", subject=message.subject, reason=reason)
-    return "new"
 
 
 def settle_unmatched(session: Session, message: InboundMessage, case: BookingCase) -> None:
