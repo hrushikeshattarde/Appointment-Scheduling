@@ -65,6 +65,7 @@ from facility_profiles.booking.models import (
     CaseStatus,
     ExceptionType,
     SlotOffer,
+    is_person_request,
 )
 from facility_profiles.booking.outbox import (
     SendRefusedError,
@@ -74,6 +75,7 @@ from facility_profiles.booking.outbox import (
     is_sender,
     record_delivery,
 )
+from facility_profiles.booking.person_requests import asked_slot, to_facility
 from facility_profiles.booking.recommend import (
     Recommendation,
     facility_history,
@@ -141,7 +143,15 @@ from facility_profiles.booking.worklist import (
 )
 from facility_profiles.booking.writeback import appointment_payload, queue_write
 from facility_profiles.business_days import is_business_day
-from facility_profiles.clock import EASTERN_ZONE, local_to_eastern, slot_text, stamp, tpro_time
+from facility_profiles.clock import (
+    EASTERN_ZONE,
+    eastern_to_local,
+    local_to_eastern,
+    slot_text,
+    stamp,
+    to_eastern,
+    tpro_time,
+)
 from facility_profiles.config import Settings
 from facility_profiles.customers import (
     Customer,
@@ -1333,7 +1343,15 @@ def _check_draftable(
 
 
 def has_request(case: BookingCase) -> bool:
-    """True once a request for the case has been drafted or sent."""
+    """True once a request for the case has been drafted or sent, by the agent or a person."""
+    return any(
+        m.direction == "out" and (m.kind == "request" or is_person_request(m))
+        for m in case.messages
+    )
+
+
+def _drafted_request(case: BookingCase) -> bool:
+    """True when the agent drafted a request for the case (what a person's send may be)."""
     return any(m.direction == "out" and m.kind == "request" for m in case.messages)
 
 
@@ -2184,7 +2202,7 @@ def ingest(  # noqa: PLR0912 - one branch per reply outcome
                 stats.own_outbound += 1
             elif outcome == "linked":
                 stats.linked_outbound += 1
-            elif attach_circle_mail(session, message, known):
+            elif attach_circle_mail(session, message, known, settings=settings):
                 stats.by_person += 1
             else:
                 stats.skipped_internal += 1
@@ -2647,6 +2665,7 @@ def link_outbound(session: Session, message: InboundMessage) -> str:
         own = session.scalar(
             select(BookingMessage).where(
                 BookingMessage.direction == "out",
+                BookingMessage.kind != PERSON_MAIL,  # a person's email seen again is kept again
                 func.lower(BookingMessage.rfc_message_id) == message.rfc_message_id.lower(),
             )
         )
@@ -2676,7 +2695,7 @@ def link_outbound(session: Session, message: InboundMessage) -> str:
     for case in candidates:
         if case.status == CaseStatus.PENDING.value and case.thread_id:
             continue
-        if not has_request(case):
+        if not _drafted_request(case):
             continue  # only a drafted request is linked to a person's send; other mail is kept
         same_subject = any(
             normalize_subject(m.subject).lower() == subject
@@ -2738,26 +2757,42 @@ def _match_circle_mail(session: Session, message: InboundMessage) -> list[Bookin
     ]
 
 
-def attach_circle_mail(session: Session, message: InboundMessage, known: Customers) -> int:
+def attach_circle_mail(
+    session: Session,
+    message: InboundMessage,
+    known: Customers,
+    *,
+    settings: Settings | None = None,
+) -> int:
     """Keep a Circle person's email on every pickup it is about; how many it was kept on.
 
     Only mail with the pickup's customer group on it (To or Cc, or only Bcc: the copy came
     through the group) counts as part of the pickup's conversation; a private note between
     colleagues is not. The email is kept as sent by a
     person (``PERSON_MAIL``): shown in the pickup's emails, never read as a vendor's reply and
-    never counted as the agent's own.
+    never counted as the agent's own. One that asks the facility for the pickup is its request
+    (:func:`_asked_by_person`); an email kept before that was read is read for it again.
     """
     on_group = participants(message.to_addr, message.cc_addr) | set(message.via_groups)
     kept = 0
     for case in _match_circle_mail(session, message):
-        group = (known.for_case(case).group or "").strip().lower()
+        customer = known.for_case(case)
+        group = (customer.group or "").strip().lower()
         if group and group not in on_group:
             continue
         rfc = (message.rfc_message_id or "").lower()
-        if any(
-            m.message_id == message.message_id or (rfc and (m.rfc_message_id or "").lower() == rfc)
-            for m in case.messages
-        ):
+        before = next(
+            (
+                m
+                for m in case.messages
+                if m.message_id == message.message_id
+                or (rfc and (m.rfc_message_id or "").lower() == rfc)
+            ),
+            None,
+        )
+        if before is not None:
+            if before.kind == PERSON_MAIL:
+                _asked_by_person(session, case, before, customer, settings=settings)
             continue
         case.messages.append(
             BookingMessage(
@@ -2787,9 +2822,69 @@ def attach_circle_mail(session: Session, message: InboundMessage, known: Custome
             to=message.to_addr,
         )
         _answered_by_person(session, case, message)
+        _asked_by_person(session, case, case.messages[-1], customer, settings=settings)
         kept += 1
     session.flush()
     return kept
+
+
+def _asked_by_person(
+    session: Session,
+    case: BookingCase,
+    record: BookingMessage,
+    customer: Customer,
+    *,
+    settings: Settings | None,
+) -> bool:
+    """A person's email that asks the facility for the pickup: it is the pickup's request.
+
+    The pickup is then asked for (pending) at the time the email names; the no-reply clock runs
+    from it and the agent does not ask again. A decline or a moved delivery is settled by the
+    new ask, and a time that makes the delivery settles *Cannot make the delivery* and *Slot will
+    not work* (``booking/person_requests.py``). Read once per email; True when it was a request.
+    """
+    reading = record.classification or {}
+    if reading.get("request") or reading.get("request_read"):
+        return False
+    record.classification = {**reading, "request_read": True}
+    live = (CaseStatus.UNSCHEDULED.value, CaseStatus.PENDING.value, CaseStatus.DECLINED.value)
+    sent = as_utc(record.sent_at) or datetime.now(tz=UTC)
+    if case.status not in live or picked_up((case.tpro_seen or {}).get("load_status")):
+        return False
+    internal = settings.internal_email_domains if settings is not None else ["circledelivers.com"]
+    if not to_facility(
+        record.to_addr,
+        record.cc_addr,
+        desk=address(case.contact_email) or None,
+        internal=internal,
+        customer_addresses=(customer.group, customer.customer_desk, *customer.cc),
+    ):
+        return False
+    asked = asked_slot(record.body or "", [str(p) for p in case.po_numbers], sent=to_eastern(sent))
+    if asked is None:
+        return False
+    eastern, line = asked
+    local = eastern_to_local(eastern, case.vendor_timezone) or eastern
+    who = bare_address(record.from_addr) or "a person"
+    was = case.requested_local
+    record.classification = {**record.classification, "request": {"local": local, "line": line}}
+    case.requested_local = local
+    case.status = CaseStatus.PENDING.value
+    case.reason = None
+    if case.thread_id is None and record.thread_id:
+        case.thread_id = record.thread_id
+    shown = slot_text(local, case.vendor_timezone)
+    settled = [ExceptionType.FACILITY_DECLINED, ExceptionType.DELIVERY_MOVED]
+    if settings is not None:
+        day, _, clock = local.partition(" ")
+        works, _why = offer_is_feasible(
+            case, local_dt(day, clock or None, case.vendor_timezone), settings, now=sent
+        )
+        if works:
+            settled += [ExceptionType.LOAD_INFEASIBLE, ExceptionType.SLOT_UNWORKABLE]
+    resolve(session, case, settled, resolution=f"{who} asked the facility for {shown}", by=who)
+    _event(session, case, "requested_by_person", actor=who, local=local, previous=was, line=line)
+    return True
 
 
 def _answered_by_person(session: Session, case: BookingCase, message: InboundMessage) -> None:

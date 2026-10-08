@@ -46,6 +46,7 @@ from facility_profiles.booking.models import (
     CaseException,
     CaseStatus,
     ExceptionType,
+    is_person_request,
 )
 from facility_profiles.booking.rules import check_desk_rules, vendor_profile
 from facility_profiles.booking.worklist import (
@@ -195,7 +196,7 @@ def waiting_since(case: BookingCase) -> BookingMessage | None:
     """The first message sent to the vendor that is still unanswered, or None.
 
     That is the earliest sent message to the vendor after their last answer. Drafts nobody sent
-    do not count: the vendor has not seen them.
+    do not count: the vendor has not seen them. A request a person emailed themselves counts.
     """
     answers = [
         t for m in case.messages if is_vendor_answer(m) if (t := as_utc(m.sent_at or m.created_at))
@@ -204,7 +205,7 @@ def waiting_since(case: BookingCase) -> BookingMessage | None:
     unanswered = [
         (sent, m)
         for m in case.messages
-        if m.direction == "out" and m.kind not in NOT_TO_VENDOR
+        if m.direction == "out" and (m.kind not in NOT_TO_VENDOR or is_person_request(m))
         if (sent := as_utc(m.sent_at)) is not None
         if last_answer is None or sent > last_answer
     ]

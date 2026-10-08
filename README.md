@@ -728,7 +728,11 @@ With `FP_BOOKING_INBOX` set, each pass also reads the new replies, the way Bigge
   you!", or a note asking the customer's desk for the PO all count. It shows in the pickup's
   Emails as "Sent by a person", from whom and to whom, in time order with the vendor's and the
   agent's mail. It is never read as a vendor's reply, and never counted as the agent's own
-  (rounds, the daily cap, the no-reply clock). One sent to the facility after its latest reply
+  (rounds, the daily cap). One that asks the facility for the pickup, a line naming its PO with
+  a day and a time ("PO# A & B (one truck) on 10/12 @ 0900", Eastern), is the pickup's request:
+  the pickup is asked (pending) at that time, the no-reply clock runs from it, the agent does not
+  ask again, and a time that makes the delivery settles "Cannot make the delivery" and "Slot will
+  not work" (`booking/person_requests.py`). One sent to the facility after its latest reply
   settles the to-dos that asked a person to answer it (a question, an ETA, a late arrival, a
   hand-off, an unsent draft); one to the customer's desk or a colleague settles nothing. The
   group only in Bcc counts: the archive keeps the group a copy came through (`Mailing-list`,

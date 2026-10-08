@@ -175,6 +175,11 @@ class BookingCase(Base):
 PERSON_MAIL = "by_person"
 
 
+def is_person_request(message: BookingMessage) -> bool:
+    """A person's email that asked the facility for the pickup (``booking/person_requests.py``)."""
+    return message.kind == PERSON_MAIL and bool((message.classification or {}).get("request"))
+
+
 class BookingMessage(Base):
     """An email the agent composed or read for a case, or one a person sent on the group."""
 
