@@ -72,25 +72,30 @@ def test_the_tendered_time_is_asked_for_as_before(settings: Settings) -> None:
     rec = recommend_time(a_case(), settings, None, now=NOW)
     assert rec.local == "2026-10-01 09:00" and rec.feasible and rec.moved == []
     assert [s.rule for s in rec.steps] == ["tender"]
-    # No tender: back from the delivery by the transit days (559 miles: one day's drive), at the
-    # pod's default time.
+    # No tender: back from the delivery one day per 550 miles (559 miles: two days), at the pod's
+    # default time.
     rec = recommend_time(a_case(tendered_pickup_utc=None), settings, None, now=NOW)
     assert (
-        rec.local == "2026-10-01 09:00"
-        and rec.steps[0].note == "1 day before the delivery on 10/02"
+        rec.local == "2026-09-30 09:00"
+        and rec.steps[0].note == "2 days before the delivery on 10/02"
     )
     # Backed off to a day that has passed: the earliest pickup a driver can still make.
-    later = datetime(2026, 10, 1, 15, 10, tzinfo=UTC)  # 11:10 New York; four hours' notice
+    later = datetime(2026, 9, 30, 15, 10, tzinfo=UTC)  # 11:10 New York; four hours' notice
     rec = recommend_time(a_case(tendered_pickup_utc=None), settings, None, now=later)
-    assert rec.local == "2026-10-01 15:30" and rec.feasible
+    assert rec.local == "2026-09-30 15:30" and rec.feasible
     assert (
         rec.moved[0].note
-        == "that day has passed; the earliest pickup a driver can still make is Thu 10/01 15:30 ET"
+        == "that day has passed; the earliest pickup a driver can still make is Wed 09/30 15:30 ET"
     )
 
 
 def test_a_truck_covers_600_miles_a_day(settings: Settings) -> None:
-    """Within a day's 600 miles it drives straight through; past them, it stops for the day."""
+    """Within a day's 600 miles it drives straight through; past them, it stops for the day.
+
+    The delivery check's own setting: choosing the pickup day still counts back by 550 miles.
+    """
+    assert settings.booking_drive_miles_per_day == 600
+    assert settings.booking_transit_miles_per_day == 550
 
     def hours(miles: int) -> float:
         return transit_hours(a_case(miles=miles), settings)

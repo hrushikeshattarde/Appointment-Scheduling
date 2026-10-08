@@ -633,11 +633,11 @@ def test_customer_desk_slot_moves_the_pickup_and_redrafts_in_thread(settings, se
         # The pickup was re-requested in the vendor thread, backed off the new delivery; asking
         # again answers the decline.
         assert case.status == CaseStatus.PENDING.value and open_kinds(case) == []
-        assert case.exceptions[0].resolution == "pickup asked for again: Mon 10/05 09:00 ET"
-        assert case.requested_local == "2026-10-05 09:00"
+        assert case.exceptions[0].resolution == "pickup asked for again: Fri 10/02 09:00 ET"
+        assert case.requested_local == "2026-10-02 09:00"
         assert mailer.drafts[-1].to_addr == "cci@udfinc.com" and mailer.drafts[-1].thread_id == "tv"
         assert (
-            "Can we please reschedule PO# 104419082630 on 10/05 @ 0900?" in mailer.drafts[-1].body
+            "Can we please reschedule PO# 104419082630 on 10/02 @ 0900?" in mailer.drafts[-1].body
         )
         assert [m.kind for m in case.messages] == ["request", "customer_desk", "reschedule"]
         assert any(e.action == "delivery_updated" for e in case.events)

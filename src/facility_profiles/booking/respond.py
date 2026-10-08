@@ -184,13 +184,14 @@ def local_dt(day: str, clock: str | None, timezone: str | None) -> datetime:
 def transit_hours(case: BookingCase, settings: Settings) -> float:
     """Drive time, the drivers' daily stops and loading, from the load's miles.
 
-    A truck covers FP_BOOKING_TRANSIT_MILES_PER_DAY (600) a day: it drives at FP_BOOKING_AVG_MPH
+    A truck covers FP_BOOKING_DRIVE_MILES_PER_DAY (600) a day: it drives at FP_BOOKING_AVG_MPH
     (50), then stops for the rest of the 24 hours (12 hours at 600 miles and 50 mph) before the
     next day's miles. A trip within one day's miles has no stop: 1,000 miles is 20 hours of
-    driving, one 12-hour stop and 2 hours of loading.
+    driving, one 12-hour stop and 2 hours of loading. (Choosing the pickup day counts back by
+    FP_BOOKING_TRANSIT_MILES_PER_DAY, 550, instead.)
     """
     miles = case.miles or 0
-    per_day = settings.booking_transit_miles_per_day
+    per_day = settings.booking_drive_miles_per_day
     stop = max(0.0, 24 - per_day / settings.booking_avg_mph)
     stops = max(0, math.ceil(miles / per_day) - 1)
     return miles / settings.booking_avg_mph + stops * stop + settings.booking_load_hours
