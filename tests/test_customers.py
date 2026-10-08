@@ -104,7 +104,7 @@ def test_lidl_file_carries_what_the_code_used_to_hard_code(settings: Settings) -
     assert lidl.name == "Lidl" and lidl.tpro_customer_ids == (7211, 6680)
     assert lidl.terminal_ids == (1089,)
     assert lidl.group == lidl.sender == "lidl@circledelivers.com"
-    assert lidl.cc == ("lidl@circledelivers.com",)
+    assert lidl.cc == ("lidl@circledelivers.com", "megan.goodwin@circledelivers.com")
     assert lidl.signature and lidl.signature.endswith("lidl@circledelivers.com")
     assert lidl.customer_desk == "inbound@lidl.us" and lidl.delivery_system == "DCT"
     assert lidl.po_embedded_date("115802102660", near=date(2026, 10, 1)) == date(2026, 10, 2)
@@ -253,7 +253,7 @@ def test_a_second_customer_books_from_its_own_file_beside_lidl(two: Settings, se
         messages = draft_batch(session, [lidl_case, north_case], mailer, two, now=NOW)
         assert len(messages) == 2 and len(mailer.drafts) == 2
     lidl_draft, north_draft = mailer.drafts
-    assert lidl_draft.cc_addr == "lidl@circledelivers.com"
+    assert lidl_draft.cc_addr == "lidl@circledelivers.com, megan.goodwin@circledelivers.com"
     assert lidl_draft.from_addr == "lidl@circledelivers.com"
     assert "going to Lidl?" in lidl_draft.body
     assert north_draft.to_addr == "cci@udfinc.com"

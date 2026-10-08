@@ -32,7 +32,8 @@ terminal_ids = [$terminals]
 [mail]
 # The Google Group the pickup threads run through. Drafts are from it and copy it.
 $group_line
-# cc = ["group@circledelivers.com"]       # defaults to the group; [] copies no one
+# Who every email copies: the group, and the account manager who runs the customer, by name.
+# cc = ["group@circledelivers.com", "account.manager@circledelivers.com"]   # default: the group
 # sender = "group@circledelivers.com"     # defaults to the group
 $signature_line
 

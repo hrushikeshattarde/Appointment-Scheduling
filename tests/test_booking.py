@@ -238,7 +238,7 @@ def test_scan_draft_reply_and_approve_round_trip(settings, sessions):
         assert "PO# 226321092660 on 10/01 @ 0900" in draft.body
         assert "Delivering" not in draft.body and "Carrier:" not in draft.body
         assert draft.body.startswith("Hello,\n\nCan I please schedule")
-        assert draft.cc_addr == "lidl@circledelivers.com"
+        assert draft.cc_addr == "lidl@circledelivers.com, megan.goodwin@circledelivers.com"
         message = draft_case(session, case, mailer, settings, now=NOW)
         # Drafted but not sent: nothing has been asked of the vendor yet.
         assert message.draft_ref == "memory:1" and case.status == CaseStatus.UNSCHEDULED.value

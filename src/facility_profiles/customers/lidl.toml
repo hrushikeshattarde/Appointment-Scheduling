@@ -19,9 +19,10 @@ terminal_ids = [1089]
 booking_customer_ids = [7211]
 
 [mail]
-# The Google Group every pickup thread runs through. Drafts are from it and copy it.
+# The Google Group every pickup thread runs through. Drafts are from it and copy it, and Megan
+# Goodwin, who manages the customer, is copied by name as well.
 group = "lidl@circledelivers.com"
-cc = ["lidl@circledelivers.com"]
+cc = ["lidl@circledelivers.com", "megan.goodwin@circledelivers.com"]
 signature = "Circle Logistics, Inc. | Fort Wayne | 260-208-4500 | lidl@circledelivers.com"
 
 [customer_desk]
