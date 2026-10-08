@@ -53,7 +53,7 @@ CARRIER_KEY = "carrier"
 WATCH_AHEAD = timedelta(days=4)
 WATCH_AFTER = timedelta(days=2)
 _CANCELED = frozenset({"canceled", "cancelled", "void", "voided"})
-_PICKED_UP = frozenset({"delivered", "in transit", "intransit", "completed"})
+PICKED_UP = frozenset({"delivered", "in transit", "intransit", "completed"})
 
 
 class DispatchSource(Protocol):
@@ -114,7 +114,7 @@ def watched(session: Session, now: datetime, settings: Settings) -> list[Watch]:
     out: list[Watch] = []
     query = select(BookingCase).where(BookingCase.status == CaseStatus.SCHEDULED.value)
     for case in session.scalars(query):
-        if (str((case.tpro_seen or {}).get("load_status") or "")).lower() in _PICKED_UP:
+        if (str((case.tpro_seen or {}).get("load_status") or "")).lower() in PICKED_UP:
             continue
         _, at = booked_slot(case)
         if at is None or not (now - WATCH_AFTER <= at <= now + WATCH_AHEAD):

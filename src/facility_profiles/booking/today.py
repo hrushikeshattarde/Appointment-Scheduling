@@ -40,6 +40,7 @@ URGENCY: tuple[str, ...] = (
     ExceptionType.EMAIL_BOUNCED.value,
     ExceptionType.WORK_IN_OFFERED.value,
     ExceptionType.CARRIER_MISSING.value,
+    ExceptionType.CARRIER_STEPS.value,
     ExceptionType.ETA_REQUESTED.value,
     ExceptionType.PICKUP_EXPIRED.value,
     ExceptionType.LOAD_INFEASIBLE.value,

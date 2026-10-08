@@ -8,7 +8,10 @@ filed for it from what the desk wrote:
 - ``max_days_ahead``: how far ahead it books at all;
 - ``required_refs``: the numbers it needs besides the PO. Morgan Foods wants Lidl's TI shipment
   number; RLS wants Lidl's SO number. The agent cannot produce them, so a person adds them to the
-  case (``booking ref``).
+  case (``booking ref``);
+- ``carrier_steps``: what the carrier must do once the pickup is booked. Morgan Foods refuses a
+  driver not registered in its gate system, which opens 48 hours before the pickup. A booked
+  pickup raises them for a person to pass on (``booking/steps.py``).
 
 Before a request is drafted the agent checks them. Too early is a wait, with nothing for a person
 to do. Past the cut-off or the notice is raised as ``slot_unworkable``, a missing number as
@@ -76,6 +79,8 @@ class VendorProfile:
     cutoff_time: str | None = None
     max_days_ahead: int | None = None
     required_refs: list[str] = field(default_factory=list)
+    # What the carrier must do once booked: [{"step": "...", "hours_before": 48 | None}].
+    carrier_steps: list[dict[str, Any]] = field(default_factory=list)
     # The facility's opening spans: [{"days": ["mon", ...], "open": "HH:MM", "close": "HH:MM"}].
     hours: list[dict[str, Any]] | None = None
 
@@ -115,6 +120,7 @@ def vendor_profile(repo: Repository, key: str) -> VendorProfile:
         cutoff_time=trusted("cutoff_time"),
         max_days_ahead=trusted("max_days_ahead"),
         required_refs=list(trusted("required_refs") or []),
+        carrier_steps=[s for s in trusted("carrier_steps") or [] if isinstance(s, dict)],
         hours=_spans(trusted("receiving_hours")),
     )
 

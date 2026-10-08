@@ -1,6 +1,6 @@
 """Timers: what the agent raises on its own as time passes.
 
-Two clocks run over the cases still being booked (:func:`sweep`; ``booking timers`` and
+The clocks run over the cases still being booked (:func:`sweep`; ``booking timers`` and
 ``booking today`` run it, and ``serve`` runs it every few minutes):
 
 - **No reply.** Once a request (or any later message) has gone to the vendor and nothing has
@@ -17,6 +17,8 @@ Two clocks run over the cases still being booked (:func:`sweep`; ``booking timer
   its desk's rules again (``booking/rules.py``): a cut-off or notice that passed overnight is
   raised as ``slot_unworkable``, a number the desk now requires as ``missing_reference``; a
   case still waiting for a desk takes the one the profile has since learned.
+- **The carrier's steps.** A booked pickup at a facility that sets the carrier a task (gate
+  registration) raises it for a person to pass on (``booking/steps.py``).
 
 Each raise remembers what started its clock (the message that went unanswered, the slot that
 passed), so a person's resolution sticks: the same silence or the same slot is never raised
@@ -247,6 +249,12 @@ def sweep(session: Session, *, now: datetime, settings: Settings | None = None) 
     result = SweepResult()
     for case in session.scalars(stmt):
         check_case(session, case, now=now, result=result, settings=settings)
+    # The steps read the carrier the scan saw (booking/coverage.py), which reads these timers.
+    from facility_profiles.booking.steps import sweep_steps  # noqa: PLC0415
+
+    steps = sweep_steps(session, now=now)
+    result.raised += steps.raised
+    result.resolved += steps.resolved
     if result.raised or result.resolved:
         log.info("booking.timers", **result.counts())
     return result

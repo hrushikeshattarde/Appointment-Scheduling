@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -43,6 +44,11 @@ _FALSE = {"false", "no", "0"}
 # Wall-clock times as people write them: 14:00, 1400, 2 PM, 2:30pm or 14h.
 _CLOCK_RE = re.compile(r"^(\d{1,2})(?::?(\d{2}))?\s*(am|pm|a\.m\.|p\.m\.|h)?$", re.IGNORECASE)
 MAX_DAYS_AHEAD_LIMIT = 60
+# A carrier step: "48h before: register the driver ..." opens 48 hours before the pickup.
+_STEP_OPENS_RE = re.compile(r"^(\d{1,3})\s*h(?:ours?|rs?)?\s+before\s*[:\-]\s*(.+)$", re.I)
+_STEP_SPLIT_RE = re.compile(r"\r?\n|\s\|\s")
+MAX_STEPS = 5
+MAX_STEP_CHARS = 200
 
 
 @dataclass(frozen=True)
@@ -75,14 +81,13 @@ def coerce(field_name: str, raw: str) -> Any | None:
     if field_name == "notice_period_hours":
         digits = "".join(ch for ch in text if ch.isdigit())
         return int(digits) if digits else None
-    if field_name == "cutoff_time":
-        return coerce_clock(text)
+    special = _COERCERS.get(field_name)
+    if special is not None:
+        return special(text)
     if field_name == "max_days_ahead":
         digits = "".join(ch for ch in text if ch.isdigit())
         days = int(digits) if digits else None
         return days if days is not None and 0 < days <= MAX_DAYS_AHEAD_LIMIT else None
-    if field_name == "required_refs":
-        return coerce_refs(text)
     if field_name == "contact_phone":
         return normalize_phone(text)
     if field_name == "contact_email":
@@ -140,6 +145,43 @@ def coerce_refs(text: str) -> list[str] | None:
         if value not in found:
             found.append(value)
     return sorted(found) or None
+
+
+def coerce_steps(text: str) -> list[dict[str, Any]] | None:
+    """The steps a carrier must take once the pickup is booked, one per line (or "|").
+
+    "48h before: register the driver in the gate system" opens 48 hours before the pickup; a
+    step without it can be done at once. A JSON list of such lines, or of {"step", "hours_before"}
+    objects, is read too. None when there is no step, or one is too long or too many are given.
+    """
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        parsed = None
+    raw: list[Any] = parsed if isinstance(parsed, list) else _STEP_SPLIT_RE.split(text)
+    steps: list[dict[str, Any]] = []
+    for item in raw:
+        if isinstance(item, dict):
+            words, hours = str(item.get("step") or "").strip(), item.get("hours_before")
+        else:
+            words, hours = str(item).strip(), None
+            match = _STEP_OPENS_RE.match(words)
+            if match:
+                hours, words = int(match.group(1)), match.group(2).strip()
+        if not words:
+            continue
+        if len(words) > MAX_STEP_CHARS or (hours is not None and not str(hours).isdigit()):
+            return None
+        steps.append({"step": words, "hours_before": int(hours) if hours is not None else None})
+    return steps if 0 < len(steps) <= MAX_STEPS else None
+
+
+# Fields read by a parser of their own.
+_COERCERS: dict[str, Callable[[str], Any]] = {
+    "cutoff_time": coerce_clock,
+    "required_refs": coerce_refs,
+    "carrier_steps": coerce_steps,
+}
 
 
 def grouping_key(field_name: str, value: Any) -> Any:

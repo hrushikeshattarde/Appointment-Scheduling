@@ -20,6 +20,11 @@ A facility asking for the driver's ETA gets the driver's latest check call or po
 Transport Pro when there is one; a late arrival it will still take, or a pickup it put on hold,
 goes to a person with a to-do of its own.
 
+A question about the carrier or the driver asked before either is on the load waits in Needs
+you, and is answered in the thread once Transport Pro shows them (:meth:`Responder.answer_later`,
+each pass of the agent on its own): tried once for each carrier and driver seen, never while a
+person is writing to the facility about it.
+
 Everything else, and anything that mentions money, is handed to a person: the exception the
 reply raised stays open with the agent's reason added to it. So is any change to a pickup that
 was already booked, and an offer from a facility off Eastern time that named no time zone. A
@@ -47,6 +52,8 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from facility_profiles.booking.automated import AUTOMATED_KINDS
+from facility_profiles.booking.coverage import PICKED_UP
 from facility_profiles.booking.facts import (
     FACT_KEYS,
     FORBIDDEN_TOPICS,
@@ -61,6 +68,7 @@ from facility_profiles.booking.models import (
     BookingCase,
     BookingEvent,
     BookingMessage,
+    CaseException,
     CaseStatus,
     ExceptionType,
 )
@@ -341,6 +349,70 @@ def answer_is_safe(draft: AnswerDraft, facts: dict[str, Any]) -> tuple[bool, str
     return True, "ok"
 
 
+# ------------------------------------------------------------------ waiting for a carrier
+
+# Who hauls the load: the carrier (its name, MC, DOT), the driver (name, cell) or the truck's
+# numbers. Asked before a carrier is on the load, such a question waits for one (answer_later).
+_WHO_HAULS = re.compile(
+    r"\b(?:carrier|trucking|mc|dot|scac)\b"
+    r"|\bdriver'?s?\s+(?:name|phone|cell|number|#|info\w*|contact|details)"
+    r"|\bwho\b[^?.]{0,40}\bdriver\b"
+    r"|\b(?:truck|tractor|trailer)\s*(?:#|number|no\b)",
+    re.I,
+)
+_ASKS_DRIVER = re.compile(r"\bdriver", re.I)
+_ASKS_TRUCK = re.compile(r"\b(?:truck|tractor)\s*(?:#|number|no\b)", re.I)
+_ASKS_TRAILER = re.compile(r"\btrailer\s*(?:#|number|no\b)", re.I)
+# What answering such a question depends on: who Transport Pro shows on the load.
+HAULER_FACTS = (
+    "carrier",
+    "carrier_mc",
+    "carrier_dot",
+    "carrier_phone",
+    "driver_name",
+    "driver_phone",
+    "truck_number",
+    "trailer_number",
+)
+
+
+def about_hauler(question: str) -> bool:
+    """True when the question asks who hauls the load: the carrier, the driver, the truck."""
+    return bool(_WHO_HAULS.search(question))
+
+
+def hauler_seen(facts: dict[str, Any]) -> str:
+    """The carrier, driver and truck in the facts, as one value to tell a change by."""
+    return json.dumps([facts.get(k) for k in HAULER_FACTS], default=str)
+
+
+def hauler_answer(questions: str, facts: dict[str, Any]) -> str | None:
+    """The fixed answer to who hauls the load; None unless the facts hold all that was asked."""
+    carrier = facts.get("carrier")
+    if not carrier:
+        return None
+    ids = ", ".join(
+        f"{label} {facts[key]}"
+        for label, key in (("MC", "carrier_mc"), ("DOT", "carrier_dot"))
+        if facts.get(key)
+    )
+    parts = [f"The carrier is {str(carrier).rstrip('.')}" + (f" ({ids})" if ids else "") + "."]
+    if _ASKS_DRIVER.search(questions):
+        name, phone = facts.get("driver_name"), facts.get("driver_phone")
+        if not name or not phone:
+            return None
+        parts.append(f"The driver is {name}, {phone}.")
+    for asked, key, label in (
+        (_ASKS_TRUCK, "truck_number", "truck"),
+        (_ASKS_TRAILER, "trailer_number", "trailer"),
+    ):
+        if asked.search(questions):
+            if not facts.get(key):
+                return None
+            parts.append(f"The {label} number is {facts[key]}.")
+    return " ".join(parts)
+
+
 # Follow-ups and check-backs one pickup may get; then the no-reply to-dos and a person take over.
 MAX_NUDGES = 3
 
@@ -386,6 +458,15 @@ def raise_questions(
 
 
 # ------------------------------------------------------------------ the responder
+
+
+def _person_wrote_since(case: BookingCase, since: datetime | None) -> bool:
+    """True when someone at Circle wrote in the thread after ``since``: a person is on it."""
+    return any(
+        m.kind == PERSON_MAIL
+        and (since is None or (as_utc(m.sent_at) or as_utc(m.created_at) or since) > since)
+        for m in case.messages
+    )
 
 
 def _fmt(day: str, clock: str | None) -> str:
@@ -893,6 +974,108 @@ class Responder:
             decision=f"They confirmed the pickup{when}. Thank them.",
         )
         return self.act(session, case, reply, self._write(case, reply, result, plan))
+
+    def answer_later(self, session: Session, case: BookingCase) -> BookingMessage | None:
+        """Answer what the facility asked about the carrier or the driver, now there is one.
+
+        The question waits in Needs you (``facility_question``) because no carrier was on the
+        load when it came, and the reply said someone would get back to them. Once Transport Pro
+        shows a carrier, the answer goes in the thread, written for the situation or in fixed
+        words, drafted or sent by the customer's rule like any answer, and the to-do is settled;
+        what it still cannot answer stays for a person. It is tried once for each carrier and
+        driver seen, and not at all while a person is writing to the facility about it.
+        """
+        current = open_exceptions(case, ExceptionType.FACILITY_QUESTION)
+        if not current or self.facts is None or case.status == CaseStatus.CANCELED.value:
+            return None
+        exc = current[-1]
+        asked = [q.strip() for q in str((exc.detail or {}).get("question") or "").split("; ")]
+        asked = [q for q in asked if q]
+        if not any(about_hauler(q) for q in asked):
+            return None
+        if str((case.tpro_seen or {}).get("load_status") or "").lower() in PICKED_UP:
+            return None
+        facts = self._facts(case)
+        if facts.get("carrier_assigned") != "yes":
+            return None
+        seen = hauler_seen(facts)
+        if (exc.detail or {}).get("hauler_seen") == seen:
+            return None
+        exc.detail = {**(exc.detail or {}), "hauler_seen": seen}
+        reply = self._asked_in(case, exc)
+        if reply is None or _person_wrote_since(case, as_utc(exc.raised_at)):
+            return None
+        plan = self._later_plan(case, reply, asked, facts)
+        if plan is None:
+            return None
+        message = self.act(session, case, reply, plan)
+        for left in open_exceptions(case, ExceptionType.FACILITY_QUESTION):
+            left.detail = {**(left.detail or {}), "hauler_seen": seen}  # wait for the next change
+        session.flush()
+        return message
+
+    def _later_plan(
+        self,
+        case: BookingCase,
+        reply: BookingMessage,
+        asked: list[str],
+        facts: dict[str, Any],
+    ) -> ResponsePlan | None:
+        """The answer to questions that waited for a carrier; None when it still has none."""
+        decision = (
+            "Follow up on what they asked earlier: the carrier is on the load now. "
+            "Answer their questions."
+        )
+        plan = ResponsePlan(
+            ResponseIntent.ANSWER_QUESTION,
+            "the carrier is on the load now: answered what they asked before",
+            to_addr=reply.from_addr or case.contact_email,
+            decision=decision,
+        )
+        if self.writer is not None:
+            situation = ReplySituation(
+                intent=plan.intent.value,
+                decision=decision,
+                their_words=reply.body or "",
+                questions=tuple(asked),
+                facts=facts,
+                history=self._history(case),
+            )
+            try:
+                checked = check_reply(self.writer.write(situation), situation)
+            except ExtractionError as exc:
+                log.warning("booking.later_not_written", case=case.id, error=str(exc))
+                checked = None
+            if checked is not None and checked.ok and checked.answered:
+                return replace(
+                    plan,
+                    body=checked.body,
+                    unanswered=tuple(checked.unanswered),
+                    written=True,
+                    reason=f"{plan.reason}; written for the situation",
+                )
+        hauled = [q for q in asked if about_hauler(q)]
+        fixed = hauler_answer(" ".join(hauled), facts)
+        if fixed is None:
+            return None
+        return replace(
+            plan,
+            body=f"{fixed} Thank you!",
+            unanswered=tuple(q for q in asked if q not in hauled),
+        )
+
+    @staticmethod
+    def _asked_in(case: BookingCase, exc: CaseException) -> BookingMessage | None:
+        """The facility's email the question came in: its last before the to-do was raised."""
+        raised = as_utc(exc.raised_at)
+        theirs = [
+            m
+            for m in case.messages
+            if m.direction == "in" and m.kind not in AUTOMATED_KINDS and m.kind != PERSON_MAIL
+        ]
+        before = [m for m in theirs if raised is None or (as_utc(m.created_at) or raised) <= raised]
+        pool = before or theirs
+        return pool[-1] if pool else None
 
     # -- helpers
 

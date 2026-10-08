@@ -124,6 +124,7 @@ from facility_profiles.booking.templates import (
 from facility_profiles.booking.timers import fmt_slot
 from facility_profiles.booking.unmatched import FREE_MAIL, keep_unmatched, settle_unmatched
 from facility_profiles.booking.worklist import (
+    BOOKING_KEEPS,
     QUESTION_SUPERSEDES,
     SLOT_REPLY_SUPERSEDES,
     TIMER_KINDS,
@@ -1001,7 +1002,9 @@ def _booked_in_tpro(session: Session, case: BookingCase, wp: Waypoint, *, confir
     )
     case.status = CaseStatus.SCHEDULED.value
     case.reason = f"booked in Transport Pro: {how}"[:255]
-    resolve_all(session, case, resolution="booked in Transport Pro", by=REFRESH_ACTOR)
+    resolve_all(
+        session, case, resolution="booked in Transport Pro", by=REFRESH_ACTOR, keep=BOOKING_KEEPS
+    )
     _event(
         session,
         case,
@@ -3176,7 +3179,7 @@ def mark_booked(
     )
     case.status = CaseStatus.SCHEDULED.value
     case.reason = (f"booked by {via}" + (f": {note}" if note else ""))[:255]
-    resolve_all(session, case, resolution=f"booked by {via}", by=by)
+    resolve_all(session, case, resolution=f"booked by {via}", by=by, keep=BOOKING_KEEPS)
     _event(
         session,
         case,

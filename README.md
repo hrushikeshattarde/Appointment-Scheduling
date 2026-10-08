@@ -347,6 +347,7 @@ agent when the situation clears or by a person with a note (`booking resolve`):
 | `carrier_dropped` | the carrier's dispatch for a booked pickup was canceled and no other carrier is on the load | a carrier on the load, a person |
 | `carrier_missing` | a booked pickup has no carrier on the load by `FP_BOOKING_CARRIER_BY` (12:00 ET) the business day before | a carrier on the load, a person |
 | `pickup_no_show` | `FP_BOOKING_NO_SHOW_HOURS` (2) after a booked time, Transport Pro shows no arrival at the shipper | an arrival recorded at the shipper, the load picked up, a person |
+| `carrier_steps` | a pickup is booked at a facility whose profile has `carrier_steps` ("Tell the carrier"); raised again when a new carrier replaces the one told | a person passing it on, the pickup moved, canceled, picked up or its time passed (booking it again does not) |
 
 When the agent hands a reply to a person (money, the round cap, no safe answer) the exception
 the reply raised stays open with the agent's reason added to it. A later reply about the slot (a
@@ -684,6 +685,20 @@ With `FP_BOOKING_INBOX` set, each pass also reads the new replies, the way Bigge
   Each clears itself when a carrier is on the load, or the arrival is recorded. The pickup's page
   shows the carrier, and Latest updates shows a carrier put on, changed or dropped. Real trucks
   often arrive hours late, so the no-show to-do is a prompt to check, not a verdict.
+- **Carrier questions answered later**: a facility that asks who the carrier or the driver is
+  before either is on the load gets the rest of its answer and "I will get back to you", and the
+  question waits in Needs you. Each pass of the agent on its own (with Transport Pro to read)
+  checks those questions: once the dispatch shows a carrier, the answer goes in the facility's
+  thread (written for the situation, or "The carrier is X (MC ..., DOT ...)."), drafted or sent by
+  the customer's `replies` rule, and the to-do is settled. It is tried once for each carrier and
+  driver seen, so a carrier with no driver yet sends nothing, and never after someone at Circle
+  wrote in the thread.
+- **What the carrier must do**: a facility's `carrier_steps` (Morgan Foods: register the driver
+  in its Eaigle gate system, no earlier than 48 hours before) raise "Tell the carrier" once the
+  pickup is booked, with the time each step opens on the Eastern clock and the carrier's name
+  once the scan has seen one. A person passes it on and marks it done; a carrier that replaces
+  the one told raises it again. The steps also go on the load's note when the appointment is
+  written to Transport Pro.
 - **Delivery moved under a booked pickup**: when Transport Pro or the customer's desk moves the
   delivery, a booked pickup is checked against it (the booked time plus the drive and loading);
   one that can no longer make it raises "Delivery moved" for a person to ask the facility for an
@@ -834,13 +849,15 @@ set`, the review workbook) because the extractor does not look for them yet:
 | `cutoff_time` | `HH:MM` local, on the business day before the pickup ("2 PM" is accepted) | goes to a person past it (`slot_unworkable`) |
 | `max_days_ahead` | how far ahead the desk books at all | holds the request until then; the case says from which day |
 | `required_refs` | numbers needed besides the PO: `shipment_number`, `sales_order_number`, `bol_number`, `load_number`, `delivery_number` ("TI shipment number", "SO#" are accepted) | raises `missing_reference` until a person adds them, then writes them into the request line: `PO# X / Shipment# 7781234 on 10/01 @ 0900` |
+| `carrier_steps` | what the carrier must do once booked, one step per line or ` \| `; `48h before: ...` says when a step opens (a JSON list is accepted too) | raises `carrier_steps` ("Tell the carrier") on a booked pickup, again for a new carrier, and puts the steps on the load's Transport Pro note |
 
 They are checked when a load is scanned, by `booking draft` and `booking send` (which print the
 cases that wait, and why), and by the timers for requests not sent yet, so a cut-off that passed
 overnight becomes a to-do. A number is added with `booking ref CASE KIND VALUE --by NAME` or "Add
 reference" on the board; the to-do clears once the case has every number its desk needs.
-`scripts/seed_lidl_desk_rules.py` files the two the lidl@ threads stated: Morgan Foods wants
-Lidl's TI shipment number, RLS Lebanon wants Lidl's SO number. A portal desk's to-do names its
+`scripts/seed_lidl_desk_rules.py` files what the lidl@ threads stated: Morgan Foods wants
+Lidl's TI shipment number and its drivers registered in Eaigle, RLS Lebanon wants Lidl's SO
+number. A portal desk's to-do names its
 system and address ("books on opendock (https://...)").
 
 ### Desk memory
@@ -1034,9 +1051,9 @@ extra) for production. Alembic migrations are to be added before the first Postg
 
 Profile fields: `appointment_required`, `booking_method`, `contact_name`, `contact_phone`,
 `contact_email`, `portal_url`, `portal_vendor`, `notice_period_hours`, `cutoff_time`,
-`max_days_ahead`, `required_refs`, `time_granularity`, `receiving_hours`, plus a one-line
-`scheduling_summary`. Mapping to Transport Pro fields is in `domain/rules.py::to_tpro_write`
-(the desk rules go into the appointment notes).
+`max_days_ahead`, `required_refs`, `carrier_steps`, `time_granularity`, `receiving_hours`, plus a
+one-line `scheduling_summary`. Mapping to Transport Pro fields is in
+`domain/rules.py::to_tpro_write` (the desk rules go into the appointment notes).
 
 `portal_vendor` is one of opendock, c3, datadocks, one_network, e2open, blue_yonder, retalix
 (also NCR Power Traffic), costco, unfi, ahold, publix, bozzutos or other. A portal URL names its

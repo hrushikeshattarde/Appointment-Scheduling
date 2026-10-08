@@ -142,6 +142,7 @@ PROFILE_FIELDS: tuple[str, ...] = (
     "cutoff_time",
     "max_days_ahead",
     "required_refs",
+    "carrier_steps",
     "time_granularity",
     "receiving_hours",
 )
@@ -151,8 +152,12 @@ PROFILE_FIELDS: tuple[str, ...] = (
 # - cutoff_time: "HH:MM" local; a request must reach the desk by then on the business day
 #   before the pickup ("appointments for tomorrow by 2 PM");
 # - max_days_ahead: whole days; the desk takes no request earlier than that before the pickup;
-# - required_refs: the ReferenceType values the request must carry besides the PO.
-RULE_FIELDS: frozenset[str] = frozenset({"cutoff_time", "max_days_ahead", "required_refs"})
+# - required_refs: the ReferenceType values the request must carry besides the PO;
+# - carrier_steps: what the carrier must do once the pickup is booked, each step with the hours
+#   before the pickup it opens, if any ([{"step": "register the driver ...", "hours_before": 48}]).
+RULE_FIELDS: frozenset[str] = frozenset(
+    {"cutoff_time", "max_days_ahead", "required_refs", "carrier_steps"}
+)
 
 # Fields whose values must appear verbatim in a source (FR-6).
 VERBATIM_FIELDS: frozenset[str] = frozenset({"contact_phone", "contact_email", "portal_url"})

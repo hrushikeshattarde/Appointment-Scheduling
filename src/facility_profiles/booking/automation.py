@@ -18,7 +18,9 @@ One pass (:func:`run_once`: ``booking run``, or ``serve --autopilot-every``):
    desk's rules are checked first, exactly as for ``booking draft``. A batch that fails leaves
    nothing behind; it is retried an hour later, and after three tries raised as
    ``automation_failed``;
-4. a sent request with no reply gets its one follow-up, unless the rule says not to;
+4. a sent request with no reply gets its one follow-up, unless the rule says not to; and, with
+   Transport Pro to read (``facts``), a question about the carrier or the driver that waited
+   for one is answered once the load has one (``Responder.answer_later``);
 5. with a Transport Pro client (only while FP_BOOKING_TPRO_WRITEBACK is on), the booked pickups
    are written back to their loads (``booking/writeback.py``).
 
@@ -44,6 +46,7 @@ from facility_profiles.booking.models import (
     AutomationJob,
     BookingCase,
     BookingEvent,
+    CaseException,
     CaseStatus,
     ExceptionType,
     JobStatus,
@@ -101,6 +104,7 @@ class RunReport:
     mail_failed: int = 0  # replies that failed (retried on the next pass) or an unreadable inbox
     mail_unmatched: int = 0  # booking mail no pickup matched, kept for a person this pass
     booked_changed: int = 0  # replies that moved, dropped or put off a booked pickup
+    carrier_answered: int = 0  # carrier or driver questions answered once the load had one
     lines: list[str] = field(default_factory=list)
 
     def say(self, case: BookingCase, text: str) -> None:
@@ -389,6 +393,30 @@ def _follow_ups(
         report.say(case, f"follow-up {'sent' if send else 'drafted'} to {message.to_addr}")
 
 
+def _answer_later(session: Session, *, responder: Responder, report: RunReport) -> None:
+    """Answer the carrier and driver questions that waited for a carrier on the load."""
+    waiting = select(CaseException.case_id).where(
+        CaseException.resolved_at.is_(None),
+        CaseException.kind == ExceptionType.FACILITY_QUESTION.value,
+    )
+    cases = session.scalars(
+        select(BookingCase).where(BookingCase.id.in_(waiting)).order_by(BookingCase.id)
+    )
+    for case in list(cases):
+        try:
+            with session.begin_nested():
+                message = responder.answer_later(session, case)
+        except Exception:  # one case that fails must not stop the pass
+            log.exception("booking.answer_later_failed", case=case.id)
+            report.failed += 1
+            continue
+        if message is None:
+            continue
+        report.carrier_answered += 1
+        done = "sent" if message.sent_at is not None else "drafted"
+        report.say(case, f"carrier question answered, {done} to {message.to_addr}")
+
+
 # ------------------------------------------------------------------ one pass
 
 
@@ -580,6 +608,16 @@ def run_once(
     ]
     _execute(session, due, settings=settings, mailer=mailer, sender=sender, now=now, report=report)
     _follow_ups(session, settings=settings, mailer=mailer, sender=sender, now=now, report=report)
+    if facts is not None:
+        later = Responder(
+            settings,
+            mailer,
+            writer=writer,
+            now=now,
+            sender=sender if settings.booking_mode == "send" else None,
+            facts=facts,
+        )
+        _answer_later(session, responder=later, report=report)
     if client is not None and settings.booking_tpro_writeback:
         written = write_appointments(session, settings, client, now=now)
         report.written_to_tpro = written.written

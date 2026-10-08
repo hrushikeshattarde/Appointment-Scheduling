@@ -9,7 +9,11 @@ Two desks will not book a Lidl pickup on the PO alone:
 
 Filed as ``required_refs``: the booking agent then holds the request, raises "Reference needed"
 on the case, and writes the number into the request line once a person adds it (``booking
-ref``). No cut-off or booking horizon was stated by any Lidl vendor, so none is filed. Run after
+ref``). No cut-off or booking horizon was stated by any Lidl vendor, so none is filed.
+
+Morgan Foods also refuses a driver not registered in its Eaigle gate system, which opens 48 hours
+before arrival (the link is in the desk's signature). Filed as ``carrier_steps``: a booked Morgan
+pickup raises "Tell the carrier" with the time registration opens. Run after
 ``seed_lidl_vendor_profiles.py``; re-running is harmless.
 
     python scripts/seed_lidl_desk_rules.py [--dry-run]
@@ -36,6 +40,14 @@ RULES: list[dict[str, str]] = [
             'lidl@ group archive, "Pick Up Appointment" threads (2026): Morgan Foods asks for the '
             'shipment number "given to you by TI", not the PO; "Lidl is usually scheduled through '
             'TI"'
+        ),
+        "carrier_steps": (
+            "48h before: Register the driver in Morgan Foods' Eaigle gate system "
+            "(driverapp.morganfoods.eaigle.ai); a driver not registered is refused entry"
+        ),
+        "carrier_evidence": (
+            'lidl@ group mail "Pick Up Appointments", 24-29 Sep 2026: every driver must register '
+            "in the Eaigle gate system no earlier than 48 hours before arrival or is refused entry"
         ),
     },
     {
@@ -77,20 +89,24 @@ def main() -> None:
     dry_run = "--dry-run" in sys.argv
     for rule in RULES:
         print(f"\n## {rule['name']}")
-        cli(
-            "profile",
-            "set",
-            rule["key"],
-            "shipper",
-            "required_refs",
-            "--value",
-            rule["required_refs"],
-            "--by",
-            BY,
-            "--reason",
-            rule["evidence"],
-            dry_run=dry_run,
-        )
+        filed = [("required_refs", "evidence")]
+        if "carrier_steps" in rule:
+            filed.append(("carrier_steps", "carrier_evidence"))
+        for field, evidence in filed:
+            cli(
+                "profile",
+                "set",
+                rule["key"],
+                "shipper",
+                field,
+                "--value",
+                rule[field],
+                "--by",
+                BY,
+                "--reason",
+                rule[evidence],
+                dry_run=dry_run,
+            )
 
 
 if __name__ == "__main__":

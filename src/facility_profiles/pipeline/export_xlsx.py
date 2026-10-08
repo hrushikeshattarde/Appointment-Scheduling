@@ -81,6 +81,7 @@ FIELD_ORDER = {
     "max_days_ahead": 10,
     "required_refs": 11,
     "time_granularity": 12,
+    "carrier_steps": 13,
 }
 LEGEND = (
     "HOW TO USE: fill in the three yellow columns for each row you can decide. Decision = accept "

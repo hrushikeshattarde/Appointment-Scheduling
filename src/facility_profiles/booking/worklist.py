@@ -180,6 +180,12 @@ KINDS: dict[str, tuple[str, str]] = {
         "agree a new pickup and move the delivery if it no longer works. This clears when "
         "Transport Pro shows the truck arrived.",
     ),
+    "carrier_steps": (
+        "Tell the carrier",
+        "The facility needs the carrier to do this for the booked pickup, or it may turn the "
+        "truck away. Pass it on to the carrier or the driver, or put it on the load's notes in "
+        "Transport Pro, then mark this done. A new carrier on the load raises it again.",
+    ),
     "on_hold": (
         "Pickup on hold",
         "The facility put the pickup or the order on hold. Ask when it will be released, or "
@@ -190,6 +196,8 @@ KINDS: dict[str, tuple[str, str]] = {
 UNANSWERED: frozenset[ExceptionType] = frozenset(
     {ExceptionType.UNANSWERED_24H, ExceptionType.UNANSWERED_48H}
 )
+# What booking the pickup never settles: work that only starts once it is booked.
+BOOKING_KEEPS: frozenset[ExceptionType] = frozenset({ExceptionType.CARRIER_STEPS})
 # Everything the timers raise. Booking the pickup settles all of them.
 TIMER_KINDS: frozenset[ExceptionType] = UNANSWERED | {ExceptionType.PICKUP_EXPIRED}
 # A reply about the slot (a confirmation, an offer, a deferral, a decline) replaces whatever an
@@ -317,9 +325,12 @@ def resolve_all(
     resolution: str,
     by: str = "agent",
     at: datetime | None = None,
+    keep: Iterable[ExceptionType] = (),
 ) -> list[str]:
-    """Resolve every open exception on the case; return the kinds resolved."""
-    return _close(session, case.open_exceptions, resolution=resolution, by=by, at=at)
+    """Resolve every open exception on the case but the kinds kept; return the kinds resolved."""
+    kept = {k.value for k in keep}
+    current = [e for e in case.open_exceptions if e.kind not in kept]
+    return _close(session, current, resolution=resolution, by=by, at=at)
 
 
 def annotate(session: Session, case: BookingCase, note: str) -> CaseException | None:

@@ -18,8 +18,8 @@ Before it writes, the writer reads the load from Transport Pro:
 - after the write the load is read again, so the write is confirmed rather than assumed.
 
 With the appointment, a note goes on the load, once per booking: the time on the Eastern clock,
-the facility's pickup number and the conditions it set (load bars, check-in), which the
-appointment fields have no room for.
+the facility's pickup number, the conditions it set (load bars, check-in) and what the carrier
+must do (``booking/steps.py``), which the appointment fields have no room for.
 
 Every write is recorded on the case (``written_to_tpro``, with what Transport Pro had before) and
 on its job. A failed write is retried after an hour and raised after three tries. An appointment
@@ -44,6 +44,7 @@ from facility_profiles.booking.models import (
     ExceptionType,
     JobStatus,
 )
+from facility_profiles.booking.steps import told_steps
 from facility_profiles.booking.worklist import flag
 from facility_profiles.clock import stamp
 from facility_profiles.config import Settings
@@ -203,6 +204,9 @@ def appointment_note(
     conditions = _conditions(case)
     if conditions:
         lines.append("Facility says: " + "; ".join(conditions) + ".")
+    steps = told_steps(case)
+    if steps:
+        lines.append("Carrier must: " + "; ".join(steps) + ".")
     lines.append(f"Booked by the booking agent, case #{case.id}.")
     return " ".join(lines)[:1000]
 

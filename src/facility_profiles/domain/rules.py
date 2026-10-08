@@ -192,6 +192,9 @@ def to_tpro_write(profile: FacilityProfile) -> TProFacilityWrite:
     refs = _value(profile, "required_refs")
     if refs:
         notes_parts.append("Needs " + ", ".join(str(r).replace("_", " ") for r in refs))
+    steps = [s for s in _value(profile, "carrier_steps") or [] if isinstance(s, dict)]
+    if steps:
+        notes_parts.append("Carrier must: " + "; ".join(str(s.get("step")) for s in steps))
     granularity = _value(profile, "time_granularity")
     if granularity and granularity != "unknown":
         notes_parts.append(f"Gives {granularity} appointment times")

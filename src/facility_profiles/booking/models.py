@@ -83,6 +83,9 @@ class ExceptionType(StrEnum):
     CARRIER_DROPPED = "carrier_dropped"
     CARRIER_MISSING = "carrier_missing"
     PICKUP_NO_SHOW = "pickup_no_show"
+    # Something the carrier must do once the pickup is booked (the facility's ``carrier_steps``,
+    # booking/steps.py): a person passes it on to whoever hauls the load.
+    CARRIER_STEPS = "carrier_steps"
 
 
 class BookingCase(Base):
