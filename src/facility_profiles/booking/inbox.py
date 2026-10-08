@@ -10,10 +10,18 @@ The agent's requests ask for answers at the group (Reply-To), but some facilitie
 mailbox that sent the request, and that mail never reaches the group. So whenever the sending
 mailbox is set up, the mail addressed to it is read too: in the Gmail search beside the groups',
 or, with the archive, from the mailbox beside the archive. An email found in both is read once.
+
+The archive is read with this machine's AWS login, which lapses (an SSO session lasts hours).
+With a Gmail key and the group member's mailbox set up (FP_BOOKING_GMAIL_KEY and
+FP_MAIL_ARCHIVE_GMAIL_USER, else FP_BOOKING_GMAIL_USER), an archive that cannot be read is
+stood in for by the group's mail in that mailbox, the same mail the collector archives
+(:class:`FallbackInbox`); either way the board says what happened and, for a lapsed login, the
+command that renews it.
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -23,6 +31,21 @@ from facility_profiles.booking.mail import GmailReader, InboundMessage
 from facility_profiles.booking.writer import OpenRouterReplyWriter, ReplyWriter
 from facility_profiles.config import Settings
 from facility_profiles.customers import customers
+from facility_profiles.logging import get_logger
+
+log = get_logger(__name__)
+# What boto3 raises when this machine's AWS login is missing or has lapsed.
+_LAPSED_ERRORS = frozenset(
+    {
+        "NoCredentialsError",
+        "PartialCredentialsError",
+        "CredentialRetrievalError",
+        "TokenRetrievalError",
+        "UnauthorizedSSOTokenError",
+        "SSOTokenLoadError",
+    }
+)
+_LAPSED_CODES = frozenset({"ExpiredToken", "ExpiredTokenException", "InvalidClientTokenId"})
 
 
 class Inbox(Protocol):
@@ -68,6 +91,57 @@ class ArchiveInbox:
         return f"the archive s3://{self.bucket}/{self.prefix}".rstrip("/")
 
 
+def aws_login_lapsed(exc: BaseException) -> bool:
+    """True when ``exc`` (or what caused it) says this machine's AWS login is missing or lapsed."""
+    seen: BaseException | None = exc
+    while seen is not None:
+        response = getattr(seen, "response", None)
+        code = (response.get("Error") or {}).get("Code") if isinstance(response, dict) else None
+        if type(seen).__name__ in _LAPSED_ERRORS or code in _LAPSED_CODES:
+            return True
+        if "token has expired" in str(seen).lower():
+            return True
+        seen = seen.__cause__ or seen.__context__
+    return False
+
+
+def mail_problem(exc: BaseException) -> str | None:
+    """Why the mail could not be read, in words for the board, or None (the log has it)."""
+    if not aws_login_lapsed(exc):
+        return None
+    profile = os.environ.get("AWS_PROFILE")
+    how = f"aws sso login --profile {profile}" if profile else "aws sso login"
+    return f"the AWS login on this machine has lapsed; run {how}"
+
+
+@dataclass
+class FallbackInbox:
+    """The archive, stood in for by the group's mail in Gmail when the archive cannot be read.
+
+    Both hold the same mail: the collector archives what the group member's mailbox gets. What
+    happened is kept in ``notes`` for the board.
+    """
+
+    primary: Inbox
+    fallback: Inbox
+    notes: list[str] = field(default_factory=list)
+
+    def fetch(self) -> list[InboundMessage]:
+        """The archive's messages, or the mailbox's when the archive cannot be read."""
+        self.notes = []
+        try:
+            return self.primary.fetch()
+        except Exception as exc:
+            log.warning("booking.archive_unread", error=str(exc))
+            why = mail_problem(exc) or "it could not be read"
+            found = self.fallback.fetch()
+            self.notes.append(f"read from {self.fallback}: {self.primary} was not read ({why})")
+            return found
+
+    def __str__(self) -> str:
+        return str(self.primary)
+
+
 def identity(message: InboundMessage) -> str:
     """One email's identity across sources: its RFC Message-ID, else the source's own id."""
     rfc = (message.rfc_message_id or "").strip().strip("<>").lower()
@@ -84,6 +158,7 @@ class MergedInbox:
 
     sources: list[Inbox]
     problems: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
 
     def fetch(self) -> list[InboundMessage]:
         """Every source's messages, oldest first, each email once (the first source's copy).
@@ -92,6 +167,7 @@ class MergedInbox:
         (:meth:`InboundMessage.looks_like`).
         """
         self.problems = []
+        self.notes = []
         seen: set[str] = set()
         nameless: list[InboundMessage] = []
         out: list[InboundMessage] = []
@@ -103,6 +179,7 @@ class MergedInbox:
                 failed.append(exc)
                 self.problems.append(f"{source}: {exc}")
                 continue
+            self.notes += list(getattr(source, "notes", ()))
             for message in found:
                 if not message.rfc_message_id:
                     if any(
@@ -168,8 +245,13 @@ def inbox_from_settings(settings: Settings) -> Inbox | None:
     key = settings.booking_gmail_key
     if where.startswith("s3://"):
         bucket, _, prefix = where.removeprefix("s3://").strip("/").partition("/")
-        archive = ArchiveInbox(bucket, prefix, settings.booking_inbox_days)
-        direct = direct_query(settings, settings.booking_inbox_days)
+        days = settings.booking_inbox_days
+        archive: Inbox = ArchiveInbox(bucket, prefix, days)
+        member = settings.mail_archive_gmail_user or mailbox
+        groups = group_query(settings, days)
+        if key and member and groups:  # the group's mail in Gmail stands in for the archive
+            archive = FallbackInbox(archive, GmailInbox(Path(key), member, groups))
+        direct = direct_query(settings, days)
         if not (key and mailbox and direct):
             return archive
         return MergedInbox([archive, GmailInbox(Path(key), mailbox, direct)])

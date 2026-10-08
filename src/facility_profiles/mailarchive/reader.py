@@ -66,6 +66,7 @@ def to_inbound(
         references=envelope.get("references") or None,
         unread_files=unread,
         auto_submitted=envelope.get("auto_submitted") or None,
+        via_groups=tuple(str(g).lower() for g in envelope.get("via_groups") or ()),
     )
 
 

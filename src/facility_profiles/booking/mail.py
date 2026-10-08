@@ -64,6 +64,9 @@ class InboundMessage:
     # Auto-Submitted, or what stands in for it (X-Autoreply, Precedence: auto_reply): set on an
     # out-of-office or another message no person wrote.
     auto_submitted: str | None = None
+    # The groups this copy came through (Mailing-list, List-ID): a group that was only in Bcc
+    # is here and nowhere in To or Cc.
+    via_groups: tuple[str, ...] = ()
 
     @property
     def full_text(self) -> str:
@@ -151,6 +154,27 @@ def tidy_text(text: str | None) -> str:
         return ""
     decoded = html.unescape(text) if "&" in text else text
     return _INVISIBLE.sub("", _ODD_SPACES.sub(" ", decoded.replace("\r\n", "\n")))
+
+
+_MAILING_LIST_RE = re.compile(r"(?<![\w.+-])list\s+<?([\w.+-]+@[\w.-]+)>?", re.I)
+_LIST_ID_RE = re.compile(r"<([\w-]+)\.([\w.-]+\.[a-z]{2,})>", re.I)
+
+
+def via_groups_of(headers: dict[str, str]) -> tuple[str, ...]:
+    """The groups a copy came through, from ``Mailing-list`` and ``List-ID``, lower case.
+
+    A group's copy carries them whether the group was in To, Cc or only Bcc: Google Groups
+    writes ``Mailing-list: list Lidl@circledelivers.com`` and
+    ``List-ID: <Lidl.circledelivers.com>``.
+    """
+    found: list[str] = []
+    listed = _MAILING_LIST_RE.search(headers.get("mailing-list") or "")
+    if listed:
+        found.append(listed.group(1).lower())
+    named = _LIST_ID_RE.search(headers.get("list-id") or "")
+    if named:
+        found.append(f"{named.group(1)}@{named.group(2)}".lower())
+    return tuple(dict.fromkeys(found))
 
 
 def auto_submitted_of(headers: dict[str, str]) -> str | None:
@@ -695,4 +719,5 @@ def _from_gmail(
         references=headers.get("references"),
         unread_files=unread,
         auto_submitted=auto_submitted_of(headers),
+        via_groups=via_groups_of(headers),
     )

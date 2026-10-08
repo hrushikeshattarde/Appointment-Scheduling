@@ -37,6 +37,7 @@ from facility_profiles.booking.mail import (
     gmail_body_text,
     split_quoted,
     tidy_text,
+    via_groups_of,
 )
 from facility_profiles.mailarchive import filters
 from facility_profiles.mailarchive.gmail import GmailClient, headers_of, internal_date_iso
@@ -381,6 +382,7 @@ def collect_message(
         "cc": h.get("cc", ""),
         "date": h.get("date"),
         "auto_submitted": auto_submitted_of(h),
+        "via_groups": list(via_groups_of(h)),
         "internal_date": internal,
         "labels": msg.get("labelIds") or [],
         "own_text": own,

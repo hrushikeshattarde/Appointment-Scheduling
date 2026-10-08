@@ -141,7 +141,7 @@ from facility_profiles.booking.worklist import (
 )
 from facility_profiles.booking.writeback import appointment_payload, queue_write
 from facility_profiles.business_days import is_business_day
-from facility_profiles.clock import EASTERN_ZONE, local_to_eastern, slot_text, stamp
+from facility_profiles.clock import EASTERN_ZONE, local_to_eastern, slot_text, stamp, tpro_time
 from facility_profiles.config import Settings
 from facility_profiles.customers import (
     Customer,
@@ -694,6 +694,9 @@ class _Seen:
 
     view: dict[str, Any]
     before: dict[str, Any] | None
+    # When the load last changed in Transport Pro (ISO, UTC): the time its changes are shown at,
+    # not the scan that saw them (a change made overnight is not "this morning's").
+    changed_at: str | None = None
 
     def changed(self, key: str, on_case: Any) -> bool:
         """True when Transport Pro has a new value for ``key`` to put on the case.
@@ -738,7 +741,7 @@ def refresh_case(
     stats = stats if stats is not None else ScanStats()
     if case.status == CaseStatus.CANCELED.value:
         return []
-    seen = _Seen(tpro_view(load, wp, customer), case.tpro_seen)
+    seen = _Seen(tpro_view(load, wp, customer), case.tpro_seen, tpro_time(load.updated_at, now))
     if load_canceled(load):
         done = _refresh_canceled(session, case, seen, now=now, stats=stats)
     elif picked_up(seen.view["load_status"]):
@@ -805,7 +808,14 @@ def _refresh_picked_up(
         resolution=f"picked up: Transport Pro shows the load {status}",
         by=REFRESH_ACTOR,
     )
-    _event(session, case, "picked_up_in_tpro", load_status=status, reason=case.reason)
+    _event(
+        session,
+        case,
+        "picked_up_in_tpro",
+        load_status=status,
+        reason=case.reason,
+        changed_at=seen.changed_at,
+    )
     stats.picked_up += 1
     return ["picked_up"]
 
@@ -835,7 +845,7 @@ def _refresh_booking(
     before = (seen.before or {}).get("appointment_status") or ""
     newly_confirmed = confirmed and before.lower() != "confirmed"
     if case.status in OPEN_STATUSES and (done or newly_confirmed):
-        _booked_in_tpro(session, case, wp, confirmed=confirmed)
+        _booked_in_tpro(session, case, wp, confirmed=confirmed, changed_at=seen.changed_at)
         stats.booked_in_tpro += 1
         done.append("booked")
     return done
@@ -882,6 +892,7 @@ def _refresh_delivery(
         delivery_ref=case.delivery_ref,
         delivery_at=_iso_utc(case.delivery_at_utc),
         reason=f"Transport Pro: delivery {shown}",
+        changed_at=seen.changed_at,
     )
     asked = case.status in (CaseStatus.PENDING.value, CaseStatus.DECLINED.value) or (
         case.status == CaseStatus.UNSCHEDULED.value and has_request(case)
@@ -952,6 +963,7 @@ def _refresh_request(
             previous=previous,
             tender=seen.view["tender"],
             reason=f"Transport Pro's tender is now {stamp(case.tendered_pickup_utc)}",
+            changed_at=seen.changed_at,
         )
         done.append("tender")
     waiting = case.status == CaseStatus.UNSCHEDULED.value and not has_request(case)
@@ -987,7 +999,14 @@ def _refresh_request(
     return done
 
 
-def _booked_in_tpro(session: Session, case: BookingCase, wp: Waypoint, *, confirmed: bool) -> None:
+def _booked_in_tpro(
+    session: Session,
+    case: BookingCase,
+    wp: Waypoint,
+    *,
+    confirmed: bool,
+    changed_at: str | None = None,
+) -> None:
     """The pickup was booked in Transport Pro: schedule the case with the stop's time."""
     appt = wp.appointment_time
     start = appt.open_at if confirmed and appt else None
@@ -1016,6 +1035,7 @@ def _booked_in_tpro(session: Session, case: BookingCase, wp: Waypoint, *, confir
         local=case.confirmed_local,
         pickup_number=case.pickup_number,
         reason=case.reason,
+        changed_at=changed_at,
     )
 
 
@@ -2721,12 +2741,13 @@ def _match_circle_mail(session: Session, message: InboundMessage) -> list[Bookin
 def attach_circle_mail(session: Session, message: InboundMessage, known: Customers) -> int:
     """Keep a Circle person's email on every pickup it is about; how many it was kept on.
 
-    Only mail with the pickup's customer group on it (To or Cc) counts as part of the pickup's
-    conversation; a private note between colleagues is not. The email is kept as sent by a
+    Only mail with the pickup's customer group on it (To or Cc, or only Bcc: the copy came
+    through the group) counts as part of the pickup's conversation; a private note between
+    colleagues is not. The email is kept as sent by a
     person (``PERSON_MAIL``): shown in the pickup's emails, never read as a vendor's reply and
     never counted as the agent's own.
     """
-    on_group = participants(message.to_addr, message.cc_addr)
+    on_group = participants(message.to_addr, message.cc_addr) | set(message.via_groups)
     kept = 0
     for case in _match_circle_mail(session, message):
         group = (known.for_case(case).group or "").strip().lower()

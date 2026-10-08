@@ -33,6 +33,7 @@ from facility_profiles.booking.automation import read_mail
 from facility_profiles.booking.classify import FakeReplyClassifier
 from facility_profiles.booking.inbox import (
     ArchiveInbox,
+    FallbackInbox,
     GmailInbox,
     MergedInbox,
     group_query,
@@ -412,7 +413,9 @@ def test_the_sending_mailbox_is_read_beside_the_group(settings: Settings) -> Non
     assert "to:" + MAILBOX not in (group_query(settings, 2) or "")  # a person's mailbox: group only
     archive = inbox_from_settings(_mailbox(settings, "s3://bucket/mail"))
     assert isinstance(archive, MergedInbox)
-    assert archive.sources[0] == ArchiveInbox("bucket", "mail", 2)
+    # The group's mail in the mailbox stands in for the archive when it cannot be read (gap 36).
+    stand_in = GmailInbox(Path("key.json"), MAILBOX, group_query(settings, 2) or "")
+    assert archive.sources[0] == FallbackInbox(ArchiveInbox("bucket", "mail", 2), stand_in)
     direct = archive.sources[1]
     assert isinstance(direct, GmailInbox) and direct.query == (
         f"(to:{MAILBOX} OR cc:{MAILBOX}) -to:lidl@circledelivers.com -cc:lidl@circledelivers.com "

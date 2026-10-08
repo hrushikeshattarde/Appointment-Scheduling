@@ -306,7 +306,8 @@ def latest_updates(
 
     Every email on a pickup counts, whoever sent it (the vendor, the agent, a person at Circle,
     the customer's desk), at the time it was sent; a change Transport Pro showed counts at the
-    time the board saw it.
+    time Transport Pro gives for it (the load's last change, the dispatch made), or when the
+    board saw it when it gives none.
     """
     since = now - timedelta(days=UPDATES_DAYS)
     domains = {d.lower() for d in internal}
@@ -326,7 +327,7 @@ def latest_updates(
             by_email[key] = _update(line[0], case, pos, source="email", what=line[1], about=line[2])
             rows.append(by_email[key])
         for event in case.events:
-            at = as_utc(event.created_at)
+            at = event_time(event)
             if event.action in LOAD_UPDATES and at is not None and at >= since:
                 said = EVENTS.get(event.action, event.action.replace("_", " "))
                 reason = str((event.detail or {}).get("reason") or "")
@@ -337,6 +338,17 @@ def latest_updates(
     for row in rows:
         row["po"] = ", ".join(row["po"])
     return rows[:UPDATES_SHOWN]
+
+
+def event_time(event: BookingEvent) -> datetime | None:
+    """When an event happened: Transport Pro's own time for a change it shows, else when kept."""
+    kept = as_utc(event.created_at)
+    raw = (event.detail or {}).get("changed_at")
+    try:
+        changed = as_utc(datetime.fromisoformat(str(raw))) if raw else None
+    except ValueError:
+        changed = None
+    return changed if changed is not None and (kept is None or changed <= kept) else kept
 
 
 def _update(

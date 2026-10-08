@@ -178,3 +178,14 @@ def zone_named(word: str | None, facility_zone: str | None) -> str | None:
     ):
         return facility_zone
     return named
+
+
+def tpro_time(moment: datetime | None, now: datetime) -> str | None:
+    """A time Transport Pro gives (a load's last change, a dispatch made), ISO UTC; None past now.
+
+    It stands in for when the scan saw a change: a change made overnight is not this morning's.
+    """
+    if moment is None:
+        return None
+    aware = moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+    return aware.astimezone(UTC).isoformat() if aware <= now else None

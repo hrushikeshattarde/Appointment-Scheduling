@@ -38,11 +38,11 @@ from facility_profiles.booking.models import (
 from facility_profiles.booking.timers import slot_at
 from facility_profiles.booking.worklist import flag, resolve
 from facility_profiles.business_days import previous_business_day
-from facility_profiles.clock import EASTERN_ZONE, slot_text, stamp
+from facility_profiles.clock import EASTERN_ZONE, slot_text, stamp, tpro_time
 from facility_profiles.config import Settings
 from facility_profiles.logging import get_logger
 from facility_profiles.storage.db import session_scope
-from facility_profiles.tpro.models import Dispatch, VoiceAiLoad
+from facility_profiles.tpro.models import Dispatch, VoiceAiLoad, parse_iso
 
 log = get_logger(__name__)
 
@@ -206,7 +206,10 @@ def apply_coverage(
             was = before.get("name") if isinstance(before, dict) else None
             action = "carrier_changed" if was and was != name else "carrier_assigned"
             what = f"{was} replaced by {name}" if action == "carrier_changed" else (name or "")
-            _event(session, case, action, reason=what, carrier=name)
+            made = parse_iso(live.date_created)
+            _event(
+                session, case, action, reason=what, carrier=name, changed_at=tpro_time(made, now)
+            )
     else:
         raised += _uncovered(session, case, coverage, booked=booked, now=now, settings=settings)
     if now >= at + timedelta(hours=settings.booking_no_show_hours):

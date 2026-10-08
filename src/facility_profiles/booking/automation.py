@@ -40,7 +40,7 @@ from sqlalchemy.orm import Session
 
 from facility_profiles.booking.classify import ReplyClassifier
 from facility_profiles.booking.facts import FactsSource
-from facility_profiles.booking.inbox import Inbox
+from facility_profiles.booking.inbox import Inbox, mail_problem
 from facility_profiles.booking.mail import UNCONFIRMED, InboundMessage, Mailer, Sender
 from facility_profiles.booking.models import (
     AutomationJob,
@@ -105,6 +105,10 @@ class RunReport:
     mail_unmatched: int = 0  # booking mail no pickup matched, kept for a person this pass
     booked_changed: int = 0  # replies that moved, dropped or put off a booked pickup
     carrier_answered: int = 0  # carrier or driver questions answered once the load had one
+    # Why the mail could not be read, in words for the board (a lapsed AWS login), and what was
+    # read instead when the archive could not be (inbox.FallbackInbox).
+    mail_problem: str | None = None
+    mail_note: str | None = None
     lines: list[str] = field(default_factory=list)
 
     def say(self, case: BookingCase, text: str) -> None:
@@ -443,8 +447,12 @@ def _read_inbox(
     except Exception as exc:  # an unreadable inbox must not stop the rest of the pass
         log.exception("booking.inbox_failed")
         report.mail_failed += 1
-        report.lines.append(f"inbox: could not read the mail ({exc})")
+        report.mail_problem = mail_problem(exc)
+        report.lines.append(f"inbox: could not read the mail ({report.mail_problem or exc})")
         return
+    for note in getattr(inbox, "notes", ()):  # the archive was stood in for
+        report.mail_note = note
+        report.lines.append(f"inbox: {note}")
     for problem in getattr(inbox, "problems", ()):  # one of several sources failed
         log.warning("booking.inbox_source_failed", problem=problem)
         report.mail_failed += 1

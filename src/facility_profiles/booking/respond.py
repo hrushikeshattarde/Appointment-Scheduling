@@ -96,7 +96,12 @@ from facility_profiles.booking.templates import (
     render,
     vendor_when,
 )
-from facility_profiles.booking.timers import is_vendor_answer, waiting_since, weekday_hours
+from facility_profiles.booking.timers import (
+    NOT_TO_VENDOR,
+    is_vendor_answer,
+    waiting_since,
+    weekday_hours,
+)
 from facility_profiles.booking.worklist import (
     TOPIC_KINDS,
     UNANSWERED,
@@ -105,7 +110,13 @@ from facility_profiles.booking.worklist import (
     open_exceptions,
     resolve,
 )
-from facility_profiles.booking.writer import ReplySituation, ReplyWriter, check_reply
+from facility_profiles.booking.writer import (
+    FOLLOW_UP_LINE,
+    HOLD_LINE,
+    ReplySituation,
+    ReplyWriter,
+    check_reply,
+)
 from facility_profiles.business_days import is_business_day, why_closed
 from facility_profiles.clock import slot_text, stamp, to_eastern
 from facility_profiles.config import Settings
@@ -156,6 +167,8 @@ class ResponsePlan:
     # The facility's questions this reply leaves for a person; they are raised in Needs you.
     unanswered: tuple[str, ...] = ()
     written: bool = False  # the body was written for the situation (and passed its check)
+    # It answered none of their questions, only said someone will get back to them: not a round.
+    holding: bool = False
 
 
 # ------------------------------------------------------------------ facts and feasibility
@@ -209,10 +222,28 @@ def alternative_days(case: BookingCase, settings: Settings, *, now: datetime) ->
 
 
 def rounds_so_far(case: BookingCase) -> int:
-    """The agent's outbound messages in the thread after the first request (not a person's)."""
-    return max(
-        0, sum(1 for m in case.messages if m.direction == "out" and m.kind != PERSON_MAIL) - 1
-    )
+    """The agent's emails to the facility after the first request.
+
+    A person's email, a note to the customer's desk, and a holding reply that answered nothing
+    ("I will get back to you on this") are not a round: a facility that keeps asking what the
+    load cannot answer does not use up the agent's rounds with them.
+    """
+    rounds = [
+        m
+        for m in case.messages
+        if m.direction == "out" and m.kind not in NOT_TO_VENDOR and not is_holding(m)
+    ]
+    return max(0, len(rounds) - 1)
+
+
+def is_holding(message: BookingMessage) -> bool:
+    """A reply that answered none of the facility's questions, only said we will get back."""
+    if message.kind != "answer_question":
+        return False
+    if (message.classification or {}).get("holding"):
+        return True
+    body = message.body or ""  # one written before replies were marked
+    return HOLD_LINE in body and FOLLOW_UP_LINE not in body
 
 
 # ------------------------------------------------------------------ answers to questions
@@ -709,6 +740,7 @@ class Responder:
                 body=checked.body,
                 unanswered=tuple(checked.unanswered),
                 written=True,
+                holding=plan.intent == ResponseIntent.ANSWER_QUESTION and not checked.answered,
                 reason=f"{plan.reason}; written for the situation",
             )
         note = "; ".join(problems)[:200]
@@ -856,6 +888,7 @@ class Responder:
                 subject=subject,
                 body=draft.body,
                 thread_id=draft.thread_id,
+                classification={"holding": True} if plan.holding else {},
             )
             case.messages.append(message)
             session.flush()

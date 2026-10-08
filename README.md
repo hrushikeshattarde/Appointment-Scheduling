@@ -453,7 +453,9 @@ matches replies to cases by thread, PO number or sender, classifies each reply w
 strict-schema model call (confirmed, counter-offer, question, rejected, unrelated), drops any
 date, time or pickup number the reply's own words do not back (link cruft such as
 `115802102660<tel:(580)%20210-2660>` is stripped first, and a quote from the quoted history
-under the reply only ever backs a counter-offer), and moves the case: a confirmation sets the
+under the reply only ever backs a counter-offer; a reply that is only thanks or a pleasantry,
+"Your Welcome" or "No problem, have a great day" over a signature, is unrelated whatever the
+model made of it), and moves the case: a confirmation sets the
 slot in UTC and raises `confirmation_review` (a bare "SET" or a pickup number alone means the
 requested slot; a time alone means the requested date), deferred ("check back Monday") keeps
 waiting, a counter-offer, a question or a decline raises its exception. A "confirmation" of a
@@ -489,7 +491,9 @@ the model second, and every number in the answer must exist on the case; a vendo
 cannot ship gets a drafted note to the customer's inbound desk (its customer file's `[customer_desk]`)
 asking for a new delivery slot; `booking follow-up` nudges a quiet desk once per silence after
 `FP_BOOKING_FOLLOW_UP_HOURS` weekday hours. Replies that mention rates, fees, detention, claims
-or damage, and threads past `FP_BOOKING_MAX_ROUNDS`, go to a person untouched.
+or damage, and threads past `FP_BOOKING_MAX_ROUNDS`, go to a person untouched. A round is one
+of the agent's emails to the facility: a holding reply that answered nothing ("I will get back
+to you on this"), a note to the customer's desk and a person's email are not.
 
 Also from the threads: a desk that serves several shippers (`FP_BOOKING_SHARED_DESKS`, the CCI
 desk by default) is asked "for Koch Foods going to Lidl"; a first-come-first-served shipper
@@ -725,19 +729,27 @@ With `FP_BOOKING_INBOX` set, each pass also reads the new replies, the way Bigge
   agent's mail. It is never read as a vendor's reply, and never counted as the agent's own
   (rounds, the daily cap, the no-reply clock). One sent to the facility after its latest reply
   settles the to-dos that asked a person to answer it (a question, an ETA, a late arrival, a
-  hand-off, an unsent draft); one to the customer's desk or a colleague settles nothing. Mail
-  without the group on it stays private. A
+  hand-off, an unsent draft); one to the customer's desk or a colleague settles nothing. The
+  group only in Bcc counts: the archive keeps the group a copy came through (`Mailing-list`,
+  `List-ID`), for mail archived since the collector's redeploy. Mail without the group on it
+  anywhere stays private; forwarding it to the group puts it on the chain. A
   vendor's confirmation that carries the pickup number already on the load is read as the
   booking itself, not a change, and gives a pickup booked outside the agent its booked time.
 - **Reading the mail onto the board without the agent acting**: `serve --mail-every 15` (with
   `FP_BOOKING_INBOX`) reads the group mail every 15 minutes. Every email is kept on its pickup,
   the vendor's are read so the pickup moves and its to-dos are raised, and nothing is drafted or
-  sent. Today shows when the mail was last read, and a red notice when it could not be. Mail
+  sent. Today shows when the mail was last read, and a red notice when it could not be; a
+  lapsed AWS login is named with the command that renews it (`aws sso login --profile ...`).
+  With a Gmail key and the group member's mailbox set (`FP_BOOKING_GMAIL_KEY`,
+  `FP_MAIL_ARCHIVE_GMAIL_USER`), an archive that cannot be read is stood in for by the group's
+  mail in that mailbox, the same mail the collector archives, and Today says so. Mail
   about a load Transport Pro already shows picked up is kept but not read: it is history, not a
   new to-do.
 - **Latest updates** on Today lists the newest emails, whoever sent them (the vendor, the agent,
   a person at Circle, the customer's desk), and the Transport Pro changes the scan saw (found,
-  delivery or tender moved, booked there, picked up), newest first, over the last two weeks. An
+  delivery or tender moved, booked there, picked up, the carrier), newest first, over the last
+  two weeks. A change shows at the time Transport Pro gives for it (the load's last change, the
+  dispatch made), so one made overnight is not shown as the morning's. An
   email that covered several pickups is one row; each row opens its pickup. Drafts are left
   out: "Not asked yet" counts them.
 - **Mail no pickup matches** is kept for a person (table `booking_unmatched_mail`) when it is

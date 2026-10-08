@@ -35,7 +35,7 @@ from facility_profiles.extraction.openrouter import (
     strict_json_schema,
 )
 
-PROMPT_VERSION = "reply-v8"
+PROMPT_VERSION = "reply-v9"
 
 SYSTEM_PROMPT = """You read one email reply from a shipping facility to a freight broker's pickup \
 appointment request and return a JSON object describing it.
@@ -49,6 +49,9 @@ edited times); "deferred" when they ask you to check back later because the orde
 released or ready yet (put the day to check back in pickup_date); "question" when they need \
 something before booking (order number, PO, carrier name, driver info); "rejected" when they \
 cannot book (order not ready, not in their system, closed that day); "unrelated" otherwise.
+- A reply that only thanks, says "you're welcome" ("Your Welcome"), "no problem" or "have a \
+great day", with no date, time, pickup number or ask, books nothing: it is "unrelated", never \
+"confirmed".
 - A reply about a pickup that was already booked uses the same statuses: moving it to another \
 time is a "counter_offer" (or "confirmed" when they state the new time as set), and no longer \
 being able to ship it is "rejected".
@@ -484,6 +487,10 @@ def validate_classification(
         issues.append(
             ClassificationIssue("questions", "question not in the reply's own words", dropped)
         )
+    if data["status"] != ReplyStatus.UNRELATED and courtesy_only(own):
+        issues.append(ClassificationIssue("status", COURTESY, data["status"]))
+        data.update(status=ReplyStatus.UNRELATED, question=None, questions=[], items=[])
+        kept_items = []
     named = data.get("time_zone")
     if named and not _zone_in_text(str(named), everything):
         issues.append(ClassificationIssue("time_zone", "zone not in the message", named))
@@ -494,6 +501,39 @@ def validate_classification(
         elif not reading.get("reject_reason"):
             reading["reject_reason"] = "other"
     return ReplyClassification.model_validate(data), issues
+
+
+COURTESY = "only thanks or a pleasantry: nothing to book"
+# Thanks, "you're welcome" and sign-off pleasantries: a reply made only of these books nothing.
+_COURTESY_RE = re.compile(
+    r"(?:you\s*'?\s*re|your|ur|you\s+are)\s+(?:very\s+|most\s+)?welcome|no\s+(?:problem|worries)"
+    r"|thank\s*(?:s|you)(?:\s+(?:so|very)\s+much|\s+again|\s+a\s+lot)?|\bthx\b|\bty\b"
+    r"|have\s+a\s+(?:great|good|nice|wonderful|blessed)\s+(?:day|one|weekend|evening|night)"
+    r"|\banytime\b|my\s+pleasure|\b(?:hi|hello)\b",
+    re.I,
+)
+# What a line after the pleasantry may not hold for the reply to stay a pleasantry: a number,
+# or a word about the booking. Names, titles and company names are a signature.
+_BOOKING_WORD_RE = re.compile(
+    r"\d|\b(?:confirm\w*|set|book\w*|schedul\w*|appoint\w*|pick\s*-?\s*up|works?|yes|ok(?:ay)?|"
+    r"fine|time|date|am|pm|cancel\w*|hold|ready|driver|eta|po|load|dock|door|truck|today|"
+    r"tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+    re.I,
+)
+
+
+def courtesy_only(own: str) -> bool:
+    """True when the reply's own words are only thanks or a pleasantry ("Your Welcome").
+
+    Its first line holds nothing but courtesy, and nothing after it is a number or a word about
+    the booking (what is left is a signature). "Thank you!" alone leaves no own words at all.
+    """
+    lines = [line.strip() for line in own.splitlines() if line.strip()]
+    if not lines:
+        return False
+    if re.search(r"[a-z0-9]", _COURTESY_RE.sub(" ", lines[0]), re.I):
+        return False
+    return not any(_BOOKING_WORD_RE.search(line) for line in lines[1:])
 
 
 _WORD_RE = re.compile(r"[a-z0-9#]{3,}")

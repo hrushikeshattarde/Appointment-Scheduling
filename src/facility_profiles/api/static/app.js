@@ -67,6 +67,7 @@ const READING = {
   question: "Vendor asked a question",
   rejected: "Vendor said no",
   deferred: "Vendor will answer later",
+  unrelated: "Nothing to act on",
 };
 // What the agent is doing on its own, in plain words.
 const JOB = {
@@ -508,9 +509,15 @@ async function renderOverview() {
             "div",
             { class: "notice alert", role: "alert" },
             h("span", { class: "dot", "aria-hidden": "true" }),
-            `Could not read the emails at ${clock(mailCheck.at)}, so new ones may be missing. ` +
-              `It tries again every ${plural(mailCheck.every, "minute")}; the reason is in the server's log.`,
+            mailCheck.problem
+              ? `Could not read the emails at ${clock(mailCheck.at)}: ${mailCheck.problem}. ` +
+                  `The next read, every ${plural(mailCheck.every, "minute")}, picks up what was missed.`
+              : `Could not read the emails at ${clock(mailCheck.at)}, so new ones may be missing. ` +
+                  `It tries again every ${plural(mailCheck.every, "minute")}; the reason is in the server's log.`,
           )
+        : null,
+      mailCheck && mailCheck.ok && mailCheck.note
+        ? h("div", { class: "notice", role: "status" }, `Emails ${mailCheck.note}.`)
         : null,
       summary ? summaryBox(summary) : null,
       h(

@@ -216,6 +216,8 @@ def _mail_job(
             "ok": report.mail_failed == 0,
             "read": report.mail_read,
             "by_person": report.mail_by_person,
+            "problem": report.mail_problem,
+            "note": report.mail_note,
         }
 
     return job
