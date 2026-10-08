@@ -180,6 +180,12 @@ KINDS: dict[str, tuple[str, str]] = {
         "agree a new pickup and move the delivery if it no longer works. This clears when "
         "Transport Pro shows the truck arrived.",
     ),
+    "draft_not_sent": (
+        "Send the agent's draft",
+        "The agent wrote an answer to the facility but did not send it, for the reason below. "
+        "It is in the drafts: check it and send it yourself, then mark this done. An email you "
+        "send to the facility in the thread clears this.",
+    ),
     "carrier_steps": (
         "Tell the carrier",
         "The facility needs the carrier to do this for the booked pickup, or it may turn the "
@@ -195,6 +201,17 @@ KINDS: dict[str, tuple[str, str]] = {
 # The vendor's silence: raised by the no-reply timers, cleared by any answer from the vendor.
 UNANSWERED: frozenset[ExceptionType] = frozenset(
     {ExceptionType.UNANSWERED_24H, ExceptionType.UNANSWERED_48H}
+)
+# What an email a person sends to the facility in the thread settles: the to-dos that ask a
+# person to answer the facility (booking/service.py, attach_circle_mail).
+PERSON_REPLY_SETTLES: frozenset[ExceptionType] = frozenset(
+    {
+        ExceptionType.FACILITY_QUESTION,
+        ExceptionType.ETA_REQUESTED,
+        ExceptionType.WORK_IN_OFFERED,
+        ExceptionType.DRAFT_NOT_SENT,
+        ExceptionType.HANDOFF,
+    }
 )
 # What booking the pickup never settles: work that only starts once it is booked.
 BOOKING_KEEPS: frozenset[ExceptionType] = frozenset({ExceptionType.CARRIER_STEPS})

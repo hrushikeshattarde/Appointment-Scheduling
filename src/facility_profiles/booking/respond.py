@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
@@ -53,6 +53,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from facility_profiles.booking.automated import AUTOMATED_KINDS
+from facility_profiles.booking.classify import ClassificationIssue
 from facility_profiles.booking.coverage import PICKED_UP
 from facility_profiles.booking.facts import (
     FACT_KEYS,
@@ -62,7 +63,7 @@ from facility_profiles.booking.facts import (
     read_load_facts,
     with_load,
 )
-from facility_profiles.booking.mail import Mailer, OutboundDraft, Sender
+from facility_profiles.booking.mail import Mailer, OutboundDraft, Sender, deliver
 from facility_profiles.booking.models import (
     PERSON_MAIL,
     BookingCase,
@@ -76,8 +77,8 @@ from facility_profiles.booking.outbox import (
     SendRefusedError,
     address,
     check_send_gate,
-    dispatch,
     is_sender,
+    record_delivery,
 )
 from facility_profiles.booking.rules import vendor_profile
 from facility_profiles.booking.schema import (
@@ -457,6 +458,40 @@ def raise_questions(
     )
 
 
+# ------------------------------------------------------------------ one answer per email
+
+# What goes back to the facility itself; one email answering several pickups carries them all.
+TO_FACILITY = frozenset(
+    {ResponseIntent.ACCEPT_OFFER, ResponseIntent.ASK_ALTERNATIVE, ResponseIntent.ANSWER_QUESTION}
+)
+# How a reply was tied to its pickup, kept on its reading ("tie"): by its email ID, thread or a
+# PO (strong), or only by who sent it (weak). The agent books on its own only on a strong tie.
+STRONG_TIE = "strong"
+WEAK_TIE = "weak"
+_THANKS_RE = re.compile(r"\s*thank you!?\s*$", re.I)
+
+
+def issues_of(reading: dict[str, Any]) -> list[ClassificationIssue]:
+    """The values a stored reading dropped because the reply's words did not back them."""
+    return [
+        ClassificationIssue(str(i.get("field_name")), str(i.get("reason") or ""), i.get("value"))
+        for i in reading.get("issues") or []
+        if isinstance(i, dict)
+    ]
+
+
+def joint_body(planned: list[tuple[BookingCase, BookingMessage | None, ResponsePlan]]) -> str:
+    """One email's words for several pickups' answers: once when they agree, else one per PO."""
+    parts: list[tuple[str, str]] = []
+    for case, _, plan in planned:
+        words = _THANKS_RE.sub("", (plan.body or "").strip()).strip()
+        pos = " & ".join(str(p) for p in case.po_numbers)
+        parts.append((f"PO# {pos}" if pos else f"Load {case.load_id}", words))
+    if len({words for _, words in parts}) == 1:
+        return f"{parts[0][1]} Thank you!"
+    return "\n\n".join(f"{label}: {words}" for label, words in parts) + "\n\nThank you!"
+
+
 # ------------------------------------------------------------------ the responder
 
 
@@ -724,79 +759,151 @@ class Responder:
     ) -> BookingMessage | None:
         """Draft the planned message, record it, move the case and settle what the reply raised."""
         if plan.intent == ResponseIntent.HANDOFF or not plan.body or not plan.to_addr:
-            if annotate(session, case, plan.reason) is None:
-                flag(session, case, ExceptionType.HANDOFF, plan.reason)
-            self._event(session, case, "handoff", reason=plan.reason)
+            self._hand_off(session, case, plan.reason)
             return None
+        return self._deliver(session, [(case, reply, plan)], body=plan.body)[0]
+
+    def act_together(
+        self,
+        session: Session,
+        planned: Sequence[tuple[BookingCase, BookingMessage | None, ResponsePlan]],
+    ) -> list[BookingMessage]:
+        """Act on the plans for one email that covered several pickups: one answer goes back.
+
+        What goes to the facility (accepting an offer, asking for other days, answering) is
+        one email, each pickup's part under its PO when they differ, recorded on every pickup it
+        answers. A note to the customer's desk and a hand-off stay each pickup's own.
+        """
+        together = [
+            (case, reply, plan)
+            for case, reply, plan in planned
+            if plan.intent in TO_FACILITY and plan.body and plan.to_addr and not plan.signed
+        ]
+        if len(together) < 2:
+            together = []
+        sent: list[BookingMessage] = []
+        for case, reply, plan in planned:
+            if not any(case is c for c, _, _ in together):
+                message = self.act(session, case, reply, plan)
+                sent += [message] if message is not None else []
+        if together:
+            sent += [m for m in self._deliver(session, together, body=joint_body(together)) if m]
+        return sent
+
+    def _hand_off(self, session: Session, case: BookingCase, reason: str) -> None:
+        if annotate(session, case, reason) is None:
+            flag(session, case, ExceptionType.HANDOFF, reason)
+        self._event(session, case, "handoff", reason=reason)
+
+    def _deliver(
+        self,
+        session: Session,
+        planned: list[tuple[BookingCase, BookingMessage | None, ResponsePlan]],
+        *,
+        body: str,
+    ) -> list[BookingMessage | None]:
+        """Draft or send one email for the plans, record it on each case and settle each.
+
+        An email the send gate refuses for any of its pickups is kept as a draft, and each
+        pickup gets ``draft_not_sent`` pointing at it: a note added to another to-do could be
+        settled with it, and the draft would be left with nothing in Needs you pointing to it.
+        """
+        case, reply, plan = planned[0]
         subject = self._subject(case, reply, plan)
         escalation = plan.intent == ResponseIntent.ESCALATE_TO_CUSTOMER
         customer = customer_of(case, self.settings)
         outbox = self._outbox(case, plan.intent)
         signature = customer.signature or self.settings.booking_signature
         draft = OutboundDraft(
-            to_addr=plan.to_addr,
+            to_addr=plan.to_addr or "",
             cc_addr=customer.cc_header,
             from_addr=customer.sender,
             reply_to=customer.group,
             subject=subject,
-            body=plan.body if escalation or plan.signed else f"{plan.body}\n\n{signature}",
+            body=body if escalation or plan.signed else f"{body}\n\n{signature}",
             thread_id=None if escalation else case.thread_id,
             # A new thread to the customer desk answers nothing; everything else answers the
             # vendor's message by its RFC Message-ID so the next reply threads back to the case.
             in_reply_to=None if escalation or reply is None else reply.rfc_message_id,
             references=None if escalation or reply is None else reply.references_header,
         )
-        refused = (
-            self._refused(session, case, reply, draft, plan.intent) if is_sender(outbox) else None
-        )
+        refused = None
+        if is_sender(outbox):
+            refused = next(
+                (
+                    why
+                    for c, r, p in planned
+                    if (why := self._refused(session, c, r, draft, p.intent)) is not None
+                ),
+                None,
+            )
         if refused is not None:
             if is_sender(self.mailer):  # nowhere to keep a draft: a person takes it from here
-                return self.act(
+                for c, _, _ in planned:
+                    self._hand_off(session, c, f"not sent: {refused}")
+                return [None] * len(planned)
+            outbox = self.mailer
+        delivery = deliver(outbox, draft)
+        together = [c.id for c, _, _ in planned] if len(planned) > 1 else []
+        messages: list[BookingMessage | None] = []
+        for case, reply, plan in planned:
+            message = BookingMessage(
+                case_id=case.id,
+                direction="out",
+                kind=plan.intent.value,
+                to_addr=draft.to_addr,
+                cc_addr=draft.cc_addr,
+                subject=subject,
+                body=draft.body,
+                thread_id=draft.thread_id,
+            )
+            case.messages.append(message)
+            session.flush()
+            record_delivery(session, case, message, draft, delivery)
+            if refused is not None:
+                flag(
                     session,
                     case,
-                    reply,
-                    ResponsePlan(ResponseIntent.HANDOFF, f"not sent: {refused}"),
+                    ExceptionType.DRAFT_NOT_SENT,
+                    f"the agent's answer to {draft.to_addr} was not sent ({refused}); it is in "
+                    "the drafts"[:255],
+                    draft_ref=delivery.ref,
+                    reason=refused,
                 )
-            outbox = self.mailer
-        message = BookingMessage(
-            case_id=case.id,
-            direction="out",
-            kind=plan.intent.value,
-            to_addr=draft.to_addr,
-            cc_addr=draft.cc_addr,
-            subject=subject,
-            body=draft.body,
-            thread_id=draft.thread_id,
-        )
-        case.messages.append(message)
-        session.flush()
-        delivery = dispatch(session, case, message, outbox, draft)
-        ref = delivery.ref
-        if refused is not None:
-            note = f"the agent's answer was not sent ({refused}); it is a draft for a person"
-            if annotate(session, case, note) is None:
-                flag(session, case, ExceptionType.HANDOFF, note[:255])
-            self._event(session, case, "reply_not_sent", reason=refused, draft_ref=ref)
-        self._settle(session, case, plan, sent=delivery.sent)
-        if plan.unanswered:
-            raise_questions(session, case, plan.unanswered, replied=plan.written)
-        session.flush()
-        self._event(
-            session,
-            case,
-            plan.intent.value,
-            reason=plan.reason,
-            to=draft.to_addr,
-            draft_ref=ref,
-            written=plan.written,
-            unanswered=list(plan.unanswered),
-        )
-        return message
+                self._event(session, case, "reply_not_sent", reason=refused, draft_ref=delivery.ref)
+            self._settle(session, case, plan, sent=delivery.sent, reply=reply)
+            if plan.unanswered:
+                raise_questions(session, case, plan.unanswered, replied=plan.written)
+            session.flush()
+            self._event(
+                session,
+                case,
+                plan.intent.value,
+                reason=plan.reason,
+                to=draft.to_addr,
+                draft_ref=delivery.ref,
+                written=plan.written,
+                unanswered=list(plan.unanswered),
+                **({"answered_with": [c for c in together if c != case.id]} if together else {}),
+            )
+            messages.append(message)
+        return messages
 
     def _settle(
-        self, session: Session, case: BookingCase, plan: ResponsePlan, *, sent: bool
+        self,
+        session: Session,
+        case: BookingCase,
+        plan: ResponsePlan,
+        *,
+        sent: bool,
+        reply: BookingMessage | None = None,
     ) -> None:
-        """Move the case for the answer that went out (or was drafted) and settle its to-do."""
+        """Move the case for the answer that went out (or was drafted) and settle its to-do.
+
+        An offer the agent accepted is booked by it only on the same checks as a confirmation:
+        the reply's words back the time, it says nothing of money, and it was tied to the
+        request by more than its sender (``reply``'s reading).
+        """
         if plan.intent == ResponseIntent.ACCEPT_OFFER and plan.proposed_local:
             day, _, clock = plan.proposed_local.partition(" ")
             start = local_dt(day, clock or None, case.vendor_timezone).astimezone(UTC)
@@ -827,12 +934,16 @@ class Responder:
             if sent:  # the vendor has the agent's "yes"; book it when the rule says so
                 from facility_profiles.booking.service import auto_confirm  # noqa: PLC0415
 
+                reading = (reply.classification or {}) if reply is not None else {}
                 auto_confirm(
                     session,
                     case,
                     self.settings,
                     now=self._now(),
                     reason=f"the agent accepted the vendor's {plan.proposed_local} and said so",
+                    issues=issues_of(reading),
+                    text=(reply.body or "") if reply is not None else "",
+                    strong=reading.get("tie") == STRONG_TIE,
                 )
         elif plan.intent == ResponseIntent.ASK_ALTERNATIVE:
             case.status = CaseStatus.PENDING.value
@@ -974,6 +1085,27 @@ class Responder:
             decision=f"They confirmed the pickup{when}. Thank them.",
         )
         return self.act(session, case, reply, self._write(case, reply, result, plan))
+
+    def tell_customer(
+        self,
+        session: Session,
+        case: BookingCase,
+        reply: BookingMessage,
+        result: ReplyClassification,
+    ) -> BookingMessage | None:
+        """A booked pickup the facility can no longer ship on its day: the customer's desk hears.
+
+        The same note goes as for a pickup still being booked (``customer_notes`` says draft or
+        send): only a new delivery fixes it. The facility gets no answer and the booking is not
+        moved: *Booked pickup changed* stays open for a person. Nothing goes when the decline is
+        not about the day, mentions money, or the customer has no desk on file.
+        """
+        if result.status != ReplyStatus.REJECTED or FORBIDDEN_TOPICS.search(reply.body or ""):
+            return None
+        plan = self._plan_rejection(case, result, reply.body or "")
+        if plan.intent != ResponseIntent.ESCALATE_TO_CUSTOMER:
+            return None
+        return self.act(session, case, reply, plan)
 
     def answer_later(self, session: Session, case: BookingCase) -> BookingMessage | None:
         """Answer what the facility asked about the carrier or the driver, now there is one.

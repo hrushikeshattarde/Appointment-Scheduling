@@ -307,7 +307,8 @@ def test_replay_of_the_morgan_foods_thread(settings, sessions):
         # Day 4 onwards: a missed pickup, ETAs, securement, "did this get resolved?". A booked
         # pickup's mail is read now, because a facility can move a booking. None of this does:
         # the work-in note ("Latest is 9pm tonight", about a slot already past) and the chaser
-        # become one question for a person; the rest is kept; the booking stands.
+        # become one question for a person; the rest is kept; the booking stands. The pod
+        # answered the chaser three minutes later, so that question is settled by her email.
         responder = Responder(settings, mailer, now=datetime(2026, 9, 29, 13, 0, tzinfo=UTC))
         stats = ingest(
             session, messages[7:], classifier, internal_domains=INTERNAL, responder=responder
@@ -319,7 +320,12 @@ def test_replay_of_the_morgan_foods_thread(settings, sessions):
         assert len(classifier.calls) == calls_so_far + 4
         assert case.status == CaseStatus.SCHEDULED.value
         assert case.confirmed_local == "2026-10-05 09:00"
-        assert open_kinds(case) == ["facility_question"]
+        assert open_kinds(case) == []
+        asked = [e for e in case.exceptions if e.kind == "facility_question"]
+        assert asked and asked[-1].resolved_by == "megan.goodwin@circledelivers.com"
+        assert asked[-1].resolution == (
+            "megan.goodwin@circledelivers.com answered the facility by email"
+        )
         assert [m.kind for m in case.messages if m.direction == "out"].count("acknowledge") == 1
         assert [e.action for e in case.events].count("reply_after_decision") == 2
         assert len([m for m in case.messages if m.direction == "in"]) == 7

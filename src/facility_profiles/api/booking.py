@@ -116,6 +116,7 @@ EVENTS: dict[str, str] = {
     "thanks_held": "No thank-you sent",
     "mail_linked": "Email linked to this pickup",
     "sent_by_person": "Email sent by a person",
+    "answered_by_person": "To-do settled by their email to the facility",
     "send_unconfirmed": "Gmail did not confirm the email went out",
     "email_bounced": "Email sent back by the mail server",
     "auto_reply": "Automatic reply",

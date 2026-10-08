@@ -52,6 +52,7 @@ from facility_profiles.booking.mail import (
     Mailer,
     OutboundDraft,
     Sender,
+    bare_address,
     deliver,
 )
 from facility_profiles.booking.memory import VIA_METHODS, Learned, remember_booking
@@ -87,6 +88,8 @@ from facility_profiles.booking.references import (
     record_reference,
 )
 from facility_profiles.booking.respond import (
+    STRONG_TIE,
+    WEAK_TIE,
     Responder,
     local_dt,
     offer_is_feasible,
@@ -125,6 +128,7 @@ from facility_profiles.booking.timers import fmt_slot
 from facility_profiles.booking.unmatched import FREE_MAIL, keep_unmatched, settle_unmatched
 from facility_profiles.booking.worklist import (
     BOOKING_KEEPS,
+    PERSON_REPLY_SETTLES,
     QUESTION_SUPERSEDES,
     SLOT_REPLY_SUPERSEDES,
     TIMER_KINDS,
@@ -2375,6 +2379,7 @@ def _ingest_reply(  # noqa: PLR0912 - one branch per reply outcome
                 "line_items": len(result.items),
                 "issues": [i.__dict__ for i in case_issues],
                 "model": output.model,
+                "tie": STRONG_TIE if strong else WEAK_TIE,
             },
         )
         case.messages.append(inbound)
@@ -2434,7 +2439,11 @@ def _ingest_reply(  # noqa: PLR0912 - one branch per reply outcome
         elif action == "booked_changed":
             stats.booked_changed += 1
             stats.needs_human += 1
-            continue  # a person settles a change to a booked pickup; the agent says nothing
+            # A person settles a change to a booked pickup and the facility gets no answer; a
+            # pickup it can no longer ship on its day is still the customer's to know about.
+            if responder is not None and responder.tell_customer(session, case, inbound, reading):
+                stats.responded += 1
+            continue
         elif action in (
             "counter_offer",
             "question",
@@ -2462,24 +2471,27 @@ def _answer_once(
 ) -> None:
     """At most one message back for one reply: policy answers first, else a single thanks.
 
+    The answers for every pickup the reply covered go back as one email
+    (:meth:`Responder.act_together`); a note to the customer's desk stays each pickup's own.
     Only a confirmation in ``thank`` is thanked: the time asked for, with nothing in doubt (or
     booked by the agent). A thank-you for a time we did not ask for, or one a person still has
     to check, would tell the facility it is booked.
     """
-    drafted_any = False
+    planned = []
     for case, inbound, reading in answered:
         if reading.status in (
             ReplyStatus.COUNTER_OFFER,
             ReplyStatus.QUESTION,
             ReplyStatus.REJECTED,
         ):
-            plan, drafted = responder.respond(session, case, inbound, reading)
-            if drafted is not None:
-                stats.responded += 1
-                drafted_any = True
+            plan = responder.plan(case, inbound, reading)
+            planned.append((case, inbound, plan))
             log.info(
                 "booking.responded", case=case.id, intent=plan.intent.value, reason=plan.reason
             )
+    drafted = responder.act_together(session, planned)
+    stats.responded += len(drafted)
+    drafted_any = bool(drafted)
     if not drafted_any:
         for case, inbound, reading in answered:
             if reading.status == ReplyStatus.CONFIRMED and case.id in (thank or set()):
@@ -2753,9 +2765,42 @@ def attach_circle_mail(session: Session, message: InboundMessage, known: Custome
             subject=message.subject,
             to=message.to_addr,
         )
+        _answered_by_person(session, case, message)
         kept += 1
     session.flush()
     return kept
+
+
+def _answered_by_person(session: Session, case: BookingCase, message: InboundMessage) -> None:
+    """A person's email to the facility settles the to-dos that asked a person to answer it.
+
+    Only an email to the facility counts (an address at its desk's domain, or of someone there
+    who wrote on the pickup), sent after the facility's latest reply on the pickup: the reply
+    that raised them. A note to the customer's desk or a colleague answers nothing the facility
+    asked, and the facility's newer email may ask something the person has not seen.
+    """
+    replies = [m for m in case.messages if m.direction == "in" and m.kind == "reply"]
+    theirs = {address(case.contact_email)} | {bare_address(m.from_addr) for m in replies}
+    domains = {a.rpartition("@")[2] for a in theirs if "@" in a}
+    to = participants(message.to_addr, message.cc_addr)
+    if not any(a.rpartition("@")[2] in domains for a in to):
+        return
+    sent = as_utc(message.sent_at)
+    stamps = [t for m in replies if (t := as_utc(m.sent_at) or as_utc(m.created_at))]
+    latest = max(stamps, default=None)
+    if sent is None or latest is None or sent < latest:
+        return
+    who = message.from_email or "a person"
+    kinds = resolve(
+        session,
+        case,
+        PERSON_REPLY_SETTLES,
+        resolution=f"{who} answered the facility by email",
+        by=who,
+        at=sent,
+    )
+    if kinds:
+        _event(session, case, "answered_by_person", actor=who, settled=kinds)
 
 
 def _record_after_decision(

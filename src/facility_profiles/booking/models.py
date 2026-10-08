@@ -86,6 +86,9 @@ class ExceptionType(StrEnum):
     # Something the carrier must do once the pickup is booked (the facility's ``carrier_steps``,
     # booking/steps.py): a person passes it on to whoever hauls the load.
     CARRIER_STEPS = "carrier_steps"
+    # The send gate stopped the agent's answer (a desk the profile does not trust, the day's
+    # cap): it is a draft, and this points a person to it (booking/respond.py).
+    DRAFT_NOT_SENT = "draft_not_sent"
 
 
 class BookingCase(Base):

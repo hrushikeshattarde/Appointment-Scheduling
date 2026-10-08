@@ -329,11 +329,12 @@ agent when the situation clears or by a person with a note (`booking resolve`):
 | `slot_unworkable` | the slot passed, is inside the notice window or past the desk's cut-off or notice, or cannot make the delivery | a moved delivery that fixes it, `reschedule`, a person |
 | `confirmation_review` | the vendor confirmed a slot (or the agent accepted its offer) | `approve` (the case becomes scheduled) |
 | `proposed_time_review` | the vendor offered a different time | the agent accepting it or asking for other days, a person |
-| `facility_question` | the vendor asked something | the agent answering it from the case, a person |
+| `facility_question` | the vendor asked something | the agent answering it from the case, a person's email to the facility, a person |
 | `facility_declined` | the vendor cannot book as asked | the pickup asked for again (`reschedule`, a new delivery slot from the customer desk) |
 | `stale_confirmation` | a "confirmation" of a slot already past when the vendor wrote | a person |
 | `delivery_moved` | the customer moved the delivery and nothing re-requested the pickup, or a booked pickup can no longer make the new delivery | a person, or the pickup asked for again |
-| `handoff` | the agent stopped and nothing more specific was open | a person |
+| `handoff` | the agent stopped and nothing more specific was open | a person's email to the facility, a person |
+| `draft_not_sent` | the send gate stopped the agent's answer (a desk the profile does not trust, the daily cap); it is in the drafts ("Send the agent's draft") | a person's email to the facility, a person |
 | `confirmed_outside_window` | the vendor confirmed another day, or a time more than 2 h from the one asked | `approve`, a later reply |
 | `unanswered_24h` | timer: no answer 24 weekday hours after we wrote | any answer from the vendor, a sent follow-up, 48 h replacing it |
 | `unanswered_48h` | timer: still no answer after 48 weekday hours | any answer from the vendor, a person |
@@ -468,7 +469,9 @@ thing: whether the facility moved, dropped or put off the booked pickup. The age
 a booking itself: a new time, a decline or a "check back" puts the case back to pending (declined
 for a decline) and raises `booked_slot_changed` ("Booked pickup changed", with what was booked and
 whether Transport Pro still shows it), which stays open until a person approves a time or marks
-the pickup booked; that writes the new time to Transport Pro in place of the old one. The same
+the pickup booked; that writes the new time to Transport Pro in place of the old one. A decline
+for the day (not ready, no capacity, closed) also gets the note to the customer's desk asking for
+a new delivery, as for a pickup still being booked; the facility gets no answer. The same
 time again is noted, a question is answered as usual, a time already past when they wrote
 ("latest is 9pm tonight") is a question for a person, and anything else is kept. A correction
 that arrives in the same pass as the confirmation it corrects is caught the same way.
@@ -720,7 +723,10 @@ With `FP_BOOKING_INBOX` set, each pass also reads the new replies, the way Bigge
   you!", or a note asking the customer's desk for the PO all count. It shows in the pickup's
   Emails as "Sent by a person", from whom and to whom, in time order with the vendor's and the
   agent's mail. It is never read as a vendor's reply, and never counted as the agent's own
-  (rounds, the daily cap, the no-reply clock). Mail without the group on it stays private. A
+  (rounds, the daily cap, the no-reply clock). One sent to the facility after its latest reply
+  settles the to-dos that asked a person to answer it (a question, an ETA, a late arrival, a
+  hand-off, an unsent draft); one to the customer's desk or a colleague settles nothing. Mail
+  without the group on it stays private. A
   vendor's confirmation that carries the pickup number already on the load is read as the
   booking itself, not a change, and gives a pickup booked outside the agent its booked time.
 - **Reading the mail onto the board without the agent acting**: `serve --mail-every 15` (with
@@ -779,7 +785,9 @@ With `FP_BOOKING_INBOX` set, each pass also reads the new replies, the way Bigge
     customer desk in the file;
   - the daily cap holds.
 
-  An answer the gate refuses is drafted instead, and raised for a person.
+  An answer the gate refuses is drafted instead, and raised as its own to-do, "Send the agent's
+  draft" (`draft_not_sent`), with the reason; it is never only a note on another to-do that the
+  answer then settles.
 - **Booking without a person**: where the rule says `confirm = "auto"`, the agent books a
   confirmation itself: the case becomes scheduled, the desk is remembered, and the slot is
   queued for Transport Pro, exactly as a person's approval. It does so only when nothing is in
@@ -792,7 +800,8 @@ With `FP_BOOKING_INBOX` set, each pass also reads the new replies, the way Bigge
   - a time that still makes the delivery.
 
   Otherwise the approval stays for a person, with the reason on it ("not booked automatically:
-  ..."). An offer the agent accepted is booked once its "yes" has been sent.
+  ..."). An offer the agent accepted is booked once its "yes" has been sent, on the same checks:
+  an offer tied by its sender only, or with a value its words do not back, waits for a person.
 - **Failures**: a reply that fails (the model is down, say) is left for the next pass; an
   unreadable inbox is reported and the rest of the pass goes on.
 
@@ -977,6 +986,9 @@ against the text like the whole reply and dropped when its POs are nowhere in th
 is matched to every case it belongs to (by Message-ID, thread, or PO numbers) and applied line by
 line, a case whose POs the reply never names is left where it was, and at most one message goes
 back for one reply: the conversation policy's answer if there is one, else a single "Thank you!".
+The answers for several pickups go back as one email, recorded on each: once when they say the
+same, else one part per PO ("PO# A: Our load number is 8001."); a note to the customer's desk
+stays each pickup's own.
 
 ### Sending as the agent, and tying replies to requests
 
