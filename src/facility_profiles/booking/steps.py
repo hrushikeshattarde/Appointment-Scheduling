@@ -11,7 +11,9 @@ for a step that cannot be done sooner the time it opens, on the Eastern clock:
   that replaces the one told raises it again, because the new one was never told;
 - cleared on its own when the pickup is moved, canceled or picked up, or its time has passed.
 
-The timers run it (:func:`sweep_steps`, from ``booking/timers.py``). The steps also go on the
+The timers run it (:func:`sweep_steps`, from ``booking/timers.py``) while the after-booking
+checks are on (FP_BOOKING_WATCH_BOOKED, off for now); off, :func:`clear_after_booking` closes
+what they raised. The steps also go on the
 load's note when the appointment is written to Transport Pro (``booking/writeback.py``). Nothing
 is sent to anyone.
 """
@@ -157,6 +159,34 @@ def sweep_steps(session: Session, *, now: datetime) -> StepsResult:
                 profiles[case.facility_key] = vendor_profile(repo, case.facility_key)
             profile = profiles[case.facility_key]
         check_steps(session, case, now=now, profile=profile, result=result)
+    return result
+
+
+# What only the after-booking checks raise (FP_BOOKING_WATCH_BOOKED).
+AFTER_BOOKING = (
+    ExceptionType.CARRIER_STEPS,
+    ExceptionType.CARRIER_MISSING,
+    ExceptionType.CARRIER_DROPPED,
+    ExceptionType.PICKUP_NO_SHOW,
+)
+SWITCHED_OFF = "after-booking checks are off (FP_BOOKING_WATCH_BOOKED)"
+
+
+def clear_after_booking(session: Session, *, now: datetime) -> StepsResult:
+    """With the after-booking checks off, close the to-dos only they raise.
+
+    A booked pickup then stays under Booked.
+    """
+    result = StepsResult()
+    kinds = sorted(k.value for k in AFTER_BOOKING)
+    raised = select(CaseException.case_id).where(
+        CaseException.resolved_at.is_(None), CaseException.kind.in_(kinds)
+    )
+    for case in session.scalars(select(BookingCase).where(BookingCase.id.in_(raised))):
+        for kind in resolve(
+            session, case, AFTER_BOOKING, resolution=SWITCHED_OFF, by=ACTOR, at=now
+        ):
+            result.resolved.append((case.id, kind, SWITCHED_OFF))
     return result
 
 

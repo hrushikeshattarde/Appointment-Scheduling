@@ -687,6 +687,9 @@ With `FP_BOOKING_INBOX` set, each pass also reads the new replies, the way Bigge
   the pickup on hold raises "Pickup on hold" (on a booked pickup, "Booked pickup changed"), and
   neither is answered by the agent. A hold is never read as a decline, so Lidl is not asked to
   move the delivery for it.
+- **After booking (off for now)**: the two checks below run only with `FP_BOOKING_WATCH_BOOKED`
+  on. For now the agent's job ends at the confirmed appointment, so they are off by default, a
+  booked pickup stays under Booked, and any of their to-dos still open are closed.
 - **The truck for a booked pickup**: each scan also reads the dispatch of every booked pickup due
   in the next four days, or past in the last two (one Transport Pro read per load, none while
   the store is held). A carrier's dispatch canceled with nothing in its place raises "Carrier

@@ -124,6 +124,11 @@ class Settings(BaseSettings):
     booking_customer_desk: str | None = None
     booking_max_rounds: int = Field(3, gt=0)
     booking_follow_up_hours: int = Field(24, gt=0)
+    # After booking: the carrier and the truck on a booked pickup (booking/coverage.py: Carrier
+    # dropped, No carrier yet, Truck not seen at pickup) and the carrier's steps (booking/steps.py:
+    # Tell the carrier). Off for now: the agent's job ends at the confirmed appointment, and a
+    # booked pickup stays under Booked. With it off, such to-dos still open are closed.
+    booking_watch_booked: bool = False
     # A booked pickup with no carrier on the load by this time (Eastern) on the business day
     # before it raises "No carrier yet" (booking/coverage.py).
     booking_carrier_by: str = Field("12:00", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")

@@ -54,7 +54,7 @@ GATE = "48h before: Register the driver in the gate system at gate.example.test"
 
 
 def _pilot(settings: Settings) -> Settings:
-    return settings.model_copy(update={"pilot_terminal_ids": [1089]})
+    return settings.model_copy(update={"pilot_terminal_ids": [1089], "booking_watch_booked": True})
 
 
 # ------------------------------------------------------------------ 39. answered once assigned
@@ -311,9 +311,10 @@ def _todo(sessions, case_id: int) -> tuple[list[str], list[str]]:  # type: ignor
         return open_kinds(case), [e.description for e in case.open_exceptions]
 
 
-def _sweep(sessions, at: datetime) -> dict[str, Any]:  # type: ignore[no-untyped-def]
+def _sweep(settings: Settings, sessions, at: datetime) -> dict[str, Any]:  # type: ignore[no-untyped-def]
+    """The timers, with the test's settings (the after-booking checks on, from ``_pilot``)."""
     with session_scope(sessions) as session:
-        return sweep(session, now=at).counts()
+        return sweep(session, now=at, settings=settings).counts()
 
 
 def test_a_booked_pickup_raises_the_carriers_steps_and_again_for_a_new_carrier(
@@ -322,13 +323,13 @@ def test_a_booked_pickup_raises_the_carriers_steps_and_again_for_a_new_carrier(
     settings = _pilot(settings)
     case_id, tpro_ = _booked_with_steps(settings, sessions)
     gate = "Register the driver in the gate system at gate.example.test (not before Tue 09/29 09:00 ET)"
-    assert _sweep(sessions, NOW)["raised"] == {"carrier_steps": 1}
+    assert _sweep(settings, sessions, NOW)["raised"] == {"carrier_steps": 1}
     assert _todo(sessions, case_id) == (["carrier_steps"], [f"Tell the carrier: {gate}"])
-    assert _sweep(sessions, NOW)["raised"] == {}  # once per booked time
+    assert _sweep(settings, sessions, NOW)["raised"] == {}  # once per booked time
     # The scan sees a carrier: the open to-do names it.
     tpro_.dispatches = [DISPATCH]
     scan(tpro_, sessions, settings, days_ahead=7, now=NOW + timedelta(hours=1))  # type: ignore[arg-type]
-    assert _sweep(sessions, NOW + timedelta(hours=1))["raised"] == {}
+    assert _sweep(settings, sessions, NOW + timedelta(hours=1))["raised"] == {}
     assert _todo(sessions, case_id)[1] == [f"Tell Ridgeway Freight LLC: {gate}"]
     # Passed on, then the carrier is replaced: the new one is told.
     with session_scope(sessions) as session:
@@ -339,12 +340,12 @@ def test_a_booked_pickup_raises_the_carriers_steps_and_again_for_a_new_carrier(
         )
     tpro_.dispatches = [CANCELED, {**DISPATCH, "status": "Canceled"}, OTHER]
     scan(tpro_, sessions, settings, days_ahead=7, now=NOW + timedelta(hours=2))  # type: ignore[arg-type]
-    assert _sweep(sessions, NOW + timedelta(hours=2))["raised"] == {"carrier_steps": 1}
+    assert _sweep(settings, sessions, NOW + timedelta(hours=2))["raised"] == {"carrier_steps": 1}
     assert _todo(sessions, case_id)[1] == [
         f"Harbor Road Inc replaced Ridgeway Freight LLC: tell Harbor Road Inc: {gate}"
     ]
     # The pickup time passes: it clears itself.
-    swept = _sweep(sessions, datetime(2026, 10, 1, 13, 5, tzinfo=UTC))
+    swept = _sweep(settings, sessions, datetime(2026, 10, 1, 13, 5, tzinfo=UTC))
     assert swept["resolved"] == {"carrier_steps": 1}
     assert _todo(sessions, case_id)[0] == []
 
@@ -354,12 +355,12 @@ def test_a_moved_pickup_is_told_its_new_time_and_the_note_carries_the_steps(
 ) -> None:
     settings = _pilot(settings)
     case_id, _ = _booked_with_steps(settings, sessions)
-    _sweep(sessions, NOW)
+    _sweep(settings, sessions, NOW)
     with session_scope(sessions) as session:  # the booked time changed on the case
         case = session.get(BookingCase, case_id)
         assert case is not None
         case.confirmed_local = "2026-10-02 10:00"
-    swept = _sweep(sessions, NOW)
+    swept = _sweep(settings, sessions, NOW)
     assert swept["resolved"] == {"carrier_steps": 1} and swept["raised"] == {"carrier_steps": 1}
     with session_scope(sessions) as session:
         case = session.get(BookingCase, case_id)
@@ -371,7 +372,7 @@ def test_a_moved_pickup_is_told_its_new_time_and_the_note_carries_the_steps(
         case = session.get(BookingCase, case_id)
         assert case is not None
         mark_booked(session, case, by="megan", via="phone", local="2026-10-02 10:00")
-    assert _sweep(sessions, NOW)["raised"] == {}  # the same time was told already
+    assert _sweep(settings, sessions, NOW)["raised"] == {}  # the same time was told already
     kinds, said = _todo(sessions, case_id)
     assert kinds == ["carrier_steps"] and "(not before Wed 09/30 10:00 ET)" in said[0]
     with session_scope(sessions) as session:
@@ -385,7 +386,7 @@ def test_a_moved_pickup_is_told_its_new_time_and_the_note_carries_the_steps(
         assert "Carrier must: Register the driver in the gate system" in note
         # Canceled: nothing to pass on.
         case.status = "canceled"
-    assert _sweep(sessions, NOW)["resolved"] == {"carrier_steps": 1}
+    assert _sweep(settings, sessions, NOW)["resolved"] == {"carrier_steps": 1}
 
 
 def test_a_facility_without_steps_raises_nothing_and_the_label_reads_plainly(
@@ -397,7 +398,7 @@ def test_a_facility_without_steps_raises_nothing_and_the_label_reads_plainly(
     scan(tpro_, sessions, settings, days_ahead=7, now=NOW)  # type: ignore[arg-type]
     with session_scope(sessions) as session:
         mark_booked(session, list_cases(session)[0], by="megan", via="phone", local=BOOKED)
-    assert _sweep(sessions, NOW)["raised"] == {}
+    assert _sweep(settings, sessions, NOW)["raised"] == {}
     assert KINDS["carrier_steps"][0] == "Tell the carrier"
     profile = FacilityProfile(
         identity=FacilityIdentity(facility_id=1, candidate_key=None),

@@ -602,8 +602,9 @@ def scan(  # noqa: PLR0912 - one branch per kind of load
         for load in earlier:
             if _refresh_stop(session, settings, load, now=now, stats=stats):
                 stats.rechecked += 1
-    # The truck for each booked pickup: read after the store is let go, like the loads above.
-    if callable(getattr(client, "search_dispatches", None)):
+    # The truck for each booked pickup (when after-booking checks are on): read after the store
+    # is let go, like the loads above.
+    if settings.booking_watch_booked and callable(getattr(client, "search_dispatches", None)):
         watch = watch_coverage(client, sessions, settings, now=now)
         stats.carriers_watched = watch.watched
         stats.carrier_alerts = watch.carrier_alerts

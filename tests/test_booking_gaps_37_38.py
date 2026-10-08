@@ -62,7 +62,7 @@ class Dispatched(FakeTPro):
 
 
 def _settings(settings: Settings) -> Settings:
-    return settings.model_copy(update={"pilot_terminal_ids": [1089]})
+    return settings.model_copy(update={"pilot_terminal_ids": [1089], "booking_watch_booked": True})
 
 
 def _booked(settings: Settings, sessions) -> tuple[int, Dispatched]:  # type: ignore[no-untyped-def]

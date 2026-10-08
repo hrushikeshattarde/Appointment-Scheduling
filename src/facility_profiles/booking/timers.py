@@ -18,7 +18,8 @@ The clocks run over the cases still being booked (:func:`sweep`; ``booking timer
   raised as ``slot_unworkable``, a number the desk now requires as ``missing_reference``; a
   case still waiting for a desk takes the one the profile has since learned.
 - **The carrier's steps.** A booked pickup at a facility that sets the carrier a task (gate
-  registration) raises it for a person to pass on (``booking/steps.py``).
+  registration) raises it for a person to pass on (``booking/steps.py``), when the after-booking
+  checks are on (FP_BOOKING_WATCH_BOOKED); off, the after-booking to-dos still open are closed.
 
 Each raise remembers what started its clock (the message that went unanswered, the slot that
 passed), so a person's resolution sticks: the same silence or the same slot is never raised
@@ -251,9 +252,13 @@ def sweep(session: Session, *, now: datetime, settings: Settings | None = None) 
     for case in session.scalars(stmt):
         check_case(session, case, now=now, result=result, settings=settings)
     # The steps read the carrier the scan saw (booking/coverage.py), which reads these timers.
-    from facility_profiles.booking.steps import sweep_steps  # noqa: PLC0415
+    from facility_profiles.booking.steps import clear_after_booking, sweep_steps  # noqa: PLC0415
 
-    steps = sweep_steps(session, now=now)
+    steps = (
+        sweep_steps(session, now=now)
+        if settings is not None and settings.booking_watch_booked
+        else clear_after_booking(session, now=now)
+    )
     result.raised += steps.raised
     result.resolved += steps.resolved
     if result.raised or result.resolved:
