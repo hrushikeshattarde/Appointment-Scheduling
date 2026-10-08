@@ -245,6 +245,13 @@ def serve(
             "(FP_BOOKING_INBOX; reads only: nothing is drafted or sent); 0, the default, is off"
         ),
     ] = 0,
+    writeback_every: Annotated[
+        float,
+        typer.Option(
+            help="Write each booked pickup's time to its load in Transport Pro every this many "
+            "minutes (needs FP_BOOKING_TPRO_WRITEBACK=true); 0, the default, is off"
+        ),
+    ] = 0,
     scan_customer: Annotated[
         list[str] | None,
         typer.Option(
@@ -300,6 +307,14 @@ def serve(
             "anyone who can reach this address sees every customer"
         )
     _say_loops(settings, timers_every, autopilot_every, mail_every, scan_every, scan_scope)
+    if writeback_every > 0:
+        if not settings.booking_tpro_writeback:
+            typer.echo("--writeback-every needs FP_BOOKING_TPRO_WRITEBACK=true")
+            raise typer.Exit(code=2)
+        typer.echo(
+            f"booked pickups are written to Transport Pro every {writeback_every:g} min "
+            "(the load is read first; a time someone else confirmed is never overwritten)"
+        )
     app_ = create_app(
         settings,
         timers_every=timers_every if timers_every > 0 else None,
@@ -307,6 +322,7 @@ def serve(
         scan_every=scan_every if scan_every > 0 else None,
         scan_scope=scan_scope,
         mail_every=mail_every if mail_every > 0 else None,
+        writeback_every=writeback_every if writeback_every > 0 else None,
     )
     uvicorn.run(app_, host=host, port=port, log_level="warning")
 

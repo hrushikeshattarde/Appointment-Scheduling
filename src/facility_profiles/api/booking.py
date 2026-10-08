@@ -792,6 +792,7 @@ def _detail(
         case, now=now, desks=desk_history(session, case.facility_key), shown_cases=shown
     )
     detail["can_act"] = viewer.admin or viewer.acts(_key(settings)(case))
+    detail["tpro_writeback"] = settings.booking_tpro_writeback
     return detail
 
 

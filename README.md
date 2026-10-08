@@ -582,7 +582,10 @@ never queued twice; a new time replaces a queued one.
 
 `booking writeback` (and each `booking run` pass) writes the queue only while
 `FP_BOOKING_TPRO_WRITEBACK` is on. Until then each booking waits, and the board's "Transport Pro"
-row says to enter it there by hand. With it on, each load is read first:
+row says to enter it there by hand. A board that only reads (`serve --mail-every`, no
+`--autopilot-every`) writes too with `serve --writeback-every 1`: each minute, the bookings
+waiting to be written (Transport Pro is called only when there is one). It refuses to start while
+`FP_BOOKING_TPRO_WRITEBACK` is off. With it on, each load is read first:
 
 | Transport Pro shows | The writer |
 |---|---|
@@ -658,7 +661,10 @@ With `FP_BOOKING_INBOX` set, each pass also reads the new replies, the way Bigge
   the mailbox itself; `FP_BOOKING_INBOX=s3://bucket/prefix` reads the group-mail archive and,
   when the sending mailbox is set up too, the mail sent straight to it without the group (a
   facility that answered the address the request came from). An email found in both is read
-  once, and one source that cannot be read is reported without stopping the other. Each pass
+  once, and one source that cannot be read is reported without stopping the other.
+  `FP_BOOKING_INBOX=ses://trucklists/pickup-booking` reads what Amazon SES saved for
+  booking@circle-analytics.com, the address copied on pickup booking emails (one raw email per
+  object). Each pass
   looks `FP_BOOKING_INBOX_DAYS` back (2). Mail already on a case is skipped by its email ID, so a
   reply is never answered twice, however often the inbox is read.
 - **Attached files are read**: the text of a PDF (with the `pdf` extra), Word (.docx), Excel

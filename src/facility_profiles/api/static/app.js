@@ -1261,11 +1261,13 @@ function offerText(offers) {
 }
 
 // What the agent planned on its own: "Planned: rule 'vendor pickups': draft at Thu 10/01 10:00".
-function jobText(jobs, kind = "request") {
+function jobText(jobs, kind = "request", writeback = false) {
   const job = (jobs || []).filter((j) => j.kind === kind).pop();
   if (!job) return null;
   if (kind === "tpro_write" && job.status === "planned" && /WRITEBACK/.test(job.reason || "")) {
-    return "Not sent to Transport Pro automatically (that is switched off): enter the time there by hand.";
+    return writeback
+      ? "Queued: the agent writes the time to Transport Pro on its next pass."
+      : "Not sent to Transport Pro automatically (that is switched off): enter the time there by hand.";
   }
   return `${JOB[job.status] || cap(job.status)}${job.reason ? `: ${job.reason}` : ""}`;
 }
@@ -1277,7 +1279,7 @@ function moreDetails(d) {
     ["Vendor confirmed", d.confirmed_local ? fmtSlot(d.confirmed_local) : "-"],
     ...(offerText(d.offers) ? [["Times offered by link", offerText(d.offers)]] : []),
     ...(jobText(d.jobs) ? [["The agent's plan", jobText(d.jobs)]] : []),
-    ...(jobText(d.jobs, "tpro_write") ? [["Transport Pro", jobText(d.jobs, "tpro_write")]] : []),
+    ...(jobText(d.jobs, "tpro_write") ? [["Transport Pro", jobText(d.jobs, "tpro_write", d.tpro_writeback)]] : []),
     ["Numbers", numbersText(d.references, true)],
     ["Earlier numbers", numbersText(d.references, false)],
     ["Booked before with", deskHistory(d.desk_history)],

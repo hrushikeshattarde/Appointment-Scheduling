@@ -2,9 +2,11 @@
 
 ``FP_BOOKING_INBOX`` names the source: ``gmail`` (the sending mailbox, FP_BOOKING_GMAIL_USER,
 read with FP_BOOKING_GMAIL_KEY for mail to or copying the customers' groups) or
-``s3://bucket[/prefix]`` (the group-mail archive, ``mailarchive``). Each pass reads the last
-FP_BOOKING_INBOX_DAYS days; mail already on a case is skipped by its email ID, so a reply is
-never answered twice however often the inbox is read.
+``s3://bucket[/prefix]`` (the group-mail archive, ``mailarchive``), or ``ses://bucket/prefix``
+(the mail Amazon SES saves for a circle-analytics.com address such as booking@, the
+common address copied on pickup booking emails).
+Each pass reads the last FP_BOOKING_INBOX_DAYS days; mail already on a case is skipped by its
+email ID, so a reply is never answered twice however often the inbox is read.
 
 The agent's requests ask for answers at the group (Reply-To), but some facilities answer the
 mailbox that sent the request, and that mail never reaches the group. So whenever the sending
@@ -24,7 +26,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from facility_profiles.booking.classify import OpenRouterReplyClassifier, ReplyClassifier
 from facility_profiles.booking.mail import GmailReader, InboundMessage
@@ -89,6 +91,29 @@ class ArchiveInbox:
 
     def __str__(self) -> str:
         return f"the archive s3://{self.bucket}/{self.prefix}".rstrip("/")
+
+
+@dataclass
+class SesInbox:
+    """A circle-analytics.com address's mail, as Amazon SES saved it in S3 (one raw email each)."""
+
+    bucket: str
+    prefix: str
+    days: int
+    reader: Any = field(default=None, repr=False, compare=False)
+
+    def fetch(self) -> list[InboundMessage]:  # pragma: no cover - live AWS
+        """The emails of the last ``days`` days; each object is downloaded once."""
+        from facility_profiles.mailarchive.reader import SesMailReader  # noqa: PLC0415
+        from facility_profiles.mailarchive.store import Store  # noqa: PLC0415
+
+        if self.reader is None:
+            self.reader = SesMailReader(Store(self.bucket, self.prefix))
+        messages: list[InboundMessage] = self.reader.fetch(days=self.days)
+        return messages
+
+    def __str__(self) -> str:
+        return f"the SES mail s3://{self.bucket}/{self.prefix}".rstrip("/")
 
 
 def aws_login_lapsed(exc: BaseException) -> bool:
@@ -243,6 +268,9 @@ def inbox_from_settings(settings: Settings) -> Inbox | None:
         return None
     mailbox = settings.booking_gmail_user
     key = settings.booking_gmail_key
+    if where.startswith("ses://"):
+        bucket, _, prefix = where.removeprefix("ses://").strip("/").partition("/")
+        return SesInbox(bucket, prefix, settings.booking_inbox_days)
     if where.startswith("s3://"):
         bucket, _, prefix = where.removeprefix("s3://").strip("/").partition("/")
         days = settings.booking_inbox_days

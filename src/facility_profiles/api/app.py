@@ -41,6 +41,7 @@ from facility_profiles.config import Settings, get_settings
 
 if TYPE_CHECKING:
     from facility_profiles.booking.automation import RunReport
+    from facility_profiles.booking.writeback import LoadWriter, WriteReport
 from facility_profiles.logging import get_logger
 from facility_profiles.pipeline.collect import identity_from_record
 from facility_profiles.pipeline.digest import render_digest
@@ -169,6 +170,50 @@ def run_scan(
     return stats
 
 
+def run_writeback(
+    sessions: sessionmaker[Session],
+    settings: Settings,
+    client: LoadWriter | None = None,
+    *,
+    now: datetime | None = None,
+) -> WriteReport:
+    """One pass of the Transport Pro writer: each booked pickup's time onto its load.
+
+    Only while FP_BOOKING_TPRO_WRITEBACK is on (booking/writeback.py: the load is read first,
+    a time someone else confirmed is never overwritten, and the write is read back). Transport
+    Pro is called only when a booking is waiting to be written.
+    """
+    from sqlalchemy import func, select  # noqa: PLC0415 - optional loop
+
+    from facility_profiles.booking.models import AutomationJob  # noqa: PLC0415
+    from facility_profiles.booking.writeback import (  # noqa: PLC0415
+        CLOSED,
+        KIND,
+        WriteReport,
+        write_appointments,
+    )
+    from facility_profiles.tpro.client import TransportProClient  # noqa: PLC0415
+
+    if not settings.booking_tpro_writeback:
+        msg = "Transport Pro write-back is off: set FP_BOOKING_TPRO_WRITEBACK=true"
+        raise RuntimeError(msg)
+    if client is None:
+        with session_scope(sessions) as session:
+            waiting = session.scalar(
+                select(func.count())
+                .select_from(AutomationJob)
+                .where(AutomationJob.kind == KIND, AutomationJob.status.not_in(CLOSED))
+            )
+        if not waiting:
+            return WriteReport()
+        with TransportProClient.from_settings(settings, allow_writes=True) as tpro:
+            return run_writeback(sessions, settings, tpro, now=now)
+    with session_scope(sessions) as session:
+        report = write_appointments(session, settings, client, now=now or datetime.now(tz=UTC))
+    log.info("booking.writeback", **report.counts(), lines=report.lines)
+    return report
+
+
 async def _every(minutes: float, name: str, job: Callable[[], object]) -> None:
     """Run ``job`` now and then every ``minutes``; a failed pass is logged, not fatal."""
     while True:
@@ -262,14 +307,16 @@ def create_app(
     scan_every: float | None = None,
     scan_scope: tuple[list[int], list[int]] = ([], []),
     mail_every: float | None = None,
+    writeback_every: float | None = None,
 ) -> FastAPI:
     """Build the application.
 
     With ``timers_every`` (minutes) it also runs the booking timers; with ``autopilot_every``,
     the agent's own pass by each customer's rules; with ``scan_every``, a scan of Transport Pro
     for new pickups over ``scan_scope`` (terminals, customer ids); with ``mail_every``, a read
-    of the customers' group mail onto the board that answers nothing. The last three are off
-    unless asked for.
+    of the customers' group mail onto the board that answers nothing; with ``writeback_every``,
+    each booked pickup's time written to its load (FP_BOOKING_TPRO_WRITEBACK). The last four are
+    off unless asked for.
     """
     settings = settings or get_settings()
     if signin_enabled(settings) and not settings.board_admins:
@@ -289,6 +336,7 @@ def create_app(
         loops: list[tuple[float | None, str, Callable[[], object]]] = [
             (timers_every, "timers", lambda: run_timers(sessions, settings)),
             (autopilot_every, "autopilot", lambda: run_autopilot(sessions, settings)),
+            (writeback_every, "writeback", lambda: run_writeback(sessions, settings)),
         ]
         if mail_every:  # the mail after the loads: a reply can name a pickup the scan just found
             loops.insert(0, (mail_every, "mail", _mail_job(app_, sessions, settings, mail_every)))

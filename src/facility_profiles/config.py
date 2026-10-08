@@ -169,8 +169,9 @@ class Settings(BaseSettings):
     booking_tpro_writeback: bool = False
     # Where the agent reads vendors' replies when it runs on its own (`booking run`, `serve
     # --autopilot-every`): "gmail" (FP_BOOKING_GMAIL_KEY reads FP_BOOKING_GMAIL_USER's mailbox for
-    # the customers' group mail) or "s3://bucket[/prefix]" (the group-mail archive). Not set:
-    # replies are read only by `booking inbox`. Each pass reads this many days back.
+    # the customers' group mail), "s3://bucket[/prefix]" (the group-mail archive) or
+    # "ses://bucket/prefix" (what SES saves for an address such as booking@). Not set: replies are
+    # read only by `booking inbox`. Each pass reads this many days back.
     booking_inbox: str | None = None
     booking_inbox_days: int = Field(2, gt=0, le=30)
 
@@ -235,12 +236,12 @@ class Settings(BaseSettings):
     @field_validator("booking_inbox")
     @classmethod
     def _inbox_source(cls, value: str | None) -> str | None:
-        """Gmail or an S3 archive."""
+        """Gmail, an S3 archive, or an address's SES mail."""
         if value is None or not value.strip():
             return None
         where = value.strip()
-        if where != "gmail" and not where.startswith("s3://"):
-            msg = "FP_BOOKING_INBOX must be gmail or s3://bucket[/prefix]"
+        if where != "gmail" and not where.startswith(("s3://", "ses://")):
+            msg = "FP_BOOKING_INBOX must be gmail, s3://bucket[/prefix] or ses://bucket/prefix"
             raise ValueError(msg)
         return where
 

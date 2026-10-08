@@ -1,5 +1,8 @@
 """Read the archive back as the booking agent's :class:`InboundMessage` objects.
 
+Also the mail Amazon SES saves for a circle-analytics.com address, one raw email per object
+(:class:`SesMailReader`): booking@, the address copied on pickup booking emails.
+
 Attached files are read too (``booking/attachments.py``): the collector stores each one once by
 its content, and the text of those worth reading goes under the email's own words. A file's text
 is kept in memory by its content hash, so a board that reads the last days' mail every few
@@ -10,6 +13,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 from facility_profiles.booking.attachments import (
@@ -20,10 +24,19 @@ from facility_profiles.booking.attachments import (
     triage,
     with_attachments,
 )
-from facility_profiles.booking.mail import InboundMessage, tidy_text
-from facility_profiles.mailarchive.store import MAIL_PREFIX, Store, attachment_key
+from facility_profiles.booking.mail import (
+    InboundMessage,
+    auto_submitted_of,
+    split_quoted,
+    tidy_text,
+    via_groups_of,
+)
+from facility_profiles.mailarchive.collector import parse_raw
+from facility_profiles.mailarchive.store import MAIL_PREFIX, Store, attachment_key, message_key
 
 _CACHE_SIZE = 512
+# What SES writes into a folder when a receiving rule is made for it: not an email.
+SES_SETUP_NOTICE = "AMAZON_SES_SETUP_NOTIFICATION"
 # What each attached file said, by its sha256; None for a file not worth reading.
 _READINGS: OrderedDict[str, Reading | None] = OrderedDict()
 
@@ -104,6 +117,85 @@ def attachment_readings(store: Store, envelope: dict[str, Any]) -> list[Reading]
         if reading is not None:
             out.append(reading)
     return out
+
+
+def raw_to_inbound(raw: bytes, name: str) -> InboundMessage | None:
+    """One email as Amazon SES saved it (the raw RFC822), as the agent sees it.
+
+    ``name`` is the object's name, the email's ID when it carries no Message-ID. SES mail has no
+    Gmail thread: replies are tied by the Message-IDs they answer. None for what is not an email.
+    """
+    parsed = parse_raw(raw)
+    h = parsed.headers
+    if not h.get("from"):
+        return None
+    try:
+        sent_at = parsedate_to_datetime(h.get("date") or "")
+    except (TypeError, ValueError):
+        sent_at = datetime.now(tz=UTC)
+    if sent_at.tzinfo is None:
+        sent_at = sent_at.replace(tzinfo=UTC)
+    readings = [
+        r
+        for part in parsed.attachments
+        if (
+            r := read(
+                Attachment(
+                    str(part["filename"] or "attachment"),
+                    str(part["mime"] or ""),
+                    part["data"],
+                    inline=bool(part.get("inline")),
+                )
+            )
+        )
+        is not None
+    ]
+    own, quoted = split_quoted(parsed.text)
+    body, unread = with_attachments(own, readings)
+    return InboundMessage(
+        message_id=message_key(h.get("message-id"), f"ses-{name}"),
+        thread_id=None,
+        sent_at=sent_at.astimezone(UTC),
+        from_addr=h.get("from", ""),
+        to_addr=h.get("to", ""),
+        cc_addr=h.get("cc", ""),
+        subject=h.get("subject", ""),
+        body=body,
+        in_reply_to=h.get("in-reply-to") or None,
+        quoted=quoted,
+        rfc_message_id=h.get("message-id") or None,
+        references=h.get("references") or None,
+        unread_files=unread,
+        auto_submitted=auto_submitted_of(h),
+        via_groups=via_groups_of(h),
+    )
+
+
+class SesMailReader:
+    """Mail Amazon SES saved under one folder, one raw email per object (``ses://`` inboxes).
+
+    The folder of a circle-analytics.com address such as booking@, copied on booking emails.
+    Each object is read once and remembered; only the last ``days`` days are handed over.
+    """
+
+    def __init__(self, store: Store) -> None:
+        self.store = store
+        self._seen: dict[str, InboundMessage | None] = {}
+
+    def fetch(self, *, days: int = 7, now: datetime | None = None) -> list[InboundMessage]:
+        """The emails under the folder sent in the last ``days`` days, oldest first."""
+        since = (now or datetime.now(tz=UTC)) - timedelta(days=max(1, days))
+        out: list[InboundMessage] = []
+        for key in self.store.list_keys(""):
+            name = key.rpartition("/")[2]
+            if not name or name == SES_SETUP_NOTICE:
+                continue
+            if key not in self._seen:
+                self._seen[key] = raw_to_inbound(self.store.get(key), name)
+            message = self._seen[key]
+            if message is not None and message.sent_at >= since:
+                out.append(message)
+        return sorted(out, key=lambda m: m.sent_at)
 
 
 class S3MailReader:
