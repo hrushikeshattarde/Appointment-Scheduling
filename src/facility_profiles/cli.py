@@ -139,9 +139,14 @@ def _extractor(settings: Settings, *, fake: bool):  # type: ignore[no-untyped-de
             max_tokens=settings.llm_max_tokens,
             base_url=settings.openrouter_base_url,
         )
+    from facility_profiles.claude import claude_client, claude_model
     from facility_profiles.extraction.llm import AnthropicExtractor
 
-    return AnthropicExtractor(settings.llm_model, max_tokens=settings.llm_max_tokens)
+    return AnthropicExtractor(
+        claude_model(settings),
+        max_tokens=settings.llm_max_tokens,
+        client=claude_client(settings),
+    )
 
 
 @app.command()
@@ -1076,14 +1081,12 @@ def booking_inbox(
     ] = True,
 ) -> None:
     """Read replies, match them to cases, classify them, move the cases, draft answers."""
-    from facility_profiles.booking.classify import (
-        FakeReplyClassifier,
-        OpenRouterReplyClassifier,
-        ReplyClassifier,
-    )
+    from facility_profiles.booking.classify import FakeReplyClassifier, ReplyClassifier
+    from facility_profiles.booking.inbox import reader_tools
     from facility_profiles.booking.mail import GmailReader, load_messages_jsonl
     from facility_profiles.booking.schema import ReplyClassification, ReplyStatus
     from facility_profiles.booking.service import ingest
+    from facility_profiles.booking.writer import ReplyWriter
 
     settings = _settings()
     if file is not None:
@@ -1105,33 +1108,29 @@ def booking_inbox(
     else:
         typer.echo("give --file messages.jsonl, --s3 s3://bucket, or --key and --subject for Gmail")
         raise typer.Exit(code=2)
+    model_writer: ReplyWriter | None = None
     if fake:
         classifier: ReplyClassifier = FakeReplyClassifier(
             lambda _ctx: ReplyClassification(status=ReplyStatus.UNRELATED)
         )
-    elif settings.llm_provider == "openrouter" and settings.openrouter_api_key is not None:
-        classifier = OpenRouterReplyClassifier(
-            settings.openrouter_api_key.get_secret_value(),
-            model=settings.llm_model,
-            base_url=settings.openrouter_base_url,
-        )
     else:
-        typer.echo("reply classification needs FP_LLM_PROVIDER=openrouter (or --fake)")
-        raise typer.Exit(code=2)
+        model_reader, model_writer = reader_tools(settings)
+        if model_reader is None:
+            typer.echo(
+                "reply classification needs FP_LLM_PROVIDER=bedrock, anthropic or openrouter "
+                "with its key (or --fake)"
+            )
+            raise typer.Exit(code=2)
+        classifier = model_reader
     responder = None
     with ExitStack() as stack:
         if respond:
             from facility_profiles.booking.mail import LocalDraftMailer
             from facility_profiles.booking.respond import Responder
-            from facility_profiles.booking.writer import OpenRouterReplyWriter
 
             writer = facts = None
-            if not fake and settings.llm_provider == "openrouter" and settings.openrouter_api_key:
-                writer = OpenRouterReplyWriter(
-                    settings.openrouter_api_key.get_secret_value(),
-                    model=settings.llm_model,
-                    base_url=settings.openrouter_base_url,
-                )
+            if not fake:
+                writer = model_writer
                 facts = stack.enter_context(_client(settings))  # the load's facts, read only
             responder = Responder(
                 settings,

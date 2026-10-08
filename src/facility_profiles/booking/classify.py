@@ -15,6 +15,7 @@ from pydantic import ValidationError
 from facility_profiles import __version__
 from facility_profiles.booking.mail import tidy_text
 from facility_profiles.booking.schema import ReplyClassification, ReplyStatus
+from facility_profiles.claude import Client, Effort, structured_call
 from facility_profiles.clock import (
     EASTERN_ZONE,
     LOCAL_WORDS,
@@ -729,6 +730,34 @@ class OpenRouterReplyClassifier:
                 output_tokens=int(usage.get("completion_tokens") or 0),
             ),
             request_id=response.headers.get("x-request-id") or data.get("id"),
+        )
+
+
+class ClaudeReplyClassifier:
+    """The same strict-schema reading through Anthropic's SDK: on Bedrock or Anthropic's API."""
+
+    def __init__(self, client: Client, *, model: str, effort: Effort | None = None) -> None:
+        self.model = model
+        self._client = client
+        self._effort = effort
+        self._schema = strict_json_schema(ReplyClassification)
+
+    def classify(self, context: ReplyContext) -> ClassifierOutput:
+        """One call, schema-valid by construction, then pydantic-validated."""
+        reply = structured_call(
+            self._client,
+            model=self.model,
+            system=SYSTEM_PROMPT,
+            user=render_user_message(context),
+            schema=self._schema,
+            effort=self._effort,
+        )
+        try:
+            result = ReplyClassification.model_validate(reply.data)
+        except ValidationError as exc:
+            raise ExtractionError(f"reply classification invalid: {exc}") from exc
+        return ClassifierOutput(
+            result=result, model=reply.model, usage=reply.usage, request_id=reply.request_id
         )
 
 

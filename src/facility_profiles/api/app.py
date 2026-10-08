@@ -235,7 +235,7 @@ def run_mail(sessions: sessionmaker[Session], settings: Settings) -> RunReport:
         raise RuntimeError(msg)
     classifier, _ = reader_tools(settings)
     if classifier is None:
-        msg = "no reader for the replies: set FP_LLM_PROVIDER=openrouter and its key"
+        msg = "no reader for the replies: set FP_LLM_PROVIDER (bedrock, anthropic or openrouter)"
         raise RuntimeError(msg)
     with session_scope(sessions) as session:
         report = read_mail(session, settings, inbox=inbox, classifier=classifier)

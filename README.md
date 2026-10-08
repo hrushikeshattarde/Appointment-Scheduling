@@ -1119,16 +1119,30 @@ overlapping IDs), `/location/{id}`, `/load/{id}/notes`, `/tracking/note/load/{id
 
 ## LLM
 
-Two providers, selected with `FP_LLM_PROVIDER`:
+Three providers, selected with `FP_LLM_PROVIDER`:
 
 - `anthropic` (default): `extraction/llm.py` calls Claude through the Anthropic SDK with
   structured outputs (`messages.parse` + a Pydantic schema) and a cached system prompt.
+- `bedrock`: the same SDK calls, on Amazon Bedrock (`claude.py`). Requests are signed with this
+  machine's AWS login (the server's IAM role, or `AWS_PROFILE` on a laptop), in
+  `FP_BEDROCK_REGION` (us-east-1). The current Claude models run on Bedrock only through a
+  cross-region inference profile, so `FP_LLM_MODEL=claude-sonnet-5-5` is sent as
+  `us.anthropic.claude-sonnet-5-5` (`FP_BEDROCK_ROUTING=us`; `global` is about 10% cheaper where
+  the account allows it; account 988836287275 refuses it). The role needs `bedrock:InvokeModel`
+  on the inference profile and the foundation model it routes to.
 - `openrouter`: `extraction/openrouter.py` calls the same model through OpenRouter's
   OpenAI-compatible endpoint with a strict JSON-schema `response_format`; set
   `OPENROUTER_API_KEY`. Bare model names such as `claude-opus-5` become
   `anthropic/claude-opus-5`.
 
-Both use `claude-opus-5` by default (`FP_LLM_MODEL`). The model returns candidate values with verbatim quotes that reference
+The booking agent's reply reader and reply writer follow the same setting
+(`booking/inbox.py` `reader_tools`) on `bedrock` and `openrouter`; `anthropic`, the default, reads
+no replies (a board without a model leaves them for a person). On `bedrock` each is one
+structured-output call (`claude.py` `structured_call`) whose JSON must fit the reply schema, at
+`FP_LLM_EFFORT` when set. A refusal, an answer cut off at `max_tokens` or an API failure fails that email, which
+is tried again on the next pass and then kept for a person.
+
+All use `claude-opus-5` by default (`FP_LLM_MODEL`). The model returns candidate values with verbatim quotes that reference
 numbered sources; `extraction/validate.py` drops any quote not found in its source and any
 phone, email or URL not present verbatim (FR-5, FR-6). `--fake-llm` runs the pipeline without
 model calls.

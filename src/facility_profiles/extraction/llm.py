@@ -75,7 +75,7 @@ class AnthropicExtractor:
         model: str = "claude-opus-5",
         *,
         max_tokens: int = 16_000,
-        client: anthropic.Anthropic | None = None,
+        client: anthropic.Anthropic | anthropic.AnthropicBedrock | None = None,
     ) -> None:
         self.model = model
         self.max_tokens = max_tokens

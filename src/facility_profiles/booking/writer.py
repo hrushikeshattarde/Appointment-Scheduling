@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from facility_profiles import __version__
 from facility_profiles.booking.facts import FACT_KEYS, FORBIDDEN_TOPICS
+from facility_profiles.claude import Client, Effort, structured_call
 from facility_profiles.extraction.llm import ExtractionError
 from facility_profiles.extraction.openrouter import (
     DEFAULT_BASE_URL,
@@ -373,6 +374,31 @@ class OpenRouterReplyWriter:
         try:
             return WrittenReply.model_validate(json.loads(content))
         except (json.JSONDecodeError, ValidationError) as exc:
+            raise ExtractionError(f"written reply invalid: {exc}") from exc
+
+
+class ClaudeReplyWriter:
+    """Replies written through Anthropic's SDK (Bedrock or Anthropic's API) in one schema call."""
+
+    def __init__(self, client: Client, *, model: str, effort: Effort | None = None) -> None:
+        self.model = model
+        self._client = client
+        self._effort = effort
+        self._schema = strict_json_schema(WrittenReply)
+
+    def write(self, situation: ReplySituation) -> WrittenReply:
+        """One call; a failure raises ExtractionError and the responder falls back."""
+        reply = structured_call(
+            self._client,
+            model=self.model,
+            system=WRITER_SYSTEM_PROMPT,
+            user=render_situation(situation),
+            schema=self._schema,
+            effort=self._effort,
+        )
+        try:
+            return WrittenReply.model_validate(reply.data)
+        except ValidationError as exc:
             raise ExtractionError(f"written reply invalid: {exc}") from exc
 
 

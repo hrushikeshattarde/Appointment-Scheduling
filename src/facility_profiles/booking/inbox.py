@@ -292,7 +292,21 @@ def inbox_from_settings(settings: Settings) -> Inbox | None:
 
 
 def reader_tools(settings: Settings) -> tuple[ReplyClassifier | None, ReplyWriter | None]:
-    """What reads a reply and writes the answer: the model, when OpenRouter is set up."""
+    """What reads a reply and writes the answer: the model on FP_LLM_PROVIDER.
+
+    Claude on Bedrock through the SDK (``claude.py``), or OpenRouter with its key. ``anthropic``,
+    the default, reads no replies here: a board set up without a model leaves them for a person.
+    """
+    if settings.llm_provider == "bedrock":
+        from facility_profiles.booking.classify import ClaudeReplyClassifier  # noqa: PLC0415
+        from facility_profiles.booking.writer import ClaudeReplyWriter  # noqa: PLC0415
+        from facility_profiles.claude import claude_client, claude_model  # noqa: PLC0415
+
+        client, model = claude_client(settings), claude_model(settings)
+        return (
+            ClaudeReplyClassifier(client, model=model, effort=settings.llm_effort),
+            ClaudeReplyWriter(client, model=model, effort=settings.llm_effort),
+        )
     key = settings.openrouter_api_key
     if settings.llm_provider != "openrouter" or key is None:
         return None, None

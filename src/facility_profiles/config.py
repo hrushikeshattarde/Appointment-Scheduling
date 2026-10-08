@@ -59,9 +59,19 @@ class Settings(BaseSettings):
     )
 
     # --- LLM -----------------------------------------------------------------------------
-    llm_provider: Literal["anthropic", "openrouter"] = "anthropic"
+    # "anthropic" (Anthropic's API), "bedrock" (Claude on Amazon Bedrock, signed with this
+    # machine's AWS login) or "openrouter". On Bedrock FP_LLM_MODEL is sent through a cross-region
+    # inference profile: claude-sonnet-5-5 becomes us.anthropic.claude-sonnet-5-5 (claude.py).
+    llm_provider: Literal["anthropic", "bedrock", "openrouter"] = "anthropic"
     llm_model: str = "claude-opus-5"
     llm_max_tokens: int = Field(16_000, gt=0)
+    # How hard the model thinks on the booking agent's calls (reading a reply, writing an answer):
+    # low, medium, high, xhigh or max. Not set: the model's own default.
+    llm_effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
+    bedrock_region: str = "us-east-1"
+    # Which inference profile carries the model: "us" keeps requests in US regions; "global" may
+    # run them anywhere for about 10% less, where the account's permissions allow it.
+    bedrock_routing: Literal["us", "global"] = "us"
     openrouter_api_key: SecretStr | None = Field(
         default=None, validation_alias=AliasChoices("OPENROUTER_API_KEY")
     )
