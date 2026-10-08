@@ -485,7 +485,8 @@ customer's desk for a new delivery appointment; "we do not have this PO" goes to
 
 The conversation policy (`booking/respond.py`) handles what comes back, still as drafts:
 a counter-offer is accepted when the offered pickup still makes the customer's delivery
-slot (miles at `FP_BOOKING_AVG_MPH` plus `FP_BOOKING_LOAD_HOURS`), otherwise the agent asks for
+slot (miles at `FP_BOOKING_AVG_MPH`, a stop for the rest of each 24 hours past
+`FP_BOOKING_TRANSIT_MILES_PER_DAY`, plus `FP_BOOKING_LOAD_HOURS`), otherwise the agent asks for
 alternatives inside the workable window; a factual question is answered only from data on
 the case (PO numbers, carrier, delivery site and number, load number), by rule first and by
 the model second, and every number in the answer must exist on the case; a vendor that
@@ -551,7 +552,9 @@ When the scan opens a case, `booking/recommend.py` chooses the time to ask for a
 4. **The hours**: with the facility's hours on its profile (`receiving_hours`), a time outside
    them moves to the next opening, or to an hour before closing.
 5. **The delivery**: a time that would arrive after the delivery slot (miles at
-   `FP_BOOKING_AVG_MPH`, plus `FP_BOOKING_LOAD_HOURS`) moves earlier the same day, to the latest
+   `FP_BOOKING_AVG_MPH`, a stop for the rest of each 24 hours once a trip passes
+   `FP_BOOKING_TRANSIT_MILES_PER_DAY` (600: 12 hours at 50 mph), plus `FP_BOOKING_LOAD_HOURS`)
+   moves earlier the same day, to the latest
    that still makes it. It never moves before the facility opens, or, without hours, before
    `FP_BOOKING_EARLIEST_PICKUP_TIME` (05:00).
 

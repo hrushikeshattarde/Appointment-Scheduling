@@ -319,13 +319,13 @@ def test_each_customer_desk_moves_only_its_own_deliveries(two: Settings, session
         assert case is not None and stats.delivery_updates == 1
         assert case.delivery_ref == "NG-778899"
         assert (
-            case.status == CaseStatus.PENDING.value and case.requested_local == "2026-10-02 09:00"
+            case.status == CaseStatus.PENDING.value and case.requested_local == "2026-10-05 09:00"
         )
     # The re-request went to the vendor in its thread, copied to this customer's group.
     again = mailer.drafts[-1]
     assert again.to_addr == "cci@udfinc.com" and again.thread_id == "t-north"
     assert again.cc_addr == "northline@circle.example"
-    assert "Can we please reschedule PO# 4400123456 on 10/02 @ 0900?" in again.body
+    assert "Can we please reschedule PO# 4400123456 on 10/05 @ 0900?" in again.body
 
 
 def test_a_vendor_that_cannot_ship_goes_to_the_case_customers_desk(two: Settings, sessions) -> None:  # type: ignore[no-untyped-def]

@@ -244,7 +244,7 @@ def test_a_moved_delivery_before_any_request_keeps_a_missing_desk_open(settings,
         # Nothing went out, so the next request just asks for the new day; the desk is still
         # missing, so the case is still not draftable.
         assert case.status == CaseStatus.UNSCHEDULED.value
-        assert case.requested_local == "2026-10-02 09:00"
+        assert case.requested_local == "2026-10-05 09:00"
         assert open_kinds(case) == ["missing_method"]
 
 

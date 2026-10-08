@@ -291,14 +291,15 @@ def test_replay_of_the_morgan_foods_thread(settings, sessions):
         assert answer.body is not None and answer.body.startswith(
             "Yes, both orders: PO# 115802102660 & PO# 115802102661."
         )
-        # The confirmation with Outlook cruft books the slot and gets the pod's "Thank you!".
+        # The confirmation with Outlook cruft is read cleanly, but at 600 miles a day 687 miles is
+        # more than a day's drive: Mon 10/05 09:00 misses Tue 10/06 07:30, so no "Thank you!".
         assert stats.proposed == 1 and awaiting_approval(case)
         assert case.confirmed_local == "2026-10-05 09:00" and case.pickup_number == "20463798"
         assert as_utc(case.confirmed_start_utc) == datetime(2026, 10, 5, 13, 0, tzinfo=UTC)
         last_in = [m for m in case.messages if m.direction == "in"][-1]
         assert last_in.classification["status"] == "confirmed"
         assert not last_in.classification["issues"]
-        assert [m.kind for m in outbound].count("acknowledge") == 1
+        assert [m.kind for m in outbound].count("acknowledge") == 0
 
         payload, _written = approve(session, case, by="megan")
         assert payload["start_utc"] == "2026-10-05T13:00:00Z"
@@ -326,8 +327,13 @@ def test_replay_of_the_morgan_foods_thread(settings, sessions):
         assert asked[-1].resolution == (
             "megan.goodwin@circledelivers.com answered the facility by email"
         )
-        assert [m.kind for m in case.messages if m.direction == "out"].count("acknowledge") == 1
+        # No thank-you: the 10/05 confirmation missed the delivery at 600 miles a day (above).
+        assert [m.kind for m in case.messages if m.direction == "out"].count("acknowledge") == 0
         assert [e.action for e in case.events].count("reply_after_decision") == 2
+        held = [e for e in case.events if e.action == "thanks_held"]
+        assert held[-1].detail["reason"] == (
+            "the confirmed time would arrive 10/06 12:44 ET, after the delivery slot 10/06 07:30 ET"
+        )
         assert len([m for m in case.messages if m.direction == "in"]) == 7
 
 

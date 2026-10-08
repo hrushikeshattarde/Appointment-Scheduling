@@ -112,7 +112,9 @@ class Settings(BaseSettings):
     booking_default_pickup_time: str = "09:00"
     # Without the facility's hours, a pickup is never moved earlier than this (no 00:30 asks).
     booking_earliest_pickup_time: str = "05:00"
-    booking_transit_miles_per_day: int = Field(550, gt=0)
+    # What a truck covers in a day: the pickup day counts back from the delivery by it, and a
+    # trip longer than it takes a stop for the rest of each 24 hours (booking_avg_mph).
+    booking_transit_miles_per_day: int = Field(600, gt=0)
     # Sender, cc, signature and customer desk for a customer that has no customer file. A
     # customer file (src/facility_profiles/customers/*.toml) sets its own; these never reach
     # the customers that have one.
