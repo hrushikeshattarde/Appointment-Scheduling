@@ -374,3 +374,15 @@ def test_the_demo_seeder_builds_every_situation_and_refuses_a_used_store(
         ]
     )
     assert module.main() == 1  # never mixed into a store that already has cases
+
+
+def test_coming_up_covers_as_many_days_as_the_scan_looks_ahead(settings, tmp_path: Path):  # type: ignore[no-untyped-def]
+    url = f"sqlite:///{(tmp_path / 'days.db').as_posix()}"
+    init_db(make_engine(url))
+    application = create_app(
+        settings.model_copy(update={"database_url": url, "booking_days_ahead": 14})
+    )
+    application.state.clock = lambda: NOW
+    with TestClient(application) as client:
+        assert client.get("/api/booking/overview").json()["days"] == 14
+        assert client.get("/api/booking/overview", params={"days": 3}).json()["days"] == 3

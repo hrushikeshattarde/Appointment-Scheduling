@@ -213,8 +213,9 @@ green booked, blue asked the vendor, amber needs a person, red missed, grey not 
 
 - **Home**: a greeting, a four-step "how booking works" strip (dismissable), totals (needs your
   attention, missed pickups, not asked yet, waiting on vendor, booked), what needs a person with
-  what to do about it, the next seven days by day, missed pickups and to-dos by type. Every
-  total and bar opens the matching list; the Home tab shows how many pickups need attention.
+  what to do about it, the next days by day (as many as the scan looks ahead,
+  `FP_BOOKING_DAYS_AHEAD`), missed pickups and to-dos by type. Every total and bar opens the
+  matching list; the Home tab shows how many pickups need attention.
 - **All pickups**: every pickup by time, with a search box (PO, load, vendor, pickup number,
   delivery reference), status tabs with counts, and more filters (to-do, pickup dates, missed
   only). On a phone the rows become cards.

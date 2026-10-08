@@ -810,13 +810,15 @@ def get_overview(
     viewer: ViewerDep,
     *,
     customer: str | None = None,
-    days: Annotated[int, Query(ge=1, le=60)] = 7,
+    days: Annotated[int | None, Query(ge=1, le=60)] = None,
 ) -> dict[str, Any]:
     """Counts, open to-dos, past-due pickups and the next days' pickups.
 
-    ``scan`` is when this server last checked Transport Pro for new pickups and whether that
-    worked (``serve --scan-every``); None when it does not check on its own.
+    The next days are as many as the scan looks ahead (FP_BOOKING_DAYS_AHEAD), unless ``days``
+    says otherwise. ``scan`` is when this server last checked Transport Pro for new pickups and
+    whether that worked (``serve --scan-every``); None when it does not check on its own.
     """
+    days = days or settings.booking_days_ahead
     cases = [
         c
         for c in _visible(session, viewer, settings)
