@@ -143,7 +143,7 @@ customer, each copied to its own group.
 Two lists stay pod-wide because they describe vendor desks, not customers:
 `FP_BOOKING_SHARED_DESKS` (desks that need the shipper and customer named) and
 `FP_BOOKING_PO_DATE_FLOOR_DESKS` (desks that read the customer's PO date as the earliest pickup;
-it applies only to customers whose file has a `po_date`).
+it applies only to customers whose file has a `po_date`; none by default).
 
 ### Adding a customer
 
@@ -525,9 +525,12 @@ Morgan Foods thread in the mail pull's format, Outlook cruft included, and
 ### Three rules from the live threads
 
 A freshly scanned case is checked before any email is written. A desk listed in
-`FP_BOOKING_PO_DATE_FLOOR_DESKS` (Morgan Foods by default) reads the date inside the customer's
-PO (Lidl's DDMMYY, from `[numbers] po_date` in its customer file) as the earliest pickup, so a request earlier than that day is moved up to it (weekends roll to
-Monday); if the floored day can no longer make the delivery the case goes to a person instead.
+`FP_BOOKING_PO_DATE_FLOOR_DESKS` reads the date inside the customer's PO (Lidl's DDMMYY, from
+`[numbers] po_date` in its customer file) as the earliest pickup, so a request earlier than that
+day is moved up to it (weekends roll to Monday); if the floored day can no longer make the
+delivery the case goes to a person instead. No desk is listed by default: the date inside a Lidl
+PO does not always match its delivery (115824092601 delivered 10/02, 115812102601 on 10/13), so
+the load's pickup day and the delivery's date and time decide the time asked for.
 A requested slot that has already passed, or sits inside `FP_BOOKING_MIN_NOTICE_HOURS`, goes to
 a person too, at scan time and again at draft or send time, because a same-day ask is a phone
 call. The inbound desk's delivery slots are read in every wording seen so far, including the
@@ -539,8 +542,8 @@ When the scan opens a case, `booking/recommend.py` chooses the time to ask for a
 
 1. **The day**: the tendered pickup date, else back from the delivery by the transit days. A
    backed-off day that has already passed moves up to the earliest pickup a driver can still make.
-2. **The PO-date floor**: a desk in `FP_BOOKING_PO_DATE_FLOOR_DESKS` is never asked for a day
-   before the date inside the customer's PO.
+2. **The PO-date floor** (off unless a desk is listed): a desk in
+   `FP_BOOKING_PO_DATE_FLOOR_DESKS` is never asked for a day before the date inside the PO.
 3. **The time**: the tendered time, else the time the facility usually gives, else
    `FP_BOOKING_DEFAULT_PICKUP_TIME` (09:00). "Usually" means at least 3 of its confirmed
    appointments, and at least half of them, were at one time. They come from Transport Pro's

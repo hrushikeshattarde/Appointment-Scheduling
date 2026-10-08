@@ -63,12 +63,31 @@ def test_po_embedded_date_reads_lidl_pos_and_nothing_else() -> None:
     assert LIDL.po_embedded_date("115802103060", near=near) is None  # 2030: too far from near
 
 
-def test_morgan_foods_request_is_never_earlier_than_the_po_date(settings, sessions):
+FLOOR = {"booking_po_date_floor_desks": ["shipping.appointments@morganfoods.com"]}
+
+
+def test_by_default_the_po_date_is_not_a_floor_the_load_s_pickup_day_is_kept(settings, sessions):
     settings = settings.model_copy(
         update={"pilot_terminal_ids": [1089], "pilot_customer_ids": [7211]}
     )
     seed_morgan(sessions)
-    # Tendered 10/01 09:00 ET, PO dated 02/10/26: the desk will not load before 10/02.
+    # Tendered 10/01 09:00 ET with a PO dated 02/10/26: the PO's date is not read as a floor.
+    load = morgan_load(
+        7101, pos=("115802102660", "115802102661"), pickup_open="2026-10-01T13:00:00Z"
+    )
+    scan(FakeTPro([load], {}), sessions, settings, days_ahead=14, now=EARLY)  # type: ignore[arg-type]
+    with session_scope(sessions) as session:
+        case = list_cases(session)[0]
+        assert case.requested_local == "2026-10-01 09:00" and open_kinds(case) == []
+        assert not [e for e in case.events if e.action == "po_date_floor"]
+
+
+def test_morgan_foods_request_is_never_earlier_than_the_po_date(settings, sessions):
+    settings = settings.model_copy(
+        update={"pilot_terminal_ids": [1089], "pilot_customer_ids": [7211], **FLOOR}
+    )
+    seed_morgan(sessions)
+    # Switched on, the floor holds: tendered 10/01 09:00 ET, PO dated 02/10/26, asked for 10/02.
     load = morgan_load(
         7101, pos=("115802102660", "115802102661"), pickup_open="2026-10-01T13:00:00Z"
     )
@@ -89,7 +108,7 @@ def test_morgan_foods_request_is_never_earlier_than_the_po_date(settings, sessio
 
 def test_po_date_after_the_delivery_hands_the_case_to_a_person(settings, sessions):
     settings = settings.model_copy(
-        update={"pilot_terminal_ids": [1089], "pilot_customer_ids": [7211]}
+        update={"pilot_terminal_ids": [1089], "pilot_customer_ids": [7211], **FLOOR}
     )
     seed_morgan(sessions)
     # PO dated 07/10/26, delivery on 10/06: no pickup day can make the delivery.

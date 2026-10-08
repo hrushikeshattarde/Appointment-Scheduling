@@ -139,9 +139,10 @@ class Settings(BaseSettings):
     # Vendor desks that read the date inside the customer's PO as the earliest pickup date ("this
     # is showing a pickup date of 10/2, we cannot schedule early pickups"): never ask them for an
     # earlier day. Only customers whose file says how a PO carries a date ([numbers] po_date).
-    booking_po_date_floor_desks: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: ["shipping.appointments@morganfoods.com"]
-    )
+    # None by default: the date inside a Lidl PO does not always match its delivery (115824092601
+    # delivered 10/02, 115812102601 on 10/13), so the pickup date on the load and the delivery's
+    # date and time decide the time asked for.
+    booking_po_date_floor_desks: Annotated[list[str], NoDecode] = Field(default_factory=list)
     # The time zone people work in: what "today" means in the daily summary, and when a batch
     # goes out. Every time shown is Eastern (facility_profiles/clock.py), so this is too.
     booking_timezone: str = "America/New_York"

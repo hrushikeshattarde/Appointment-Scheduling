@@ -35,7 +35,8 @@ delivery_system = "DCT"
 # Lidl PO numbers are twelve digits.
 po = '\d{12}'
 # Digits five to ten are the RDC delivery date as DDMMYY: 115802102660 is 2 October 2026.
-# Some vendor desks read it as the earliest pickup (FP_BOOKING_PO_DATE_FLOOR_DESKS).
+# Not always: 115824092601 delivered 10/02 and 115812102601 on 10/13. So no desk is held to it
+# by default (FP_BOOKING_PO_DATE_FLOOR_DESKS); the load's pickup date and delivery decide.
 po_date = '\d{4}(?P<dd>\d{2})(?P<mm>\d{2})(?P<yy>\d{2})\d{2}'
 # DCT delivery references: PYE_061026919, FRG_200526615, GRM_200826926.
 delivery_ref = '[A-Z]{3}_\d{6,}'
