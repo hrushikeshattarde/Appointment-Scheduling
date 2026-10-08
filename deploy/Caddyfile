@@ -1,0 +1,11 @@
+# HTTPS for the board: Caddy gets and renews the certificate for HOST_NAME on its own (port 80
+# must be open for that), and passes every request to the board on 127.0.0.1:8000.
+{$HOST_NAME} {
+	encode gzip
+	reverse_proxy 127.0.0.1:8000
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "same-origin"
+	}
+}

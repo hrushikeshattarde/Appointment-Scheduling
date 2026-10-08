@@ -1,0 +1,11 @@
+# Streams every change to the board's SQLite store to S3 within seconds, so a lost server loses
+# seconds of work, not a day. deploy/install.sh restores from here when the server has no store.
+# Signed with the instance's IAM role.
+dbs:
+  - path: /data/board.db
+    replicas:
+      - type: s3
+        bucket: ${BACKUP_BUCKET}
+        path: litestream/board.db
+        region: ${AWS_REGION}
+        retention: 720h

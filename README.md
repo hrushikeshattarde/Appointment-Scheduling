@@ -1147,6 +1147,13 @@ numbered sources; `extraction/validate.py` drops any quote not found in its sour
 phone, email or URL not present verbatim (FR-5, FR-6). `--fake-llm` runs the pipeline without
 model calls.
 
+## Running on AWS
+
+`deploy/README.md` stands the board up on one EC2 server: the `Dockerfile` image behind Caddy for
+HTTPS, the store streamed to S3 by Litestream, Claude on Bedrock under the server's IAM role, and
+the settings in Parameter Store (`deploy/aws/pickup-booking.yml` creates the server, its role, the
+fixed IP and DNS name, and the backup bucket).
+
 ## Development
 
 ```bash

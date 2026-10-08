@@ -1,0 +1,38 @@
+name: Image
+
+# The board's container image must keep building, for the server's ARM chip (t4g) and for x86.
+# Built only, not pushed: the server builds its own from the same commit (deploy/README.md).
+on:
+  push:
+    branches: [main]
+    paths: [Dockerfile, .dockerignore, pyproject.toml, uv.lock, "src/**", "deploy/**"]
+  pull_request:
+    paths: [Dockerfile, .dockerignore, pyproject.toml, uv.lock, "src/**", "deploy/**"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build for linux/arm64 and linux/amd64
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64,linux/amd64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Start it and ask /health (amd64)
+        run: |
+          docker build -t pickup-booking:ci .
+          docker run -d --name board -p 8000:8000 \
+            -e HOST=0.0.0.0 -e TPRO_BASE_URL=https://tpro.invalid \
+            -e TPRO_USERNAME=ci -e TPRO_PASSWORD=ci pickup-booking:ci
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8000/health && exit 0
+            sleep 2
+          done
+          docker logs board
+          exit 1

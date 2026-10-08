@@ -1,0 +1,18 @@
+[Unit]
+Description=Pickup booking board: app, HTTPS and the store's S3 copy (docker compose)
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/pickup-booking/src/deploy
+# The settings are read again from Parameter Store at every start.
+ExecStartPre=/opt/pickup-booking/src/deploy/fetch-env.sh
+ExecStart=/usr/bin/docker compose --env-file /etc/pickup-booking/compose.env up -d --build --remove-orphans
+ExecStop=/usr/bin/docker compose --env-file /etc/pickup-booking/compose.env down
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target

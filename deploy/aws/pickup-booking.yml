@@ -1,0 +1,244 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Pickup booking board: one EC2 server (board, HTTPS, continuous S3 copy of its store), its IAM
+  role (Claude on Bedrock, the mail folders, its settings), a fixed IP with a DNS name, and the
+  backup bucket. deploy/README.md says how to run it.
+
+Parameters:
+  HostName:
+    Type: String
+    Default: pickups.circle-analytics.com
+    Description: The board's address; Caddy gets its HTTPS certificate for this name.
+  HostedZoneName:
+    Type: String
+    Default: circle-analytics.com.
+    Description: The Route 53 zone that holds HostName (with the trailing dot).
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: A public subnet (one that gives public IPs) in an AZ that offers t4g, e.g. us-east-1a.
+  InstanceType:
+    Type: String
+    Default: t4g.small
+    AllowedValues: [t4g.micro, t4g.small, t4g.medium]
+  ImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+  RepoUrl:
+    Type: String
+    Default: https://github.com/hrushikeshattarde/Appointment-Scheduling.git
+  RepoRef:
+    Type: String
+    Default: main
+    Description: The branch or tag the server starts from; deploy/update.sh moves it later.
+  MailArchiveBucket:
+    Type: String
+    Default: circle-lidl-appointments
+    Description: The group-mail archive the board reads (FP_BOOKING_INBOX=s3://...).
+  SesMailBucket:
+    Type: String
+    Default: trucklists
+    Description: Where SES saves booking@circle-analytics.com's mail.
+  SesMailPrefix:
+    Type: String
+    Default: pickup-booking/
+
+Resources:
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub circle-pickup-booking-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+
+  ServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub pickup-booking-server-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Session Manager and Run Command: no SSH port, no keys.
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: pickup-booking
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ClaudeOnBedrock
+                Effect: Allow
+                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+                Resource:
+                  - !Sub arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/us.anthropic.claude-*
+                  - arn:aws:bedrock:*::foundation-model/anthropic.claude-*
+              - Sid: ListMailFolders
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub arn:aws:s3:::${MailArchiveBucket}
+              - Sid: ListSesMailFolder
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub arn:aws:s3:::${SesMailBucket}
+                Condition:
+                  StringLike:
+                    s3:prefix: [!Sub "${SesMailPrefix}*"]
+              - Sid: ReadMail
+                Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub arn:aws:s3:::${MailArchiveBucket}/*
+                  - !Sub arn:aws:s3:::${SesMailBucket}/${SesMailPrefix}*
+              - Sid: Backups
+                Effect: Allow
+                Action: [s3:ListBucket, s3:GetBucketLocation]
+                Resource: !GetAtt BackupBucket.Arn
+              - Sid: BackupObjects
+                Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource: !Sub ${BackupBucket.Arn}/*
+              - Sid: Settings
+                Effect: Allow
+                Action: [ssm:GetParametersByPath, ssm:GetParameters, ssm:GetParameter]
+                Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/pickup-booking
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/pickup-booking/*
+
+  ServerProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref ServerRole]
+
+  ServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Pickup booking board - HTTPS, and HTTP for the certificate; no SSH
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: board }
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0, Description: certificate and redirect }
+      Tags:
+        - { Key: Name, Value: pickup-booking }
+
+  ServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref ImageId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: { Arn: !GetAtt ServerProfile.Arn }
+        SecurityGroupIds: [!Ref ServerSecurityGroup]
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: { VolumeType: gp3, VolumeSize: 20, Encrypted: true, DeleteOnTermination: true }
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: [{ Key: Name, Value: pickup-booking }]
+          - ResourceType: volume
+            Tags: [{ Key: Name, Value: pickup-booking }]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euxo pipefail
+            dnf install -y docker git
+            mkdir -p /usr/local/lib/docker/cli-plugins
+            curl -fsSL -o /usr/local/lib/docker/cli-plugins/docker-compose \
+              https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-aarch64
+            curl -fsSL -o /usr/local/lib/docker/cli-plugins/docker-buildx \
+              https://github.com/docker/buildx/releases/download/v0.17.1/buildx-v0.17.1.linux-arm64
+            chmod 755 /usr/local/lib/docker/cli-plugins/docker-compose /usr/local/lib/docker/cli-plugins/docker-buildx
+            systemctl enable --now docker
+            git clone --branch ${RepoRef} ${RepoUrl} /opt/pickup-booking/src
+            bash /opt/pickup-booking/src/deploy/install.sh ${HostName} ${BackupBucket} ${AWS::Region}
+
+  Server:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ServerLaunchTemplate
+        Version: !GetAtt ServerLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref SubnetId
+
+  ServerAddress:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref Server
+      Tags: [{ Key: Name, Value: pickup-booking }]
+
+  BoardDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneName: !Ref HostedZoneName
+      Name: !Ref HostName
+      Type: A
+      TTL: "300"
+      ResourceRecords: [!Ref ServerAddress]
+
+  # AWS moves the server to healthy hardware when the host fails, and reboots it when the
+  # operating system stops answering; the store comes back from its disk either way.
+  RecoverOnHostFailure:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Pickup booking server - recover when the host fails
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed_System
+      Dimensions: [{ Name: InstanceId, Value: !Ref Server }]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [!Sub "arn:aws:automate:${AWS::Region}:ec2:recover"]
+
+  RebootOnInstanceFailure:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Pickup booking server - reboot when the operating system stops answering
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed_Instance
+      Dimensions: [{ Name: InstanceId, Value: !Ref Server }]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [!Sub "arn:aws:automate:${AWS::Region}:ec2:reboot"]
+
+Outputs:
+  BoardUrl:
+    Value: !Sub https://${HostName}
+  GoogleRedirectUrl:
+    Description: Add this to the Google sign-in client's authorized redirect URIs.
+    Value: !Sub https://${HostName}/auth/callback
+  ServerId:
+    Value: !Ref Server
+  PublicIp:
+    Value: !Ref ServerAddress
+  BackupBucket:
+    Value: !Ref BackupBucket

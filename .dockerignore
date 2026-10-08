@@ -1,0 +1,10 @@
+# Only the source, the lock file and the deploy scripts go into the image: never keys, settings
+# or stores.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!src/
+!deploy/serve.sh
+**/__pycache__
+**/*.py[cod]

@@ -32,3 +32,6 @@ Thumbs.db
 # Google service-account keys (never commit)
 gsheets-python-*.json
 *-service-account*.json
+
+# The server's settings, filled in from deploy/aws/settings.env.example
+deploy/aws/settings.env
